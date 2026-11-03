@@ -1,0 +1,23 @@
+﻿# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Node modules
+node_modules/
+extension/node_modules/
+package-lock.json
+npm-debug.log*
+
+# Sensitive credentials & downloaded files
+*cookies*.txt
+*_test.txt
+bili_netscape_test.txt
+downloads/
+
+# Environment and logs
+.env
+.env.*
+*.log
+.vscode/
+.idea/

@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "Cookie Hub - 开发者 Cookie 提取助手",
+  "version": "1.2.0",
+  "description": "专为开发者打造的轻量 Cookie 提取与导出工具，支持本地双向通信，可按需由本地服务/脚本通过 API 随时调用提取任意域名的 Cookie。",
+  "permissions": [
+    "cookies",
+    "activeTab",
+    "clipboardWrite",
+    "storage",
+    "alarms"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Cookie Hub",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

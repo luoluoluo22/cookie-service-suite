@@ -1,0 +1,23 @@
+{
+  "name": "cookie-exporter-extension",
+  "version": "1.1.0",
+  "description": "Cookie Hub - 开发者 Cookie 提取与本地通信助手 (支持命令与热重载)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "reload": "node reload.js",
+    "get": "node get_cookie.js"
+  },
+  "keywords": [
+    "cookie",
+    "extension",
+    "developer",
+    "bridge"
+  ],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

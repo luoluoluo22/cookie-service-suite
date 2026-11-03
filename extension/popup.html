@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cookie Hub</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Header -->
+    <header class="app-header">
+      <div class="header-left">
+        <span class="logo-icon">🍪</span>
+        <div class="header-title-group">
+          <div class="title-with-pill">
+            <h1 class="header-title">Cookie Hub</h1>
+            <div id="bridge-status-pill" class="bridge-status-pill disconnected" title="本地通信服务 (127.0.0.1:18888)">
+              <span class="status-dot"></span>
+              <span id="bridge-status-text">本地服务离线</span>
+            </div>
+          </div>
+          <span class="header-subtitle">开发者 Cookie 提取与本地通信助手</span>
+        </div>
+      </div>
+      <div class="header-actions">
+        <button id="btn-refresh" class="icon-btn" title="刷新 Cookie 列表与通信状态">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- Target Site Info Bar -->
+    <section class="site-bar">
+      <div class="site-info">
+        <span class="site-label">当前站点:</span>
+        <span id="current-domain" class="site-domain" title="当前域名">加载中...</span>
+      </div>
+      <div class="badge-group">
+        <span id="cookie-count-badge" class="count-badge">0 个</span>
+      </div>
+    </section>
+
+    <!-- Special Warning for system pages -->
+    <div id="system-page-tip" class="notice-box warning-box" style="display: none;">
+      ⚠️ 当前页面为浏览器系统内置页面，无法读取 Cookie。请切换至具体网页后再试。
+    </div>
+
+    <!-- Smart Preset Tokens Card (Dynamically Shown) -->
+    <section id="preset-card" class="preset-card" style="display: none;">
+      <div class="preset-header">
+        <div class="preset-title-row">
+          <span class="preset-badge">✨ 识别服务</span>
+          <span id="preset-service-name" class="preset-service-name"></span>
+        </div>
+        <p id="preset-service-tip" class="preset-tip"></p>
+      </div>
+      <div id="preset-tokens-container" class="preset-tokens-grid">
+        <!-- Tokens rendered dynamically -->
+      </div>
+    </section>
+
+    <!-- Quick Export Toolbar -->
+    <section class="toolbar-section">
+      <div class="section-title">一键导出格式</div>
+      <div class="export-grid">
+        <button id="btn-copy-header" class="btn btn-primary" title="用于 cURL、Python requests Headers、Postman 等">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1" ry="1"/></svg>
+          Header 字符串
+        </button>
+        <button id="btn-copy-json" class="btn btn-secondary" title="Key-Value 键值对 JSON，适合写入 .env 或配置">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+          JSON 键值对
+        </button>
+        <button id="btn-copy-puppeteer" class="btn btn-secondary" title="完整属性数组，适合 Playwright / Puppeteer 自动化注入">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+          Playwright 格式
+        </button>
+        <button id="btn-copy-netscape" class="btn btn-secondary" title="Netscape cookies.txt 格式，适用于 yt-dlp --cookies">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+          yt-dlp (txt)
+        </button>
+      </div>
+    </section>
+
+    <!-- Search & List Controls -->
+    <section class="filter-section">
+      <div class="search-wrapper">
+        <svg class="search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        <input type="text" id="input-search" class="search-input" placeholder="搜索 Cookie 名称或值...">
+      </div>
+      <label class="toggle-mask-label" title="切换是否脱敏显示">
+        <input type="checkbox" id="check-reveal-all">
+        <span>显示明文</span>
+      </label>
+    </section>
+
+    <!-- Cookie List -->
+    <main class="list-container">
+      <div id="cookie-list" class="cookie-list">
+        <!-- Cookie items rendered dynamically -->
+      </div>
+      <div id="empty-state" class="empty-state" style="display: none;">
+        未检索到匹配的 Cookie
+      </div>
+    </main>
+
+    <!-- Toast Notification -->
+    <div id="toast" class="toast"></div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
