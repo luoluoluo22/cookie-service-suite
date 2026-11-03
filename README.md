@@ -31,7 +31,7 @@
 
 | 服务平台 | 实测提取凭证 / 桥接技术 | 测试场景 / 接口 | 实测结果 | 数据反馈与能力 |
 | :--- | :--- | :--- | :--- | :--- |
-| **OpenAI ChatGPT Web** | 浏览器原生桥接<br>`Bearer AccessToken`<br>`__Secure-next-auth` | 1. 登录会话与用户提取 (`/chatgpt/session`)<br>2. 账号可用模型列表 (`/chatgpt/models`)<br>3. 标准兼容对话 (`/v1/chat/completions`) | 🟢 **100% 通过** | 彻底绕过 Cloudflare Turnstile 403 拦截，提取账号 `7501243@qq.com` 会话与实时模型库；通过独立后台桥接标签页，实现毫秒级输入与标准 OpenAI 对话问答响应。 |
+| **OpenAI ChatGPT Web** | 浏览器原生桥接<br>`Bearer AccessToken`<br>`__Secure-next-auth`<br>**SSE Stream Hook** | 1. 登录会话与用户提取 (`/chatgpt/session`)<br>2. 账号可用模型列表 (`/chatgpt/models`)<br>3. 标准兼容对话 (`/v1/chat/completions`)<br>4. 实时流式响应 (`stream: true`) | 🟢 **100% 通过** | 彻底绕过 Cloudflare Turnstile 403 拦截，提取账号 `7501243@qq.com` 会话与实时模型库；通过页面主环境 (`MAIN` world) 挂载 `window.fetch` 流式拦截器，毫秒级逐字提取 SSE 数据块 (`text/event-stream`)，兼具 DOM 兜底保底，实现长文本无截断完整输出。 |
 | **百度网盘 (Baidu Pan)** | `BDUSS`<br>`STOKEN`<br>`PANPSC` | 1. 账号与会员鉴权<br>2. 网盘总配额/剩余容量<br>3. 目录与文件实时遍历 | 🟢 **100% 通过** | 自动提取 `BDUSS`，成功查询容量配额 **2055.0 GB**（已用 1913.86 GB，剩余 141.14 GB），成功遍历根目录下 19 项文件与文件夹。 |
 | **Bilibili (哔哩哔哩)** | `SESSDATA`<br>`bili_jct`<br>`DedeUserID` | 1. 个人中心与资产查询<br>2. 高清分P与Dash流解析<br>3. `yt-dlp` 高清下载 | 🟢 **100% 通过** | 自动提取 `SESSDATA`，成功识别账号等级 Lv.5、大会员特权与硬币，解锁 1080P+ / 4K 高码率视频流。 |
 | **yt-dlp 联动下载** | Netscape 格式 cookies.txt | B 站 1080P+ / 4K 原画视频解析提取 | 🟢 **100% 通过** | 本地服务自动导出标准 Netscape 格式，yt-dlp 无感绕过画质限制并自动下载。 |
@@ -95,18 +95,49 @@ answer = client.ask("请用一句话说明：量子纠缠是什么？")
 print("回复:", answer)
 ```
 
-#### (2) 作为本地 OpenAI 兼容 API 使用
-本地服务开放了标准 `/v1/chat/completions` 接口：
+#### (2) 标准 OpenAI 兼容 API 与流式输出 (Stream: true)
+本地服务开放了标准 `/v1/chat/completions` 接口，支持纯文本与打字机流式 SSE (`text/event-stream`)：
 ```bash
-curl -X POST http://127.0.0.1:18888/v1/chat/completions \
+# 流式调用 (实时返回 data: {...} SSE 数据块)
+curl -N -X POST http://127.0.0.1:18888/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "chatgpt-web",
     "messages": [
-      {"role": "user", "content": "你好，请确认连接状态！"}
-    ]
+      {"role": "user", "content": "用Python写一个快速排序算法并解释原理"}
+    ],
+    "stream": true
   }'
 ```
+
+#### (3) Python SDK 流式生成器调用
+```python
+from chatgpt_service import ChatGPTBridgeClient
+
+client = ChatGPTBridgeClient()
+
+# 流式打字机逐字输出
+for token in client.ask("写一首关于夏天的五言绝句", stream=True):
+    print(token, end="", flush=True)
+```
+
+---
+
+## ⚡ ChatGPT Web 双引擎流式与长文本完整性保障机制
+
+针对网页端 ChatGPT 获取回复的行业痛点（DOM 截断、代码块折叠、长文本丢失、渲染延迟），本套件设计了业内顶尖的**双引擎协同机制**：
+
+1. **主环境 SSE 网络流挂钩引擎 (优先生效 - 极致速度与完整度)**:
+   - 注入浏览器页面主环境 (`world: 'MAIN'`) 劫持原生 `window.fetch`；
+   - 识别 ChatGPT 核心对话接口（`/conversation` 与 `/backend-api/f/conversation`）；
+   - 通过 `response.clone().body.getReader()` 在底层克隆流，对浏览器原有 UI 渲染零干扰；
+   - 实时解析服务端推送的 SSE 增量数据块 (`parts: [...]`)，按 delta 增量毫秒级回传本地桥接服务；
+   - 彻底摆脱 DOM 虚拟列表、滚动条限制与代码框折叠影响，保证数千字长篇代码/文章无任何截断。
+
+2. **DOM 语义树稳定扫描引擎 (兜底保底 - 极致鲁棒性)**:
+   - 当遇到网络异常或特殊接口变动时，底层自动无缝降级至 DOM 监控器；
+   - 通过稳定轮询与状态机（侦测发送按钮、停止生成按钮、思考指示器与 Markdown 根容器渲染稳定性）；
+   - 确保在任何极端网络波动场景下均能稳定获取完整模型回答。
 
 ### 4. 百度网盘命令行使用
 ```powershell

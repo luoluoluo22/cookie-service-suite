@@ -12,6 +12,9 @@ const extensionSockets = new Set();
 // Store pending HTTP requests waiting for extension response: reqId -> { resolve, reject, timer }
 const pendingRequests = new Map();
 
+// Map to route SSE streaming events to active HTTP responses: reqId -> { onChunk, onDone }
+const activeStreams = new Map();
+
 // Create HTTP Server
 const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -239,12 +242,105 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      const result = await dispatchToExtension('chatgpt_send_message', { prompt: promptText });
-      if (!result.success) {
-        res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ error: result.error || 'ChatGPT 对话处理失败' }));
+      const isStream = json.stream === true;
+      const streamReqId = 'stream_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
+
+      if (isStream) {
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream; charset=utf-8',
+          'Cache-Control': 'no-cache, no-transform',
+          'Connection': 'keep-alive',
+          'Access-Control-Allow-Origin': '*'
+        });
+        if (typeof res.flushHeaders === 'function') res.flushHeaders();
+
+        let streamClosed = false;
+        const sendChunk = (delta) => {
+          if (!streamClosed && delta) {
+            const chunkObj = {
+              id: 'chatcmpl-' + Date.now(),
+              object: 'chat.completion.chunk',
+              created: Math.floor(Date.now() / 1000),
+              model: json.model || 'chatgpt-web',
+              choices: [
+                {
+                  index: 0,
+                  delta: { content: delta },
+                  finish_reason: null
+                }
+              ]
+            };
+            res.write(`data: ${JSON.stringify(chunkObj)}\n\n`);
+          }
+        };
+
+        const finishStream = () => {
+          if (!streamClosed) {
+            const endObj = {
+              id: 'chatcmpl-' + Date.now(),
+              object: 'chat.completion.chunk',
+              created: Math.floor(Date.now() / 1000),
+              model: json.model || 'chatgpt-web',
+              choices: [
+                {
+                  index: 0,
+                  delta: {},
+                  finish_reason: 'stop'
+                }
+              ]
+            };
+            res.write(`data: ${JSON.stringify(endObj)}\n\n`);
+            res.write('data: [DONE]\n\n');
+            res.end();
+            streamClosed = true;
+            activeStreams.delete(streamReqId);
+          }
+        };
+
+        activeStreams.set(streamReqId, {
+          onChunk: (delta) => sendChunk(delta),
+          onDone: () => finishStream()
+        });
+
+        req.on('close', () => {
+          streamClosed = true;
+          activeStreams.delete(streamReqId);
+        });
+
+        dispatchToExtension('chatgpt_send_message', { reqId: streamReqId, prompt: promptText }).then((result) => {
+          // If stream not closed yet, send result text if not sent, then finish
+          if (!streamClosed) {
+            if (result && result.text) sendChunk(result.text);
+            finishStream();
+          }
+        }).catch(err => {
+          if (!streamClosed) {
+            res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+            res.write('data: [DONE]\n\n');
+            res.end();
+            streamClosed = true;
+            activeStreams.delete(streamReqId);
+          }
+        });
         return;
       }
+
+      // Non-stream mode: accumulate SSE stream tokens for 100% purity, fallback to DOM result
+      let accumulatedSSEText = '';
+      activeStreams.set(streamReqId, {
+        onChunk: (delta, fullText) => {
+          accumulatedSSEText = fullText || (accumulatedSSEText + delta);
+        },
+        onDone: (finalText) => {
+          if (finalText) accumulatedSSEText = finalText;
+          activeStreams.delete(streamReqId);
+        }
+      });
+
+      const result = await dispatchToExtension('chatgpt_send_message', { reqId: streamReqId, prompt: promptText });
+      activeStreams.delete(streamReqId);
+
+      const finalContent = (accumulatedSSEText && accumulatedSSEText.trim()) ? accumulatedSSEText.trim() : (result.text || '');
 
       const openaiResp = {
         id: 'chatcmpl-' + Date.now(),
@@ -256,7 +352,7 @@ const server = http.createServer(async (req, res) => {
             index: 0,
             message: {
               role: 'assistant',
-              content: result.text
+              content: finalContent
             },
             finish_reason: 'stop'
           }
@@ -390,6 +486,26 @@ wss.on('connection', (ws) => {
   ws.on('message', (raw) => {
     try {
       const msg = JSON.parse(raw);
+
+      // Handle real-time SSE stream events from in-page fetch hook
+      if (msg.action === 'log_raw_chunk') {
+        console.log('[SSE Raw Chunk Sample]', msg.raw);
+        return;
+      }
+      if (msg.action === 'chatgpt_sse_chunk') {
+        if (msg.delta) console.log(`[SSE Stream Delta] ${msg.delta}`);
+        if (msg.isDone) console.log('[SSE Stream Done]');
+        const handler = activeStreams.get(msg.reqId);
+        if (handler) {
+          if (msg.isDone) {
+            handler.onDone(msg.text);
+          } else if (msg.delta) {
+            handler.onChunk(msg.delta, msg.text);
+          }
+        }
+        return;
+      }
+
       if (msg.id && pendingRequests.has(msg.id)) {
         const { resolve, timer } = pendingRequests.get(msg.id);
         clearTimeout(timer);

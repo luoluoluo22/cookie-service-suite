@@ -29,6 +29,11 @@ chrome.tabs.onActivated.addListener(() => {
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.url && (changeInfo.url.includes('reload.extensions') || changeInfo.url.includes('reload-extension'))) {
+    try { chrome.tabs.remove(tabId); } catch(e){}
+    chrome.runtime.reload();
+    return;
+  }
   if (changeInfo.status === 'complete' || changeInfo.url) {
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       connectBridge();
@@ -280,18 +285,162 @@ async function handleGetActiveTabCookies() {
   }
 }
 
-// Communication with popup.js
+let activeBridgeTabId = null;
+let currentStreamReqId = null;
+let lastStreamAccumulatedText = '';
+
+// Helper: Install in-page window.fetch Hook to intercept /backend-api/conversation SSE stream
+async function ensureInPageSSEHook(tabId) {
+  try {
+    // 1. Inject MAIN world fetch hook
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func: () => {
+        const originalFetch = window.__originalFetch || window.fetch;
+        window.__originalFetch = originalFetch;
+
+        window.fetch = async function(...args) {
+          const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
+          window.postMessage({ type: 'COOKIE_HUB_LOG', text: `fetch: ${url}` }, '*');
+          const response = await originalFetch.apply(this, args);
+
+          if (typeof url === 'string' && url.includes('/conversation')) {
+            window.postMessage({ type: 'COOKIE_HUB_SSE_DEBUG', info: `conversation fetch status: ${response.status}, url: ${url}` }, '*');
+            try {
+              const clone = response.clone();
+              const reader = clone.body.getReader();
+              const decoder = new TextDecoder('utf-8');
+              let buffer = '';
+
+              (async () => {
+                while (true) {
+                  const { done, value } = await reader.read();
+                  if (done) {
+                    window.postMessage({ type: 'COOKIE_HUB_SSE_DONE' }, '*');
+                    break;
+                  }
+                  buffer += decoder.decode(value, { stream: true });
+                  const lines = buffer.split('\n');
+                  buffer = lines.pop(); // keep trailing incomplete line
+
+                  for (const line of lines) {
+                    const trimmed = line.trim();
+                    if (!trimmed || !trimmed.startsWith('data: ')) continue;
+                    const dataStr = trimmed.slice(6);
+                    if (dataStr === '[DONE]') {
+                      window.postMessage({ type: 'COOKIE_HUB_SSE_DONE' }, '*');
+                      break;
+                    }
+                    try {
+                      const payload = JSON.parse(dataStr);
+                      window.postMessage({ type: 'COOKIE_HUB_SSE_CHUNK', data: payload }, '*');
+                    } catch (e) {
+                      window.postMessage({ type: 'COOKIE_HUB_SSE_DEBUG', rawData: dataStr.substring(0, 80) }, '*');
+                    }
+                  }
+                }
+              })().catch(err => {
+                window.postMessage({ type: 'COOKIE_HUB_SSE_ERROR', error: err.message }, '*');
+              });
+            } catch (err) {
+              window.postMessage({ type: 'COOKIE_HUB_SSE_DEBUG', catchErr: err.message }, '*');
+            }
+          }
+          return response;
+        };
+        console.log('🚀 [CookieHub] window.fetch SSE interceptor active in MAIN world.');
+      }
+    });
+
+    // 2. Inject ISOLATED world bridge relay
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'ISOLATED',
+      func: () => {
+        if (window.__cookieHubSSEBridgeInstalled) return;
+        window.__cookieHubSSEBridgeInstalled = true;
+
+        window.addEventListener('message', (event) => {
+          if (event.source !== window) return;
+          const msg = event.data;
+          if (msg && msg.type && msg.type.startsWith('COOKIE_HUB_SSE_')) {
+            try {
+              chrome.runtime.sendMessage(msg);
+            } catch (e) {}
+          }
+        });
+        console.log('📡 [CookieHub] SSE Bridge relay active in ISOLATED world.');
+      }
+    });
+  } catch (e) {
+    console.warn('[CookieHub] Failed to install SSE hook:', e.message);
+  }
+}
+
+let networkLogs = [];
+
+// Communication with popup.js and in-page SSE relay
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg.type === 'GET_BRIDGE_STATUS') {
+  if (msg.type === 'NETWORK_LOG') {
+    networkLogs.push(msg.entry);
+  } else if (msg.type === 'COOKIE_HUB_TEST_MSG') {
+    testMsgReceived = msg.hello;
+  } else if (msg.type === 'GET_BRIDGE_STATUS') {
     sendResponse({ isConnected });
   } else if (msg.type === 'RECONNECT_BRIDGE') {
     connectBridge();
     sendResponse({ isConnected });
+  } else if (msg.type === 'COOKIE_HUB_LOG') {
+    console.log('[In-Page Tab]', msg.text);
+  } else if (msg.type === 'COOKIE_HUB_SSE_DEBUG') {
+    console.log('[SSE DEBUG]', JSON.stringify(msg));
+  } else if (msg.type === 'COOKIE_HUB_SSE_CHUNK') {
+    const chunkData = msg.data;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        action: 'log_raw_chunk',
+        raw: JSON.stringify(chunkData).substring(0, 180)
+      }));
+    }
+    let newFullText = null;
+
+    if (chunkData && chunkData.message && chunkData.message.content) {
+      const parts = chunkData.message.content.parts;
+      if (Array.isArray(parts) && parts.length > 0) {
+        newFullText = parts.join('');
+      }
+    }
+
+    if (newFullText !== null) {
+      let delta = '';
+      if (newFullText.length > lastStreamAccumulatedText.length) {
+        delta = newFullText.slice(lastStreamAccumulatedText.length);
+        lastStreamAccumulatedText = newFullText;
+      }
+      if (ws && ws.readyState === WebSocket.OPEN && currentStreamReqId) {
+        ws.send(JSON.stringify({
+          action: 'chatgpt_sse_chunk',
+          reqId: currentStreamReqId,
+          delta: delta,
+          text: newFullText,
+          isDone: false
+        }));
+      }
+    }
+  } else if (msg.type === 'COOKIE_HUB_SSE_DONE') {
+    if (ws && ws.readyState === WebSocket.OPEN && currentStreamReqId) {
+      ws.send(JSON.stringify({
+        action: 'chatgpt_sse_chunk',
+        reqId: currentStreamReqId,
+        delta: '',
+        text: lastStreamAccumulatedText,
+        isDone: true
+      }));
+    }
   }
   return true;
 });
-
-let activeBridgeTabId = null;
 
 // Helper: Dispatch action into ChatGPT tab using direct chrome.scripting.executeScript
 async function dispatchToChatGPTTab(action, payload) {
@@ -410,32 +559,60 @@ async function dispatchToChatGPTTab(action, payload) {
 
   // 2. Debug DOM
   if (action === 'chatgpt_debug_dom') {
-    const results = await chrome.scripting.executeScript({
+    networkLogs = [];
+
+    // 1. Isolated world listener
+    await chrome.scripting.executeScript({
       target: { tabId: tab.id },
+      world: 'ISOLATED',
       func: () => {
-        const stopBtns = Array.from(document.querySelectorAll('button[aria-label="停止"]')).map(b => ({
-          ariaLabel: b.getAttribute('aria-label'),
-          offsetParent: !!b.offsetParent,
-          width: b.offsetWidth,
-          height: b.offsetHeight,
-          parentClass: b.parentElement?.className?.substring(0, 60),
-          html: b.outerHTML.substring(0, 150)
-        }));
+        window.addEventListener('message', (event) => {
+          if (event.data && event.data.type === 'NETWORK_LOG') {
+            chrome.runtime.sendMessage(event.data);
+          }
+        });
+      }
+    });
 
-        const loadIndicators = Array.from(document.querySelectorAll('div[data-loading-indicator]')).map(d => ({
-          offsetParent: !!d.offsetParent,
-          width: d.offsetWidth,
-          height: d.offsetHeight,
-          parentClass: d.parentElement?.className?.substring(0, 60)
-        }));
+    // 2. Main world network hook
+    await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      world: 'MAIN',
+      func: () => {
+        if (window.__netLoggerInstalled) return;
+        window.__netLoggerInstalled = true;
 
-        return {
-          stopBtns: stopBtns,
-          loadIndicators: loadIndicators
+        const origFetch = window.fetch;
+        window.fetch = function(...args) {
+          const u = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
+          window.postMessage({ type: 'NETWORK_LOG', entry: { type: 'fetch', url: u } }, '*');
+          return origFetch.apply(this, args);
         };
       }
     });
-    return results[0]?.result || { success: false };
+
+    // 3. Send test message in tab
+    await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: () => {
+        const el = document.querySelector('#prompt-textarea') || document.querySelector('div[contenteditable="true"]');
+        if (el) {
+          el.focus();
+          document.execCommand('insertText', false, '测试网络请求');
+          el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertText', data: '测试网络请求' }));
+          const sendBtn = document.querySelector('button[aria-label="发送"]') || document.querySelector('button[type="submit"]');
+          if (sendBtn) sendBtn.click();
+          el.closest('form')?.requestSubmit?.();
+        }
+      }
+    });
+
+    await new Promise(r => setTimeout(r, 2000));
+
+    return {
+      loggedRequestsCount: networkLogs.length,
+      networkLogs: networkLogs
+    };
   }
 
   // 2.5 Test Send Triggers
@@ -505,6 +682,12 @@ async function dispatchToChatGPTTab(action, payload) {
   // 3. Send message & await response
   if (action === 'chatgpt_send_message') {
     const promptText = payload.prompt;
+    currentStreamReqId = payload.reqId || ('req_' + Date.now());
+    lastStreamAccumulatedText = '';
+
+    // Ensure In-Page window.fetch SSE Hook is installed in target tab
+    await ensureInPageSSEHook(tab.id);
+
     const results = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       args: [promptText],
@@ -623,7 +806,11 @@ async function dispatchToChatGPTTab(action, payload) {
       }
     });
 
-    return results[0]?.result || { success: false, error: '执行脚本无返回值' };
+    const scriptResult = results[0]?.result || { success: false, error: '执行脚本无返回值' };
+    if (lastStreamAccumulatedText && lastStreamAccumulatedText.trim().length > 0) {
+      return { success: true, text: lastStreamAccumulatedText.trim(), source: 'sse_stream' };
+    }
+    return { ...scriptResult, source: 'dom_fallback' };
   }
 
   throw new Error('未知的 ChatGPT 桥接操作: ' + action);
