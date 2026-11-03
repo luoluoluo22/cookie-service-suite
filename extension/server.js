@@ -225,6 +225,20 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // 2.88 ChatGPT Inspect Tab (/chatgpt/inspect)
+  if (pathname === '/chatgpt/inspect') {
+    try {
+      const tabId = parsedUrl.searchParams.get('tabId') || currentBridgeTabId;
+      const data = await dispatchToExtension('chatgpt_inspect_tab', { tabId: tabId ? Number(tabId) : null });
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(data, null, 2));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
   // 2.86 ChatGPT Test Input (/chatgpt/test_input)
   if (pathname === '/chatgpt/test_input') {
     try {

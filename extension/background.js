@@ -626,6 +626,32 @@ async function dispatchToChatGPTTab(action, payload) {
     return results[0]?.result || { success: false, error: '执行脚本无返回值' };
   }
 
+  // 1.9 Inspect Tab Elements & Text
+  if (action === 'chatgpt_inspect_tab') {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: () => {
+        const isBusy = Array.from(document.querySelectorAll('button[aria-label="停止"], button[data-testid="stop-button"], div[data-loading-indicator], .result-streaming'))
+          .some(e => e.offsetWidth > 0 && e.offsetHeight > 0);
+
+        const markdowns = Array.from(document.querySelectorAll('[class*="MarkdownRoot"], .markdown, [data-message-author-role="assistant"]'));
+        const articles = Array.from(document.querySelectorAll('article'));
+        const turns = Array.from(document.querySelectorAll('[data-testid*="conversation-turn"]'));
+
+        return {
+          title: document.title,
+          isBusy,
+          markdownCount: markdowns.length,
+          articleCount: articles.length,
+          turnCount: turns.length,
+          latestMarkdown: markdowns.length > 0 ? markdowns[markdowns.length - 1].innerText : '',
+          latestArticle: articles.length > 0 ? articles[articles.length - 1].innerText : ''
+        };
+      }
+    });
+    return results[0]?.result || {};
+  }
+
   // 2. Debug DOM
   if (action === 'chatgpt_debug_dom') {
     networkLogs = [];
