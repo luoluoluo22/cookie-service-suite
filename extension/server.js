@@ -71,6 +71,207 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // 2.5 Browser-native fetch via extension (bypasses Cloudflare TLS fingerprinting)
+  if (pathname === '/proxy_fetch' && req.method === 'POST') {
+    if (extensionSockets.size === 0) {
+      res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: '浏览器扩展未连接' }));
+      return;
+    }
+
+    try {
+      const body = await readRequestBody(req);
+      const json = JSON.parse(body || '{}');
+      const result = await dispatchToExtension('proxy_fetch', json);
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(result, null, 2));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  // 2.7 Tab Management (/tabs and /chatgpt/open)
+  if (pathname === '/tabs') {
+    try {
+      const data = await dispatchToExtension('list_tabs', {});
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(data, null, 2));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  if (pathname === '/chatgpt/open') {
+    try {
+      const data = await dispatchToExtension('open_chatgpt_tab', {});
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(data, null, 2));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  if (pathname === '/chatgpt/set_tab') {
+    try {
+      const tabId = parsedUrl.searchParams.get('tabId');
+      const data = await dispatchToExtension('set_bridge_tab', { tabId });
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(data, null, 2));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  // 2.8 ChatGPT In-Page Bridge: Get Session (/chatgpt/session)
+  if (pathname === '/chatgpt/session') {
+    if (extensionSockets.size === 0) {
+      res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: '浏览器扩展未连接' }));
+      return;
+    }
+    try {
+      const data = await dispatchToExtension('chatgpt_get_session', {});
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(data, null, 2));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  // 2.82 ChatGPT Models (/chatgpt/models)
+  if (pathname === '/chatgpt/models') {
+    try {
+      const data = await dispatchToExtension('chatgpt_get_models', {});
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(data, null, 2));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  // 2.83 ChatGPT Sentinel Requirements (/chatgpt/requirements)
+  if (pathname === '/chatgpt/requirements') {
+    try {
+      const data = await dispatchToExtension('chatgpt_test_requirements', {});
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(data, null, 2));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  // 2.85 ChatGPT Debug DOM (/chatgpt/debug)
+  if (pathname === '/chatgpt/debug') {
+    try {
+      const data = await dispatchToExtension('chatgpt_debug_dom', {});
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(data, null, 2));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  // 2.86 ChatGPT Test Input (/chatgpt/test_input)
+  if (pathname === '/chatgpt/test_input') {
+    try {
+      const text = parsedUrl.searchParams.get('text') || '你好测试';
+      const data = await dispatchToExtension('chatgpt_test_input', { text });
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(data, null, 2));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  // 2.87 ChatGPT Test Send (/chatgpt/test_send)
+  if (pathname === '/chatgpt/test_send') {
+    try {
+      const prompt = parsedUrl.searchParams.get('prompt') || '你好，1+1等于几？';
+      const method = parsedUrl.searchParams.get('method') || 'all';
+      const data = await dispatchToExtension('chatgpt_test_send', { prompt, method });
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(data, null, 2));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  // 2.9 ChatGPT Chat / OpenAI Compatible Completions (/v1/chat/completions or /chatgpt/chat)
+  if ((pathname === '/chatgpt/chat' || pathname === '/v1/chat/completions') && req.method === 'POST') {
+    if (extensionSockets.size === 0) {
+      res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: '浏览器扩展未连接' }));
+      return;
+    }
+    try {
+      const body = await readRequestBody(req);
+      const json = JSON.parse(body || '{}');
+
+      let promptText = json.prompt || '';
+      if (!promptText && Array.isArray(json.messages)) {
+        const lastUser = [...json.messages].reverse().find(m => m.role === 'user');
+        promptText = lastUser ? (typeof lastUser.content === 'string' ? lastUser.content : JSON.stringify(lastUser.content)) : '';
+      }
+
+      if (!promptText) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: '缺少 prompt 或 messages 参数' }));
+        return;
+      }
+
+      const result = await dispatchToExtension('chatgpt_send_message', { prompt: promptText });
+      if (!result.success) {
+        res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: result.error || 'ChatGPT 对话处理失败' }));
+        return;
+      }
+
+      const openaiResp = {
+        id: 'chatcmpl-' + Date.now(),
+        object: 'chat.completion',
+        created: Math.floor(Date.now() / 1000),
+        model: json.model || 'chatgpt-web',
+        choices: [
+          {
+            index: 0,
+            message: {
+              role: 'assistant',
+              content: result.text
+            },
+            finish_reason: 'stop'
+          }
+        ]
+      };
+
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(openaiResp, null, 2));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
   // 3. Fetch Cookies by Domain / URL
   if (pathname === '/cookies') {
     let domain = parsedUrl.searchParams.get('domain') || parsedUrl.searchParams.get('url');
@@ -242,7 +443,7 @@ function dispatchToExtension(action, payload) {
     }
 
     const reqId = 'req_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
-    const timeoutMs = 5000;
+    const timeoutMs = (action === 'chatgpt_send_message' || payload.timeout) ? (payload.timeout || 120000) : 8000;
 
     const timer = setTimeout(() => {
       pendingRequests.delete(reqId);

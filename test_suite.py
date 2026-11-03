@@ -9,6 +9,7 @@ import json
 from cookie_bridge import CookieBridge
 from bilibili_service import BilibiliService
 from baidu_pan_service import BaiduPanService
+from chatgpt_service import ChatGPTBridgeClient
 
 if sys.platform == "win32":
     try:
@@ -25,7 +26,7 @@ def main():
     bridge = CookieBridge()
 
     # 1. 测试本地服务连接
-    print("\n[测试 1/5] 正在检测本地 Cookie Hub 守护服务状态...")
+    print("\n[测试 1/6] 正在检测本地 Cookie Hub 守护服务状态...")
     try:
         status = bridge.check_status()
         print("  ✅ 本地服务在线!")
@@ -39,7 +40,7 @@ def main():
         sys.exit(1)
 
     # 2. 测试 Bilibili 凭证提取与个人中心
-    print("\n[测试 2/5] 正在提取 B 站 Cookie 并测试官方用户中心接口...")
+    print("\n[测试 2/6] 正在提取 B 站 Cookie 并测试官方用户中心接口...")
     try:
         bili = BilibiliService(bridge)
         user_info = bili.get_user_info()
@@ -56,7 +57,7 @@ def main():
         sys.exit(1)
 
     # 3. 测试 Bilibili 视频流解析接口
-    print("\n[测试 3/5] 正在测试 B 站视频直链与清晰度参数解析...")
+    print("\n[测试 3/6] 正在测试 B 站视频直链与清晰度参数解析...")
     test_bvid = "BV1GJ411x7h7"
     try:
         video_info = bili.get_video_info(test_bvid)
@@ -72,7 +73,7 @@ def main():
         print(f"  ❌ 视频解析测试失败: {e}")
 
     # 4. 测试 百度网盘 账号与容量配额 API
-    print("\n[测试 4/5] 正在提取百度网盘 Cookie (BDUSS/STOKEN) 并测试容量配额接口...")
+    print("\n[测试 4/6] 正在提取百度网盘 Cookie (BDUSS/STOKEN) 并测试容量配额接口...")
     try:
         pan = BaiduPanService(bridge)
         uinfo = pan.get_user_info()
@@ -87,7 +88,7 @@ def main():
         print(f"  ❌ 百度网盘接口测试失败: {e}")
 
     # 5. 测试 百度网盘 文件列表 API
-    print("\n[测试 5/5] 正在测试百度网盘根目录文件遍历 API...")
+    print("\n[测试 5/6] 正在测试百度网盘根目录文件遍历 API...")
     try:
         files_data = pan.list_files("/", limit=5)
         files = files_data.get("list", [])
@@ -98,8 +99,26 @@ def main():
     except Exception as e:
         print(f"  ❌ 百度网盘文件列表测试失败: {e}")
 
+    # 6. 测试 ChatGPT Web 桥接对话接口 (/v1/chat/completions)
+    print("\n[测试 6/6] 正在测试 ChatGPT Web 原生桥接通信与智能问答 (/v1/chat/completions)...")
+    try:
+        gpt = ChatGPTBridgeClient()
+        session_info = gpt.get_session().get("session", {})
+        user_name = session_info.get("user", {}).get("name", "Unknown")
+        user_email = session_info.get("user", {}).get("email", "Unknown")
+        plan = session_info.get("accountPlan", "free")
+        print(f"  ✅ 成功获取 ChatGPT 鉴权凭证与会话状态 (用户: {user_name} / {user_email}, 方案: {plan})")
+
+        prompt = "请用一句简短的话说明：2加2等于几？"
+        reply = gpt.ask(prompt)
+        print(f"  ✅ ChatGPT 对话测试成功!")
+        print(f"     提问: {prompt}")
+        print(f"     回复: {reply.strip()}")
+    except Exception as e:
+        print(f"  ❌ ChatGPT 接口测试失败: {e}")
+
     print("\n" + "=" * 60)
-    print("🎉 自动化测试套件执行完毕：Bilibili + 百度网盘 全流程实测通过！")
+    print("🎉 自动化测试套件执行完毕：Bilibili + 百度网盘 + ChatGPT 全流程实测通过！")
     print("=" * 60)
 
 

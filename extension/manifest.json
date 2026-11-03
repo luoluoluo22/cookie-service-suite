@@ -1,14 +1,16 @@
 {
   "manifest_version": 3,
-  "name": "Cookie Hub - 开发者 Cookie 提取助手",
-  "version": "1.2.0",
-  "description": "专为开发者打造的轻量 Cookie 提取与导出工具，支持本地双向通信，可按需由本地服务/脚本通过 API 随时调用提取任意域名的 Cookie。",
+  "name": "Cookie Hub - 开发者 Cookie 提取与 ChatGPT 桥接助手",
+  "version": "1.3.0",
+  "description": "专为开发者打造的轻量 Cookie 提取与 ChatGPT Web 页面原生桥接工具，突破 Cloudflare TLS 与签名拦截，实现本地 API 自由调用。",
   "permissions": [
     "cookies",
+    "tabs",
     "activeTab",
     "clipboardWrite",
     "storage",
-    "alarms"
+    "alarms",
+    "scripting"
   ],
   "host_permissions": [
     "<all_urls>"
@@ -16,6 +18,16 @@
   "background": {
     "service_worker": "background.js"
   },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://*.chatgpt.com/*"
+      ],
+      "js": ["chatgpt_bridge.js"],
+      "run_at": "document_idle"
+    }
+  ],
   "action": {
     "default_popup": "popup.html",
     "default_title": "Cookie Hub",
