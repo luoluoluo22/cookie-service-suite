@@ -14,6 +14,7 @@ const pendingRequests = new Map();
 
 // Map to route SSE streaming events to active HTTP responses: reqId -> { onChunk, onDone }
 const activeStreams = new Map();
+let currentBridgeTabId = null;
 
 // Create HTTP Server
 const server = http.createServer(async (req, res) => {
@@ -111,6 +112,7 @@ const server = http.createServer(async (req, res) => {
   if (pathname === '/chatgpt/open') {
     try {
       const data = await dispatchToExtension('open_chatgpt_tab', {});
+      if (data && data.tabId) currentBridgeTabId = Number(data.tabId);
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify(data, null, 2));
     } catch (err) {
@@ -123,6 +125,7 @@ const server = http.createServer(async (req, res) => {
   if (pathname === '/chatgpt/set_tab') {
     try {
       const tabId = parsedUrl.searchParams.get('tabId');
+      if (tabId) currentBridgeTabId = Number(tabId);
       const data = await dispatchToExtension('set_bridge_tab', { tabId });
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify(data, null, 2));
@@ -141,7 +144,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     try {
-      const data = await dispatchToExtension('chatgpt_get_session', {});
+      const data = await dispatchToExtension('chatgpt_get_session', { tabId: currentBridgeTabId });
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify(data, null, 2));
     } catch (err) {
@@ -154,7 +157,7 @@ const server = http.createServer(async (req, res) => {
   // 2.82 ChatGPT Models (/chatgpt/models)
   if (pathname === '/chatgpt/models') {
     try {
-      const data = await dispatchToExtension('chatgpt_get_models', {});
+      const data = await dispatchToExtension('chatgpt_get_models', { tabId: currentBridgeTabId });
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify(data, null, 2));
     } catch (err) {
@@ -255,8 +258,10 @@ const server = http.createServer(async (req, res) => {
         if (typeof res.flushHeaders === 'function') res.flushHeaders();
 
         let streamClosed = false;
+        let receivedAnyChunk = false;
         const sendChunk = (delta) => {
           if (!streamClosed && delta) {
+            receivedAnyChunk = true;
             const chunkObj = {
               id: 'chatcmpl-' + Date.now(),
               object: 'chat.completion.chunk',
@@ -274,8 +279,9 @@ const server = http.createServer(async (req, res) => {
           }
         };
 
-        const finishStream = () => {
+        const finishStream = (force = false) => {
           if (!streamClosed) {
+            if (!force && !receivedAnyChunk) return;
             const endObj = {
               id: 'chatcmpl-' + Date.now(),
               object: 'chat.completion.chunk',
@@ -299,7 +305,7 @@ const server = http.createServer(async (req, res) => {
 
         activeStreams.set(streamReqId, {
           onChunk: (delta) => sendChunk(delta),
-          onDone: () => finishStream()
+          onDone: () => finishStream(false)
         });
 
         req.on('close', () => {
@@ -307,11 +313,11 @@ const server = http.createServer(async (req, res) => {
           activeStreams.delete(streamReqId);
         });
 
-        dispatchToExtension('chatgpt_send_message', { reqId: streamReqId, prompt: promptText }).then((result) => {
+        dispatchToExtension('chatgpt_send_message', { reqId: streamReqId, prompt: promptText, tabId: currentBridgeTabId }).then((result) => {
           // If stream not closed yet, send result text if not sent, then finish
           if (!streamClosed) {
-            if (result && result.text) sendChunk(result.text);
-            finishStream();
+            if (result && result.text && !receivedAnyChunk) sendChunk(result.text);
+            finishStream(true);
           }
         }).catch(err => {
           if (!streamClosed) {
@@ -337,7 +343,7 @@ const server = http.createServer(async (req, res) => {
         }
       });
 
-      const result = await dispatchToExtension('chatgpt_send_message', { reqId: streamReqId, prompt: promptText });
+      const result = await dispatchToExtension('chatgpt_send_message', { reqId: streamReqId, prompt: promptText, tabId: currentBridgeTabId });
       activeStreams.delete(streamReqId);
 
       const finalContent = (accumulatedSSEText && accumulatedSSEText.trim()) ? accumulatedSSEText.trim() : (result.text || '');

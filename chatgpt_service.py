@@ -7,6 +7,7 @@ ChatGPT Web In-Page Bridge Client
 并对外暴露标准的 OpenAI /v1/chat/completions 兼容接口（同时支持流式 SSE stream 与全量非流式返回）。
 """
 
+import os
 import urllib.request
 import urllib.parse
 import json
@@ -19,26 +20,28 @@ class ChatGPTBridgeClient:
     def __init__(self, base_url: str = DEFAULT_BRIDGE_URL, timeout: int = 120):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        # 强制直连本地 127.0.0.1 回环地址，杜绝系统 HTTP 代理劫持
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     def check_health(self) -> dict:
         """检查本地桥接服务是否正常运行且扩展已连接"""
         url = f"{self.base_url}/status"
         req = urllib.request.Request(url)
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with self.opener.open(req, timeout=5) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
     def get_session(self) -> dict:
         """获取浏览器中 ChatGPT 当前登录会话（包括 AccessToken、用户邮箱、Plus 会员状态）"""
         url = f"{self.base_url}/chatgpt/session"
         req = urllib.request.Request(url)
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with self.opener.open(req, timeout=10) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
     def get_models(self) -> dict:
         """获取当前账号可用模型目录"""
         url = f"{self.base_url}/chatgpt/models"
         req = urllib.request.Request(url)
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with self.opener.open(req, timeout=10) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
     def ask(self, prompt: str, model: str = "chatgpt-web", stream: bool = False) -> Union[str, Generator[str, None, None]]:
@@ -66,7 +69,7 @@ class ChatGPTBridgeClient:
             data=payload,
             headers={"Content-Type": "application/json; charset=utf-8"}
         )
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+        with self.opener.open(req, timeout=self.timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
     def stream_chat(self, messages: List[Dict[str, str]], model: str = "chatgpt-web") -> Generator[str, None, None]:
@@ -89,7 +92,7 @@ class ChatGPTBridgeClient:
             data=payload,
             headers={"Content-Type": "application/json; charset=utf-8"}
         )
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+        with self.opener.open(req, timeout=self.timeout) as resp:
             for raw_line in resp:
                 line = raw_line.decode("utf-8").strip()
                 if not line or not line.startswith("data:"):

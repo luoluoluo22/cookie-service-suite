@@ -251,29 +251,6 @@ function waitForAssistantReply(initialCount, timeoutMs = 90000) {
     }, 600);
   });
 }
-        const lastArticle = articles[articles.length - 1];
-        // Content container inside assistant message
-        const contentEl = lastArticle.querySelector('.markdown') || lastArticle;
-        const currentText = contentEl.innerText.trim();
-
-        if (currentText) {
-          if (currentText === lastContent) {
-            stableTimes++;
-          } else {
-            stableTimes = 0;
-            lastContent = currentText;
-          }
-        }
-      }
-
-      // If stop button is gone and content has stabilized, generation is done!
-      if (!stopBtn && lastContent && stableTimes >= 3) {
-        clearInterval(interval);
-        resolve(lastContent);
-      }
-    }, 600);
-  });
-}
 
 function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));

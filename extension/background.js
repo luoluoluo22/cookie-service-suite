@@ -288,6 +288,7 @@ async function handleGetActiveTabCookies() {
 let activeBridgeTabId = null;
 let currentStreamReqId = null;
 let lastStreamAccumulatedText = '';
+let currentStreamDone = false;
 
 // Helper: Install in-page window.fetch Hook to intercept /backend-api/conversation SSE stream
 async function ensureInPageSSEHook(tabId) {
@@ -403,40 +404,67 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         raw: JSON.stringify(chunkData).substring(0, 180)
       }));
     }
+    let delta = '';
     let newFullText = null;
 
-    if (chunkData && chunkData.message && chunkData.message.content) {
-      const parts = chunkData.message.content.parts;
-      if (Array.isArray(parts) && parts.length > 0) {
-        newFullText = parts.join('');
+    // Form 1: chunkData.v.message or chunkData.message - ONLY ASSISTANT!
+    const msgObj = chunkData?.message || chunkData?.v?.message;
+    if (msgObj && msgObj.author?.role === 'assistant' && msgObj.content && Array.isArray(msgObj.content.parts)) {
+      newFullText = msgObj.content.parts.join('');
+    }
+
+    // Form 2: JSON Patch array in chunkData.v
+    if (Array.isArray(chunkData?.v)) {
+      for (const op of chunkData.v) {
+        if (op?.p && op.p.includes('/parts/') && typeof op.v === 'string') {
+          if (op.o === 'append') {
+            delta += op.v;
+          } else if (op.o === 'replace') {
+            newFullText = op.v;
+          }
+        }
+      }
+    }
+
+    // Form 3: Single JSON patch object
+    if (chunkData?.p && chunkData.p.includes('/parts/') && typeof chunkData.v === 'string') {
+      if (chunkData.o === 'append') {
+        delta += chunkData.v;
+      } else if (chunkData.o === 'replace') {
+        newFullText = chunkData.v;
       }
     }
 
     if (newFullText !== null) {
-      let delta = '';
       if (newFullText.length > lastStreamAccumulatedText.length) {
         delta = newFullText.slice(lastStreamAccumulatedText.length);
         lastStreamAccumulatedText = newFullText;
       }
+    } else if (delta) {
+      lastStreamAccumulatedText += delta;
+    }
+
+    if (delta && ws && ws.readyState === WebSocket.OPEN && currentStreamReqId) {
+      ws.send(JSON.stringify({
+        action: 'chatgpt_sse_chunk',
+        reqId: currentStreamReqId,
+        delta: delta,
+        text: lastStreamAccumulatedText,
+        isDone: false
+      }));
+    }
+  } else if (msg.type === 'COOKIE_HUB_SSE_DONE') {
+    if (lastStreamAccumulatedText.length > 0) {
+      currentStreamDone = true;
       if (ws && ws.readyState === WebSocket.OPEN && currentStreamReqId) {
         ws.send(JSON.stringify({
           action: 'chatgpt_sse_chunk',
           reqId: currentStreamReqId,
-          delta: delta,
-          text: newFullText,
-          isDone: false
+          delta: '',
+          text: lastStreamAccumulatedText,
+          isDone: true
         }));
       }
-    }
-  } else if (msg.type === 'COOKIE_HUB_SSE_DONE') {
-    if (ws && ws.readyState === WebSocket.OPEN && currentStreamReqId) {
-      ws.send(JSON.stringify({
-        action: 'chatgpt_sse_chunk',
-        reqId: currentStreamReqId,
-        delta: '',
-        text: lastStreamAccumulatedText,
-        isDone: true
-      }));
     }
   }
   return true;
@@ -684,41 +712,39 @@ async function dispatchToChatGPTTab(action, payload) {
     const promptText = payload.prompt;
     currentStreamReqId = payload.reqId || ('req_' + Date.now());
     lastStreamAccumulatedText = '';
+    currentStreamDone = false;
 
     // Ensure In-Page window.fetch SSE Hook is installed in target tab
     await ensureInPageSSEHook(tab.id);
 
-    const results = await chrome.scripting.executeScript({
+    // Step 1: Input text & trigger send in target tab
+    await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       args: [promptText],
       func: async (text) => {
         const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-        const el = document.querySelector('#prompt-textarea') || document.querySelector('div[contenteditable="true"]');
+        const el = document.querySelector('form #prompt-textarea') ||
+                   document.querySelector('#prompt-textarea') ||
+                   document.querySelector('form div[contenteditable="true"]') ||
+                   document.querySelector('form textarea');
         if (!el) return { success: false, error: '未在页面中找到输入框 (#prompt-textarea)' };
 
-        // Check if there is an active stop button with offsetParent > 0 (meaning busy); if so, click stop
+        // Click stop if busy
         const stopBtn = Array.from(document.querySelectorAll('button[aria-label="停止"], button[data-testid="stop-button"]'))
           .find(b => b.offsetWidth > 0 && b.offsetHeight > 0);
         if (stopBtn) {
           stopBtn.click();
-          await sleep(600);
+          await sleep(500);
         }
 
-        // Count existing visible MarkdownRoots (excluding user message bubbles)
-        const getMarkdownRoots = () => Array.from(document.querySelectorAll('[class*="MarkdownRoot"], .markdown'))
-          .filter(m => !m.closest('.group\\/user-message') && m.innerText.trim().length > 0);
-
-        const initialRootsCount = getMarkdownRoots().length;
-
-        // Focus & insert text via execCommand to trigger ProseMirror/Lexical editor state
+        // Clear any previous text & focus
         el.focus();
-        const sel = window.getSelection();
-        const range = document.createRange();
-        range.selectNodeContents(el);
-        sel.removeAllRanges();
-        sel.addRange(range);
+        document.execCommand('selectAll', false, null);
+        document.execCommand('delete', false, null);
+        await sleep(100);
 
+        // Insert prompt text
         document.execCommand('insertText', false, text);
         el.dispatchEvent(new InputEvent('input', {
           bubbles: true,
@@ -726,21 +752,52 @@ async function dispatchToChatGPTTab(action, payload) {
           inputType: 'insertText',
           data: text
         }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
 
-        await sleep(350);
+        const getInputText = () => (el.innerText || el.value || '').trim();
+        if (!getInputText()) {
+          if (el.isContentEditable) el.textContent = text;
+          else el.value = text;
+          el.dispatchEvent(new InputEvent('input', { bubbles: true }));
+        }
 
-        // Find send button
-        const form = el.closest('form');
-        const sendBtn = document.querySelector('button[aria-label="发送"]') ||
-                        document.querySelector('button[aria-label="Send prompt"]') ||
-                        document.querySelector('button[aria-label="发送提示"]') ||
-                        document.querySelector('button[data-testid="send-button"]') ||
-                        document.querySelector('button[type="submit"].bg-composer-primary') ||
-                        document.querySelector('button[type="submit"]') ||
-                        document.querySelector('.icon-primary-action')?.closest('button');
+        // Strict Voice Mode / Mic button filter
+        const isVoiceButton = (b) => {
+          if (!b) return true;
+          const testId = (b.getAttribute('data-testid') || '').toLowerCase();
+          const aria = (b.getAttribute('aria-label') || '').toLowerCase();
+          return testId.includes('voice') || testId.includes('mic') || aria.includes('语音') || aria.includes('voice');
+        };
 
-        // Dispatch click / key events
-        if (sendBtn) {
+        const findSendButton = () => {
+          const form = el.closest('form') || document;
+          const candidates = Array.from(form.querySelectorAll('button'));
+          for (const b of candidates) {
+            if (isVoiceButton(b)) continue;
+            const testId = b.getAttribute('data-testid') || '';
+            const aria = b.getAttribute('aria-label') || '';
+            if (testId === 'send-button' || aria === '发送' || aria === '发送提示' || aria === 'Send prompt') {
+              return b;
+            }
+            if (b.type === 'submit' && !isVoiceButton(b)) {
+              return b;
+            }
+          }
+          return null;
+        };
+
+        // Wait up to 3s for React to recognize input text and render the enabled Send button
+        let sendBtn = null;
+        for (let i = 0; i < 30; i++) {
+          await sleep(100);
+          if (getInputText().length > 0) {
+            sendBtn = findSendButton();
+            if (sendBtn && !sendBtn.disabled) break;
+          }
+        }
+
+        // Click strictly verified non-voice send button
+        if (sendBtn && !sendBtn.disabled) {
           sendBtn.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }));
           sendBtn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
           sendBtn.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true }));
@@ -748,69 +805,43 @@ async function dispatchToChatGPTTab(action, payload) {
           sendBtn.click();
         }
 
-        // Also dispatch Enter on input element
+        // Enter key dispatch
         el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
         el.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
 
-        if (form) {
+        const form = el.closest('form');
+        if (form && sendBtn && !sendBtn.disabled) {
           try { form.requestSubmit(); } catch (e) {}
         }
 
-        // Wait for generation to start and then finish
-        const start = Date.now();
-        let lastContent = '';
-        let stableTimes = 0;
-        let generationEverStarted = false;
-
-        // Poll for up to 90 seconds
-        while (Date.now() - start < 90000) {
-          await sleep(600);
-
-          const isBusy = Array.from(document.querySelectorAll('button[aria-label="停止"], div[data-loading-indicator], .result-streaming'))
-            .some(e => e.offsetWidth > 0 && e.offsetHeight > 0);
-
-          if (isBusy) {
-            generationEverStarted = true;
-          }
-
-          const roots = getMarkdownRoots();
-          if (roots.length > initialRootsCount) {
-            generationEverStarted = true;
-            const targetEl = roots[roots.length - 1];
-            const currentText = targetEl.innerText.trim();
-
-            if (currentText) {
-              if (currentText === lastContent && !isBusy) {
-                stableTimes++;
-                if (stableTimes >= 2) {
-                  return { success: true, text: currentText };
-                }
-              } else {
-                lastContent = currentText;
-                stableTimes = 0;
-              }
-            }
-          } else if (generationEverStarted && !isBusy) {
-            const allRoots = getMarkdownRoots();
-            if (allRoots.length > 0) {
-              const currentText = allRoots[allRoots.length - 1].innerText.trim();
-              if (currentText) {
-                return { success: true, text: currentText };
-              }
-            }
-          }
-        }
-
-        if (lastContent) return { success: true, text: lastContent };
-        return { success: false, error: '等待 ChatGPT 回复超时' };
+        return { triggered: true, textLength: getInputText().length, sendBtnFound: !!sendBtn };
       }
     });
 
-    const scriptResult = results[0]?.result || { success: false, error: '执行脚本无返回值' };
+    // Step 2: Await completion via SSE stream hook (primary engine)
+    const startWait = Date.now();
+    while (!currentStreamDone && (Date.now() - startWait < 90000)) {
+      await new Promise(r => setTimeout(r, 200));
+    }
+
     if (lastStreamAccumulatedText && lastStreamAccumulatedText.trim().length > 0) {
       return { success: true, text: lastStreamAccumulatedText.trim(), source: 'sse_stream' };
     }
-    return { ...scriptResult, source: 'dom_fallback' };
+
+    // Step 3: DOM Fallback
+    const fallbackResults = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: () => {
+        const roots = Array.from(document.querySelectorAll('[class*="MarkdownRoot"], .markdown'))
+          .filter(m => !m.closest('.group\\/user-message') && m.innerText.trim().length > 0);
+        if (roots.length > 0) {
+          return { success: true, text: roots[roots.length - 1].innerText.trim() };
+        }
+        return { success: false, error: '未获取到回复内容' };
+      }
+    });
+
+    return fallbackResults[0]?.result || { success: false, error: '等待 ChatGPT 回复超时' };
   }
 
   throw new Error('未知的 ChatGPT 桥接操作: ' + action);
