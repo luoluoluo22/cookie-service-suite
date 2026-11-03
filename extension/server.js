@@ -193,6 +193,38 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // 2.86 ChatGPT Read Latest Reply (/chatgpt/latest)
+  if (pathname === '/chatgpt/latest') {
+    try {
+      const tabId = parsedUrl.searchParams.get('tabId') || currentBridgeTabId;
+      const data = await dispatchToExtension('chatgpt_get_latest_reply', { tabId: tabId ? Number(tabId) : null });
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(data, null, 2));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  // 2.87 ChatGPT Send Prompt Direct (/chatgpt/send_prompt)
+  if (pathname === '/chatgpt/send_prompt') {
+    try {
+      const tabId = parsedUrl.searchParams.get('tabId') || currentBridgeTabId;
+      const prompt = parsedUrl.searchParams.get('prompt') || '继续';
+      const data = await dispatchToExtension('chatgpt_send_message', {
+        prompt: prompt,
+        tabId: tabId ? Number(tabId) : null
+      });
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(data, null, 2));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
   // 2.86 ChatGPT Test Input (/chatgpt/test_input)
   if (pathname === '/chatgpt/test_input') {
     try {

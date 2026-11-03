@@ -585,6 +585,47 @@ async function dispatchToChatGPTTab(action, payload) {
     return results[0]?.result || { success: false, error: 'No result returned' };
   }
 
+  // 1.8 Get Latest Assistant Reply & Status in tab
+  if (action === 'chatgpt_get_latest_reply') {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: () => {
+        const isBusy = Array.from(document.querySelectorAll('button[aria-label="停止"], button[data-testid="stop-button"], div[data-loading-indicator], .result-streaming'))
+          .some(e => e.offsetWidth > 0 && e.offsetHeight > 0);
+
+        const assistantEls = Array.from(document.querySelectorAll('[data-message-author-role="assistant"]'));
+        let latestReply = '';
+        if (assistantEls.length > 0) {
+          const lastEl = assistantEls[assistantEls.length - 1];
+          const markdownEl = lastEl.querySelector('.markdown') || lastEl;
+          latestReply = markdownEl.innerText.trim();
+        } else {
+          const articles = Array.from(document.querySelectorAll('article'));
+          if (articles.length > 0) {
+            latestReply = articles[articles.length - 1].innerText.trim();
+          }
+        }
+
+        const userEls = Array.from(document.querySelectorAll('[data-message-author-role="user"]'));
+        let lastUserMsg = '';
+        if (userEls.length > 0) {
+          lastUserMsg = userEls[userEls.length - 1].innerText.trim();
+        }
+
+        return {
+          success: true,
+          isBusy,
+          title: document.title,
+          url: window.location.href,
+          assistantCount: assistantEls.length,
+          lastUserMsg,
+          latestReply
+        };
+      }
+    });
+    return results[0]?.result || { success: false, error: '执行脚本无返回值' };
+  }
+
   // 2. Debug DOM
   if (action === 'chatgpt_debug_dom') {
     networkLogs = [];
