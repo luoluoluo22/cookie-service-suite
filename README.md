@@ -49,7 +49,15 @@ cookie-service-suite/
 │   ├── chatgpt_bridge.js # ChatGPT 同源注入桥接脚本
 │   ├── popup.html/js/css # 开发者弹窗界面 (支持一键复制 Header/JSON/Netscape)
 │   └── reload.js         # 命令行一键重载扩展工具
+├── app_service.py        # 统一本地 RESTful API 服务与可视化管理控制台 (FastAPI)
+├── tray_service.py       # Windows 系统托盘守护程序 (pystray + Pillow)
+├── run_service.py        # 一键启动服务与托盘程序命令行脚本
+├── generate_icon.py      # 应用图标生成与多分辨率 ICO 转换工具
+├── assets/               # 桌面与系统托盘图标资源 (app_icon.png, app_icon.ico)
 ├── cookie_bridge.py      # 通用 Python SDK：向本地 Bridge 请求实时 Cookie
+├── gemini_service.py     # Gemini 多账号池化调度管理器 (支持 /u/0 ~ /u/3 与故障自愈)
+├── run_gemini_cli.py     # Gemini 4 账号命令行管理工具
+├── monitor_gemini_workflow.py # 长时间稳定性与多账号自动化轮询监控脚本
 ├── chatgpt_service.py    # ChatGPT 客户端 SDK：会话提取、模型列表、问答对话
 ├── baidu_pan_service.py  # 百度网盘业务实现：账号鉴权、配额计算、文件列表遍历
 ├── run_baidu_cli.py      # 百度网盘命令行工具：查看配额、用户信息、列出文件
@@ -161,6 +169,51 @@ python run_bili_cli.py video BV1GJ411x7h7
 
 # 携带大会员 Cookie 高清下载视频至 ./downloads
 python run_bili_cli.py download BV1GJ411x7h7
+```
+
+### 6. Google Gemini 4 账号统一池与负载均衡
+针对用户浏览器同时登录的多个 Google 账号（以 `/u/0`, `/u/1`, `/u/2`, `/u/3` 区分），本项目打造了池化管理套件：
+- **多账号自动轮换**：动态计算 `SAPISIDHASH` 签名，通过 `X-Goog-AuthUser` 区分多账号，基于最久未用 (LRU) 自动负载均衡。
+- **自愈保活机制**：后台主动周期性续期短效会话票据，遇到异常自动从 Cookie Hub (18888) 热刷新凭证并注入 SQLite。
+- **OpenAI 兼容接口**：开放 `http://127.0.0.1:18083/v1/chat/completions`。
+
+```powershell
+# 1. 查看 4 个已接入账号状态与轮询统计
+python run_gemini_cli.py list
+
+# 2. 命令行提问 (自动在 4 个账号间负载均衡轮转)
+python run_gemini_cli.py ask "量子纠缠是什么？"
+
+# 3. 启动 / 停止后台统一 API 服务 (端口 18083)
+python run_gemini_cli.py start
+python run_gemini_cli.py stop
+
+# 4. 执行长时间稳定性与自治轮询测试
+python monitor_gemini_workflow.py
+```
+
+### 7. 本地统一 API 服务与系统托盘管理控制台 (FastAPI + pystray)
+本项目采用成熟的 **FastAPI + Uvicorn + pystray** 封装了统一的本地服务总线：
+- **系统托盘常驻**：生成定制高科技质感应用图标 (`assets/app_icon.png` 与 `app_icon.ico`)，在 Windows 系统任务栏托盘中无感驻留。
+- **一键可视化管理界面**：点击或右键托盘图标即可在浏览器直接弹出现代化 Web 控制台 (`http://127.0.0.1:18800/`)。
+- **实时看板与在线调试**：
+  - 实时监控 Cookie Hub、Gemini 4账号槽位、ChatGPT 状态与运行时间。
+  - 内置在线 API 调试工作台 (Playground)，可直接对任何接口一键发送请求并即时渲染响应。
+  - 提供账号检测、令牌保活与浏览器全量 Cookie 重新提取功能。
+- **标准化 API 规范**：开箱即用内置 Swagger UI (`/docs`)、ReDoc (`/redoc`) 与标准 OpenAI 路由 (`/v1/chat/completions`)。
+
+```powershell
+# 1. 启动本地服务 + 系统托盘 + 自动打开管理控制台
+python run_service.py
+
+# 2. 纯命令行服务模式 (不驻留托盘，适合无界面环境)
+python run_service.py --no-tray
+
+# 3. 访问入口
+# Web 控制台:    http://127.0.0.1:18800/
+# Swagger UI:    http://127.0.0.1:18800/docs
+# ReDoc 规范:    http://127.0.0.1:18800/redoc
+# OpenAI 接口:   http://127.0.0.1:18800/v1/chat/completions
 ```
 
 ---

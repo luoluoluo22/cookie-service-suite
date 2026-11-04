@@ -1,0 +1,11 @@
+{
+  "port": 18083,
+  "host": "127.0.0.1",
+  "db_path": "D:\\Projects\\cookie-service-suite\\candidate_repos\\gemini-web2api-go\\gemini_pool.db",
+  "admin_enabled": true,
+  "admin_token": "admin_gemini_pool",
+  "impersonate": "chrome_146",
+  "default_model": "gemini-3.5-flash-lite",
+  "proxy": "http://127.0.0.1:7897",
+  "log_requests": true
+}

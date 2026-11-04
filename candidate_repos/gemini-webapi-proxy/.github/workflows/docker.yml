@@ -1,0 +1,195 @@
+name: Docker
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - "pyproject.toml"
+      - "src/**"
+      - "uv.lock"
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  # Docker tag components must be lowercase; the GitHub repository
+  # name preserves the user's casing, so we lowercase before
+  # composing any tag.  The image registry itself is case-
+  # insensitive on push but the tag literal is not.
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # Build each platform in its own job.  Each job pushes ONLY its
+  # own per-platform image (tagged with a `-<platform>` suffix)
+  # plus a unique digest, never a user-facing tag.  The `merge`
+  # job below then combines the per-platform images into a
+  # single multi-arch manifest list and re-tags it with the
+  # user-facing tags.  This avoids the previous bug where each
+  # matrix job pushed the same user-facing tag and the later push
+  # overwrote the earlier manifest list with a single-platform
+  # image.
+  build:
+    name: Build (${{ matrix.platform }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: ${{ matrix.platform }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      # Per-platform staging tag: lowercase the registry path
+      # (Docker requires lowercase) and replace the platform
+      # slash with a dash.  This step MUST run before the
+      # Build & push step.
+      - name: Compute staging tag
+        id: slug
+        run: |
+          platform_dash=$(echo "${{ matrix.platform }}" | tr '/' '-')
+          image_lower=$(echo "${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
+          staging="${{ env.REGISTRY }}/${image_lower}:${{ steps.meta.outputs.version }}-${platform_dash}"
+          echo "staging=${staging}" >> "$GITHUB_OUTPUT"
+          echo "staging=${staging}"
+
+      - name: Build & push (per-platform, no user tags)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.slug.outputs.staging }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # The default attest=type=provenance,mode=max would attach
+          # a separate attestation manifest per image, which then
+          # shows up in the per-platform staging tag's manifest
+          # list as an `architecture: unknown, os: unknown` entry
+          # (no platform descriptor).  When `imagetools create`
+          # merges the per-platform stagings into a single
+          # multi-arch manifest list, that unknown-platform entry
+          # survives and confuses `docker pull` for arm64.
+          # Disabling the attestation makes the per-platform
+          # staging tag a clean two-entry manifest list: the
+          # platform-specific image + its config.
+          provenance: false
+
+  merge:
+    name: Merge multi-arch manifest
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build manifest list and apply user tags
+        env:
+          DOCKER_CLI_EXPERIMENTAL: enabled
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          version="${{ steps.meta.outputs.version }}"
+          image_lower=$(echo "${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
+          image_repo="${{ env.REGISTRY }}/${image_lower}"
+
+          # Per-platform images (staging tags) were pushed by the
+          # build matrix.  Each staging tag is a small manifest
+          # list with one platform entry + an "unknown" 565-byte
+          # attestation from buildx.  We can't pass them straight
+          # to `imagetools create` because the unknown entry would
+          # leak into the user-facing manifest list and break
+          # `docker pull` for arm64.
+          #
+          # Instead, pull the per-platform image **digest** for
+          # each platform (which the registry resolves for us)
+          # and feed those digests to `imagetools create`.  The
+          # digest points at the actual image, not the
+          # attestation.
+          for plat in linux/amd64 linux/arm64; do
+            plat_dash=$(echo "$plat" | tr '/' '-')
+            staging="${image_repo}:${version}-${plat_dash}"
+            # Extract the manifest digest for the platform we
+            # built.  `docker buildx imagetools inspect` would also
+            # work, but the registry's manifest endpoint is
+            # simpler.
+            digest=$(curl -fsSL \
+              -H "Accept: application/vnd.oci.image.index.v1+json" \
+              "https://${image_repo/\//\/}/v2/${image_repo#*/}/manifests/${staging}" \
+              | python3 -c "import json,sys; d=json.load(sys.stdin); m=[x for x in d['manifests'] if x['platform']['architecture']=='$plat'.split('/')[0] and x['platform']['os']=='linux']; print(m[0]['digest'])")
+            echo "Platform $plat -> digest $digest (from $staging)"
+            # Stash digests in env vars for the next step.
+            if [ "$plat" = "linux/amd64" ]; then
+              echo "DIGEST_AMD64=$digest" >> "$GITHUB_ENV"
+            else
+              echo "DIGEST_ARM64=$digest" >> "$GITHUB_ENV"
+            fi
+          done
+
+          # Apply every user-facing tag from metadata-action to the
+          # combined multi-arch manifest list.
+          while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            echo "Creating manifest list $tag"
+            docker buildx imagetools create \
+              "${image_repo}@${DIGEST_AMD64}" \
+              "${image_repo}@${DIGEST_ARM64}" \
+              --tag "$tag" \
+              --platform linux/amd64,linux/arm64
+          done <<< "$TAGS"
+
+          # Drop the per-platform staging tags.
+          for plat in linux/amd64 linux/arm64; do
+            plat_dash=$(echo "$plat" | tr '/' '-')
+            docker buildx imagetools rm -f "${image_repo}:${version}-${plat_dash}" || true
+          done
