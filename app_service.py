@@ -66,6 +66,7 @@ START_TIME = datetime.datetime.now()
 class ChatRequest(BaseModel):
     prompt: str = Field(..., description="提问正文或指令内容", example="量子纠缠的基本原理是什么？")
     model: Optional[str] = Field("gemini-3.5-flash-lite", description="模型名称 (gemini-3.5-flash-lite, gemini-3.1-pro 等)", example="gemini-3.5-flash-lite")
+    reasoning_level: Optional[str] = Field("off", description="推理级别: 'off'(关闭思考/极速), 'medium'(中等推理), 'high'(深度扩展思考)", example="off")
     timeout: Optional[int] = Field(60, description="请求超时时间 (秒)", example=60)
 
 
@@ -77,6 +78,8 @@ class OpenAIMessage(BaseModel):
 class OpenAIChatRequest(BaseModel):
     model: Optional[str] = Field("gemini-3.5-flash-lite", example="gemini-3.5-flash-lite")
     messages: List[OpenAIMessage] = Field(..., description="对话历史消息列表")
+    reasoning_effort: Optional[str] = Field(None, description="OpenAI 兼容推理强度: 'low', 'medium', 'high'", example="medium")
+    reasoning_level: Optional[str] = Field(None, description="推理级别: 'off', 'medium', 'high'", example="off")
     stream: Optional[bool] = Field(False, description="是否启用流式输出")
     temperature: Optional[float] = Field(0.7, example=0.7)
 
@@ -167,18 +170,24 @@ def sync_gemini_profiles():
 def gemini_chat(req: ChatRequest):
     """
     底层通过最久未用 (LRU) 算法自动在已接入的 4 个账号之间分发请求，
+    支持指定推理级别 ('off' 快速直出, 'medium' 中等推理, 'high' 深度长思考链)，
     遇凭证过期或网络异常自动触发 Cookie Hub 热刷新与重试自愈。
     """
     if not gemini_pool.is_running():
         gemini_pool.start()
 
+    reasoning = req.reasoning_level or "off"
     try:
-        res = gemini_pool.ask_with_details(prompt=req.prompt, model=req.model, timeout=req.timeout)
+        res = gemini_pool.ask_with_details(
+            prompt=req.prompt, model=req.model, reasoning_level=reasoning, timeout=req.timeout
+        )
     except Exception as first_err:
         # 自动故障自愈：从 Cookie Hub 刷新凭证后重试一次
         try:
             gemini_pool.refresh_pool_cookies()
-            res = gemini_pool.ask_with_details(prompt=req.prompt, model=req.model, timeout=req.timeout)
+            res = gemini_pool.ask_with_details(
+                prompt=req.prompt, model=req.model, reasoning_level=reasoning, timeout=req.timeout
+            )
         except Exception as retry_err:
             raise HTTPException(status_code=502, detail=f"Gemini 调度调用失败 (自愈重试后仍失败): {str(retry_err)}")
 
@@ -190,6 +199,7 @@ def gemini_chat(req: ChatRequest):
         "authuser": res.get("authuser"),
         "latency_ms": res.get("took_ms"),
         "model": res.get("model"),
+        "reasoning_level": res.get("reasoning_level"),
     }
 
 
@@ -358,12 +368,17 @@ def openai_chat_completions(req: OpenAIChatRequest):
         gemini_pool.start()
 
     target_model = req.model if req.model and "gemini" in req.model else "gemini-3.5-flash-lite"
+    reasoning = req.reasoning_effort or req.reasoning_level or "off"
     try:
-        res = gemini_pool.ask_with_details(prompt=last_user_msg, model=target_model)
+        res = gemini_pool.ask_with_details(
+            prompt=last_user_msg, model=target_model, reasoning_level=reasoning
+        )
     except Exception as first_err:
         try:
             gemini_pool.refresh_pool_cookies()
-            res = gemini_pool.ask_with_details(prompt=last_user_msg, model=target_model)
+            res = gemini_pool.ask_with_details(
+                prompt=last_user_msg, model=target_model, reasoning_level=reasoning
+            )
         except Exception as retry_err:
             raise HTTPException(status_code=502, detail=f"OpenAI 兼容接口调用失败: {str(retry_err)}")
 
@@ -560,13 +575,13 @@ DASHBOARD_HTML = """
         <table class="w-full text-left text-sm text-slate-300">
           <thead class="bg-slate-900/60 text-xs uppercase text-slate-400 border-b border-slate-800">
             <tr>
-              <th class="py-3 px-4">序号</th>
+              <th class="py-3 px-3">序号</th>
               <th class="py-3 px-4">Google 账号真实名称与邮箱</th>
-              <th class="py-3 px-4">URL 路由前缀</th>
-              <th class="py-3 px-4">会话状态</th>
-              <th class="py-3 px-4">连续失败数</th>
-              <th class="py-3 px-4">最近调用时间</th>
-              <th class="py-3 px-4 text-right">操作</th>
+              <th class="py-3 px-3">URL 前缀</th>
+              <th class="py-3 px-4">5小时计算额度 (滚动窗口)</th>
+              <th class="py-3 px-4">周累计额度 (每周上限)</th>
+              <th class="py-3 px-3">会话健康</th>
+              <th class="py-3 px-3 text-right">操作</th>
             </tr>
           </thead>
           <tbody id="accounts-tbody" class="divide-y divide-slate-800/60">
@@ -583,7 +598,7 @@ DASHBOARD_HTML = """
           <h2 class="text-lg font-bold text-slate-100 flex items-center gap-2">
             <i class="fa-solid fa-terminal text-cyan-400"></i> 在线 API 调试工作台
           </h2>
-          <p class="text-xs text-slate-400">快速发起真实接口请求，支持自选模型与实时查看响应数据</p>
+          <p class="text-xs text-slate-400">快速发起真实接口请求，支持自选模型与思考推理级别</p>
         </div>
 
         <div>
@@ -591,7 +606,7 @@ DASHBOARD_HTML = """
           <select id="api-selector" onchange="switchApiTemplate()" class="w-full bg-slate-900 border border-slate-700 rounded-xl px-3.5 py-2 text-sm text-slate-200 focus:outline-none focus:border-cyan-400">
             <option value="gemini_chat">[POST] /api/gemini/chat (Gemini 4账号轮询对话)</option>
             <option value="openai_chat">[POST] /v1/chat/completions (OpenAI 兼容对话)</option>
-            <option value="gemini_accounts">[GET] /api/gemini/accounts (查看4账号状态)</option>
+            <option value="gemini_accounts">[GET] /api/gemini/accounts (查看4账号状态与额度)</option>
             <option value="sync_profiles">[POST] /api/gemini/accounts/sync-profiles (同步各账号真实名称)</option>
             <option value="hub_status">[GET] /api/hub/status (Cookie Hub 状态)</option>
             <option value="hub_cookies">[GET] /api/hub/cookies?domain=google.com (提取实时Cookie)</option>
@@ -601,22 +616,37 @@ DASHBOARD_HTML = """
           </select>
         </div>
 
-        <!-- 模型选择下拉控件 -->
-        <div id="model-select-container">
-          <label class="text-xs font-semibold text-slate-300 uppercase block mb-1.5 flex items-center justify-between">
-            <span><i class="fa-solid fa-cube text-cyan-400 mr-1.5"></i> 选择模型 (Model Selector)</span>
-            <span class="text-[10px] text-cyan-400/90 font-normal">切换自动联动 Body 参数</span>
-          </label>
-          <select id="model-selector" onchange="onModelChange()" class="w-full bg-slate-900 border border-cyan-500/40 rounded-xl px-3.5 py-2 text-sm text-cyan-300 focus:outline-none focus:border-cyan-400 shadow-inner">
-            <option value="gemini-3.5-flash-lite">gemini-3.5-flash-lite (极速响应 · 推荐默认)</option>
-            <option value="gemini-3.1-pro">gemini-3.1-pro (高智力强推理 · 复杂任务)</option>
-            <option value="gemini-3.6-flash">gemini-3.6-flash (多模态高通量 · 综合均衡)</option>
-            <option value="gemini-3.8-flash">gemini-3.8-flash (最新版 3.8 Flash 架构)</option>
-            <option value="gemini-3.1-pro-thinking">gemini-3.1-pro-thinking (深度长思考链模式)</option>
-            <option value="chatgpt-web">chatgpt-web (ChatGPT 网页原生桥接)</option>
-            <option value="gpt-4o">gpt-4o (OpenAI 协议通道映射)</option>
-            <option value="gpt-3.5-turbo">gpt-3.5-turbo (OpenAI 兼容协议)</option>
-          </select>
+        <!-- 模型与推理级别双控网格 -->
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3" id="model-controls-grid">
+          <!-- 模型选择下拉控件 -->
+          <div id="model-select-container">
+            <label class="text-xs font-semibold text-slate-300 uppercase block mb-1.5 flex items-center justify-between">
+              <span><i class="fa-solid fa-cube text-cyan-400 mr-1.5"></i> 选择模型 (Model)</span>
+            </label>
+            <select id="model-selector" onchange="onModelOrReasoningChange()" class="w-full bg-slate-900 border border-cyan-500/40 rounded-xl px-3 py-2 text-xs text-cyan-300 focus:outline-none focus:border-cyan-400 shadow-inner">
+              <option value="gemini-3.5-flash-lite">gemini-3.5-flash-lite (极速响应 · 推荐)</option>
+              <option value="gemini-3.1-pro">gemini-3.1-pro (强推理 · 复杂任务)</option>
+              <option value="gemini-3.6-flash">gemini-3.6-flash (多模态高通量 · 均衡)</option>
+              <option value="gemini-3.8-flash">gemini-3.8-flash (新版 3.8 Flash 架构)</option>
+              <option value="gemini-4-argon">gemini-4-argon (4 Argon 复杂推理)</option>
+              <option value="chatgpt-web">chatgpt-web (ChatGPT 网页原生)</option>
+              <option value="gpt-4o">gpt-4o (OpenAI 协议通道映射)</option>
+              <option value="gpt-3.5-turbo">gpt-3.5-turbo (OpenAI 兼容协议)</option>
+            </select>
+          </div>
+
+          <!-- 推理级别下拉控件 -->
+          <div id="reasoning-level-container">
+            <label class="text-xs font-semibold text-slate-300 uppercase block mb-1.5 flex items-center justify-between">
+              <span><i class="fa-solid fa-brain text-purple-400 mr-1.5"></i> 推理级别 (Reasoning)</span>
+              <span class="text-[10px] text-purple-300 font-mono">思考链</span>
+            </label>
+            <select id="reasoning-selector" onchange="onModelOrReasoningChange()" class="w-full bg-slate-900 border border-purple-500/40 rounded-xl px-3 py-2 text-xs text-purple-300 focus:outline-none focus:border-purple-400 shadow-inner">
+              <option value="off">🟢 关闭思考 / 快速模式 (Off · 直出)</option>
+              <option value="medium">🟡 中等推理 (Medium · 适度权衡)</option>
+              <option value="high">🟣 深度扩展思考 (High · 长思维链)</option>
+            </select>
+          </div>
         </div>
 
         <div class="flex gap-2 items-center">
@@ -625,7 +655,10 @@ DASHBOARD_HTML = """
         </div>
 
         <div id="req-body-container">
-          <label class="text-xs font-semibold text-slate-300 uppercase block mb-1.5">请求 Body (JSON)</label>
+          <label class="text-xs font-semibold text-slate-300 uppercase block mb-1.5 flex items-center justify-between">
+            <span>请求 Body (JSON)</span>
+            <span class="text-[10px] text-slate-400 font-normal">已自动联动模型与推理级别</span>
+          </label>
           <textarea id="req-body" rows="6" class="w-full bg-slate-900 font-mono text-xs border border-slate-700 rounded-xl p-3 text-cyan-300 focus:outline-none focus:border-cyan-400"></textarea>
         </div>
 
@@ -722,12 +755,12 @@ DASHBOARD_HTML = """
       gemini_chat: {
         method: "POST",
         url: "/api/gemini/chat",
-        body: JSON.stringify({ prompt: "请用一句话告诉我：量子纠缠是什么？", model: "gemini-3.5-flash-lite", timeout: 60 }, null, 2)
+        body: JSON.stringify({ prompt: "请用一句话告诉我：量子纠缠是什么？", model: "gemini-3.5-flash-lite", reasoning_level: "off", timeout: 60 }, null, 2)
       },
       openai_chat: {
         method: "POST",
         url: "/v1/chat/completions",
-        body: JSON.stringify({ model: "gemini-3.5-flash-lite", messages: [{ role: "user", content: "请只回复两个字母：OK。" }] }, null, 2)
+        body: JSON.stringify({ model: "gemini-3.5-flash-lite", messages: [{ role: "user", content: "请只回复两个字母：OK。" }], reasoning_level: "off" }, null, 2)
       },
       gemini_accounts: {
         method: "GET",
@@ -766,16 +799,33 @@ DASHBOARD_HTML = """
       }
     };
 
-    function onModelChange() {
-      const model = document.getElementById("model-selector").value;
+    function onModelOrReasoningChange() {
+      const baseModel = document.getElementById("model-selector").value;
+      const reasoning = document.getElementById("reasoning-selector").value;
       const bodyEl = document.getElementById("req-body");
       if (!bodyEl || !bodyEl.value) return;
+
       try {
         const data = JSON.parse(bodyEl.value);
-        if ("model" in data) {
-          data.model = model;
-          bodyEl.value = JSON.stringify(data, null, 2);
+        let targetModel = baseModel;
+        if (baseModel.startsWith("gemini")) {
+          let raw = baseModel.replace("-thinking-medium", "").replace("-thinking", "").replace("-thinking-lite", "");
+          if (reasoning === "high") {
+            if (raw === "gemini-4-argon") targetModel = "gemini-4-argon-thinking";
+            else if (raw === "gemini-3.8-flash" || raw === "gemini-3.7-flash") targetModel = "gemini-3.8-flash-thinking";
+            else targetModel = raw + "-thinking";
+          } else if (reasoning === "medium") {
+            if (raw === "gemini-4-argon") targetModel = "gemini-4-argon-thinking-medium";
+            else if (raw === "gemini-3.6-flash") targetModel = "gemini-3.6-flash-thinking";
+            else targetModel = raw;
+          } else {
+            targetModel = raw;
+          }
         }
+
+        data.model = targetModel;
+        data.reasoning_level = reasoning;
+        bodyEl.value = JSON.stringify(data, null, 2);
       } catch (e) {}
     }
 
@@ -786,25 +836,31 @@ DASHBOARD_HTML = """
       document.getElementById("req-method-badge").innerText = t.method;
       document.getElementById("req-endpoint").value = t.url;
       const container = document.getElementById("req-body-container");
-      const modelContainer = document.getElementById("model-select-container");
+      const controlsGrid = document.getElementById("model-controls-grid");
 
       if (t.method === "GET") {
         container.style.display = "none";
-        if (modelContainer) modelContainer.style.display = "none";
+        if (controlsGrid) controlsGrid.style.display = "none";
       } else {
         container.style.display = "block";
         document.getElementById("req-body").value = t.body;
-        // 仅对对话类请求展示模型选择框并自动对齐模型
+        // 仅对对话类请求展示模型与推理级别组合框
         if (key === "gemini_chat" || key === "openai_chat") {
-          if (modelContainer) modelContainer.style.display = "block";
+          if (controlsGrid) controlsGrid.style.display = "grid";
           try {
             const data = JSON.parse(t.body);
             if (data.model && document.getElementById("model-selector")) {
-              document.getElementById("model-selector").value = data.model;
+              let m = data.model;
+              if (m.endsWith("-thinking")) m = m.replace("-thinking", "");
+              if (m.endsWith("-thinking-medium")) m = m.replace("-thinking-medium", "");
+              document.getElementById("model-selector").value = m;
+            }
+            if (data.reasoning_level && document.getElementById("reasoning-selector")) {
+              document.getElementById("reasoning-selector").value = data.reasoning_level;
             }
           } catch (e) {}
         } else {
-          if (modelContainer) modelContainer.style.display = "none";
+          if (controlsGrid) controlsGrid.style.display = "none";
         }
       }
     }
@@ -868,7 +924,7 @@ DASHBOARD_HTML = """
           document.getElementById("gemini-status-text").innerText = `${sys.services.gemini_pool.active_accounts} 账号就绪`;
         }
 
-        // 2. 账号列表 (真实名称与邮箱美化卡片展示)
+        // 2. 账号列表 (真实名称、邮箱与 5小时/周额度双指标展示)
         const acctRes = await fetch("/api/gemini/accounts");
         if (acctRes.ok) {
           const data = await acctRes.json();
@@ -884,17 +940,27 @@ DASHBOARD_HTML = """
             const displayEmail = a.email ? a.email : '未解析邮箱';
             const initialChar = (displayName || displayEmail || 'G').trim().charAt(0).toUpperCase();
 
+            // 5小时与周额度渲染
+            const q5hUsed = a.quota_5h_used !== undefined ? a.quota_5h_used : 0;
+            const q5hLimit = a.quota_5h_limit || 50;
+            const q5hRemaining = a.quota_5h_remaining !== undefined ? a.quota_5h_remaining : (q5hLimit - q5hUsed);
+            const q5hReset = a.quota_5h_reset_str || "滚动重置就绪";
+
+            const qWeekUsed = a.quota_weekly_used !== undefined ? a.quota_weekly_used : 0;
+            const qWeekLimit = a.quota_weekly_limit || 500;
+            const qStatus = a.quota_status || "充裕 🟢";
+
             tr.innerHTML = `
-              <td class="py-3 px-4 font-mono text-cyan-400 font-bold">#${a.id}</td>
+              <td class="py-3 px-3 font-mono text-cyan-400 font-bold">#${a.id}</td>
               <td class="py-3 px-4">
-                <div class="flex items-center gap-3">
+                <div class="flex items-center gap-2.5">
                   <div class="w-8 h-8 rounded-full bg-gradient-to-tr from-amber-500 to-indigo-600 flex items-center justify-center text-xs font-bold text-white shadow-md shadow-indigo-500/20 shrink-0">
                     ${initialChar}
                   </div>
                   <div>
-                    <div class="font-semibold text-slate-100 flex items-center gap-2">
+                    <div class="font-semibold text-slate-100 flex items-center gap-1.5">
                       <span>${displayName}</span>
-                      <span class="text-[10px] px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300 font-mono font-medium">u/${a.auth_user}</span>
+                      <span class="text-[10px] px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300 font-mono">u/${a.auth_user}</span>
                     </div>
                     <div class="text-xs text-slate-400 font-mono flex items-center gap-1.5 mt-0.5">
                       <i class="fa-regular fa-envelope text-[11px] text-cyan-400"></i> ${displayEmail}
@@ -902,11 +968,30 @@ DASHBOARD_HTML = """
                   </div>
                 </div>
               </td>
-              <td class="py-3 px-4 text-xs font-mono text-slate-400">gemini.google.com/u/${a.auth_user}</td>
-              <td class="py-3 px-4"><span class="px-2 py-0.5 rounded text-xs font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">可用 (LRU)</span></td>
-              <td class="py-3 px-4 font-mono ${a.fail_count > 0 ? 'text-rose-400 font-bold' : 'text-slate-400'}">${a.fail_count}</td>
-              <td class="py-3 px-4 text-xs text-slate-400 font-mono">${lastUsed}</td>
-              <td class="py-3 px-4 text-right space-x-1.5">
+              <td class="py-3 px-3 text-xs font-mono text-slate-400">u/${a.auth_user}</td>
+              <td class="py-3 px-4">
+                <div class="space-y-1">
+                  <div class="flex items-center gap-1.5">
+                    <span class="px-2 py-0.5 rounded text-xs font-bold bg-amber-500/20 text-amber-300 border border-amber-500/30">已用: ${q5hUsed}/${q5hLimit}</span>
+                    <span class="text-[11px] text-slate-400 font-mono">余 ${q5hRemaining}</span>
+                  </div>
+                  <div class="text-[11px] text-slate-400 font-mono flex items-center gap-1">
+                    <i class="fa-regular fa-clock text-slate-500 text-[10px]"></i> ${q5hReset}
+                  </div>
+                </div>
+              </td>
+              <td class="py-3 px-4">
+                <div class="space-y-1">
+                  <div class="flex items-center gap-1.5">
+                    <span class="px-2 py-0.5 rounded text-xs font-bold bg-sky-500/20 text-sky-300 border border-sky-500/30">周累计: ${qWeekUsed}/${qWeekLimit}</span>
+                  </div>
+                  <div class="text-[11px] font-mono text-emerald-400 flex items-center gap-1">
+                    <span class="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400"></span> ${qStatus}
+                  </div>
+                </div>
+              </td>
+              <td class="py-3 px-3"><span class="px-2 py-0.5 rounded text-xs font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">可用 (LRU)</span></td>
+              <td class="py-3 px-3 text-right space-x-1">
                 <button onclick="checkAccount(${a.id})" class="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-slate-300 border border-slate-700 transition">检测</button>
                 <button onclick="rotateAccount(${a.id})" class="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-amber-400 border border-slate-700 transition">保活</button>
               </td>

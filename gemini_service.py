@@ -88,6 +88,52 @@ class GeminiService:
         return asyncio.run(self.async_get_quota())
 
 
+def resolve_model_reasoning(model: str, reasoning_level: str = "off") -> str:
+    """
+    根据基础模型名称和推理级别解析最终的模型 ID。
+    
+    推理级别可选:
+    - 'off' / 'none': 关闭思考模式，使用标准极速模型 (如 gemini-3.5-flash-lite, gemini-3.6-flash, gemini-3.1-pro)
+    - 'medium': 中等推理 (如 gemini-4-argon-thinking-medium，其余模型映射至标准或思考档)
+    - 'high' / 'extended': 深度长链扩展思考 (自动加 -thinking 后缀，如 gemini-3.1-pro-thinking, gemini-3.6-flash-thinking)
+    """
+    clean_level = (reasoning_level or "off").lower().strip()
+    base_model = (model or "gemini-3.5-flash-lite").strip()
+    if not base_model.startswith("gemini"):
+        return base_model
+
+    raw_base = base_model
+    for suffix in ["-thinking-medium", "-thinking", "-thinking-lite"]:
+        if raw_base.endswith(suffix):
+            raw_base = raw_base[:-len(suffix)]
+            break
+
+    if clean_level in ("high", "extended", "deep"):
+        if raw_base == "gemini-3.5-flash-lite":
+            return "gemini-3.5-flash-lite-thinking"
+        elif raw_base == "gemini-3.6-flash":
+            return "gemini-3.6-flash-thinking"
+        elif raw_base == "gemini-3.1-pro":
+            return "gemini-3.1-pro-thinking"
+        elif raw_base in ("gemini-3.8-flash", "gemini-3.7-flash"):
+            return "gemini-3.8-flash-thinking"
+        elif raw_base == "gemini-4-argon":
+            return "gemini-4-argon-thinking"
+        else:
+            return f"{raw_base}-thinking"
+    elif clean_level == "medium":
+        if raw_base == "gemini-4-argon":
+            return "gemini-4-argon-thinking-medium"
+        elif raw_base == "gemini-3.1-pro":
+            return "gemini-3.1-pro"
+        elif raw_base == "gemini-3.6-flash":
+            return "gemini-3.6-flash-thinking"
+        else:
+            return raw_base
+    else:
+        return raw_base
+
+
 class MultiAccountGeminiPool:
     """
     Gemini 浏览器多账号池化调度管理器。
@@ -378,7 +424,7 @@ class MultiAccountGeminiPool:
         return results
 
     def list_accounts(self) -> List[Dict[str, Any]]:
-        """获取账号池内所有账号的状态、真实名称与轮转统计。"""
+        """获取账号池内所有账号的状态、真实名称与 5 小时 / 周度额度统计。"""
         if not os.path.exists(self.db_path):
             self.init_database()
 
@@ -388,10 +434,14 @@ class MultiAccountGeminiPool:
             """SELECT id, label, authuser, status, last_used_at, fail_count, note 
                FROM accounts ORDER BY authuser ASC"""
         ).fetchall()
-        conn.close()
+
+        now = int(time.time())
+        five_hours_ago = now - 5 * 3600
+        one_week_ago = now - 7 * 86400
 
         res = []
         for r in rows:
+            acc_id = r[0]
             label_val = r[1]
             name = ""
             email = ""
@@ -402,9 +452,50 @@ class MultiAccountGeminiPool:
             elif "@" in label_val:
                 email = label_val.strip()
 
+            # 查询该账号 5 小时内与本周内的精确调用轨迹
+            row_5h = cur.execute(
+                """SELECT COUNT(1), MIN(ts), MAX(ts) 
+                   FROM requests WHERE account_id = ? AND ts >= ?""",
+                (acc_id, five_hours_ago),
+            ).fetchone()
+            count_5h = row_5h[0] if row_5h else 0
+            earliest_5h = row_5h[1] if row_5h and row_5h[1] else None
+
+            count_weekly = cur.execute(
+                "SELECT COUNT(1) FROM requests WHERE account_id = ? AND ts >= ?",
+                (acc_id, one_week_ago),
+            ).fetchone()[0]
+
+            # 计算 5 小时滚动重置倒计时
+            reset_str = "滚动窗口充裕"
+            if count_5h > 0 and earliest_5h:
+                secs_left = max(0, (earliest_5h + 5 * 3600) - now)
+                hours = secs_left // 3600
+                mins = (secs_left % 3600) // 60
+                if secs_left > 0:
+                    reset_str = f"{hours:02d}h {mins:02d}m 后滚动释放"
+                else:
+                    reset_str = "首批额度已释放"
+
+            limit_5h = 50
+            rem_5h = max(0, limit_5h - count_5h)
+            limit_weekly = 500
+            rem_weekly = max(0, limit_weekly - count_weekly)
+
+            # 额度健康度状态判定
+            if count_5h >= 45:
+                quota_status = "高负荷 🔴"
+                status_color = "rose"
+            elif count_5h >= 25:
+                quota_status = "适中 🟡"
+                status_color = "amber"
+            else:
+                quota_status = "充裕 🟢"
+                status_color = "emerald"
+
             res.append(
                 {
-                    "id": r[0],
+                    "id": acc_id,
                     "label": label_val,
                     "name": name,
                     "email": email,
@@ -414,28 +505,52 @@ class MultiAccountGeminiPool:
                     "last_used_at": r[4],
                     "fail_count": r[5],
                     "note": r[6],
+                    "quota_5h_used": count_5h,
+                    "quota_5h_limit": limit_5h,
+                    "quota_5h_remaining": rem_5h,
+                    "quota_5h_reset_str": reset_str,
+                    "quota_weekly_used": count_weekly,
+                    "quota_weekly_limit": limit_weekly,
+                    "quota_weekly_remaining": rem_weekly,
+                    "quota_status": quota_status,
+                    "quota_status_color": status_color,
                 }
             )
+        conn.close()
         return res
 
-    def ask(self, prompt: str, model: str = "gemini-3.5-flash-lite", timeout: int = 60) -> str:
+    def ask(
+        self,
+        prompt: str,
+        model: str = "gemini-3.5-flash-lite",
+        reasoning_level: str = "off",
+        timeout: int = 60,
+    ) -> str:
         """
         通过统一池化通道提问。
         底层自动在已接入的 4 个账号之间执行 LRU 轮转调用。
         """
-        details = self.ask_with_details(prompt=prompt, model=model, timeout=timeout)
+        details = self.ask_with_details(
+            prompt=prompt, model=model, reasoning_level=reasoning_level, timeout=timeout
+        )
         return details["reply"]
 
     def ask_with_details(
-        self, prompt: str, model: str = "gemini-3.5-flash-lite", timeout: int = 60
+        self,
+        prompt: str,
+        model: str = "gemini-3.5-flash-lite",
+        reasoning_level: str = "off",
+        timeout: int = 60,
     ) -> Dict[str, Any]:
         """
-        通过统一池化通道提问，并返回包含实际调用账号、耗时等详细元数据。
+        通过统一池化通道提问，支持选择推理级别，并返回包含实际调用账号、耗时等详细元数据。
         """
         if not self.is_running():
             started = self.start()
             if not started:
                 raise RuntimeError("无法启动本地 Gemini 多账号池代理服务！")
+
+        target_model = resolve_model_reasoning(model, reasoning_level)
 
         # 记录调用前最大的 requests 表 ID，用于匹配本次请求实际使用的账号
         prev_max_id = 0
@@ -449,7 +564,7 @@ class MultiAccountGeminiPool:
             pass
 
         req_data = {
-            "model": model,
+            "model": target_model,
             "messages": [{"role": "user", "content": prompt}],
             "stream": False,
         }
@@ -500,7 +615,9 @@ class MultiAccountGeminiPool:
             "account_label": account_label,
             "authuser": authuser,
             "took_ms": took_ms,
-            "model": model,
+            "model": target_model,
+            "base_model": model,
+            "reasoning_level": reasoning_level,
         }
 
     def check_account(self, account_id: int) -> Dict[str, Any]:
