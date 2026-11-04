@@ -149,6 +149,20 @@ def list_gemini_accounts():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/gemini/accounts/sync-profiles", summary="同步提取所有账号的真实 Google 昵称与邮箱", tags=["Gemini 多账号调度"])
+def sync_gemini_profiles():
+    """向 Google 上游拉取各 authuser 对应的真实用户显示昵称与 Gmail 邮箱并写入账号池。"""
+    try:
+        res = gemini_pool.sync_account_profiles()
+        return {
+            "success": True,
+            "message": "已成功更新 4 个账号的真实昵称与邮箱信息！",
+            "profiles": res,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"同步昵称邮箱失败: {str(e)}")
+
+
 @app.post("/api/gemini/chat", summary="向 Gemini 发起提问 (自动 LRU 负载均衡轮换)", tags=["Gemini 多账号调度"])
 def gemini_chat(req: ChatRequest):
     """
@@ -385,10 +399,14 @@ def openai_models():
     return {
         "object": "list",
         "data": [
-            {"id": "gemini-3.5-flash-lite", "object": "model", "owned_by": "google-cookie-suite"},
-            {"id": "gemini-3.1-pro", "object": "model", "owned_by": "google-cookie-suite"},
-            {"id": "gemini-3.6-flash", "object": "model", "owned_by": "google-cookie-suite"},
-            {"id": "chatgpt-web", "object": "model", "owned_by": "openai-cookie-suite"},
+            {"id": "gemini-3.5-flash-lite", "object": "model", "owned_by": "google-cookie-suite", "description": "极速响应毫秒级，推荐默认"},
+            {"id": "gemini-3.1-pro", "object": "model", "owned_by": "google-cookie-suite", "description": "高智力强推理，适合复杂任务"},
+            {"id": "gemini-3.6-flash", "object": "model", "owned_by": "google-cookie-suite", "description": "多模态高通量，通用均衡"},
+            {"id": "gemini-3.8-flash", "object": "model", "owned_by": "google-cookie-suite", "description": "新一代 Flash 架构"},
+            {"id": "gemini-3.1-pro-thinking", "object": "model", "owned_by": "google-cookie-suite", "description": "扩展深度思考链模式"},
+            {"id": "chatgpt-web", "object": "model", "owned_by": "openai-cookie-suite", "description": "ChatGPT 网页端原生桥接"},
+            {"id": "gpt-4o", "object": "model", "owned_by": "openai-cookie-suite", "description": "OpenAI 兼容通道映射"},
+            {"id": "gpt-3.5-turbo", "object": "model", "owned_by": "openai-cookie-suite", "description": "OpenAI 兼容通道映射"},
         ],
     }
 
@@ -521,15 +539,18 @@ DASHBOARD_HTML = """
 
     <!-- 2. Gemini 4 账号槽位看板 -->
     <section class="glass-card rounded-2xl p-6 shadow-xl">
-      <div class="flex items-center justify-between mb-4">
+      <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-4">
         <div>
           <h2 class="text-lg font-bold text-slate-100 flex items-center gap-2">
             <i class="fa-solid fa-users-gear text-amber-400"></i> Google Gemini 4 账号槽位看板
           </h2>
           <p class="text-xs text-slate-400">基于浏览器 /u/0 ~ /u/3 多登录体系，自动分发、保活与熔断切换</p>
         </div>
-        <div class="flex items-center gap-2">
-          <button onclick="refreshAllCookies()" class="px-3 py-1.5 rounded-lg text-xs font-medium bg-amber-500/10 text-amber-400 border border-amber-500/30 hover:bg-amber-500/20 transition flex items-center gap-1.5">
+        <div class="flex items-center gap-2.5">
+          <button onclick="syncProfiles()" id="btn-sync-profiles" class="px-3.5 py-1.5 rounded-lg text-xs font-medium bg-indigo-500/10 text-indigo-400 border border-indigo-500/30 hover:bg-indigo-500/20 transition flex items-center gap-1.5" title="抓取各账号在 Google 的真实用户名与 Gmail 邮箱">
+            <i class="fa-solid fa-id-card"></i> 同步真实名称与邮箱
+          </button>
+          <button onclick="refreshAllCookies()" class="px-3.5 py-1.5 rounded-lg text-xs font-medium bg-amber-500/10 text-amber-400 border border-amber-500/30 hover:bg-amber-500/20 transition flex items-center gap-1.5">
             <i class="fa-solid fa-arrows-rotate"></i> 从 Cookie Hub 刷新全部凭证
           </button>
         </div>
@@ -540,7 +561,7 @@ DASHBOARD_HTML = """
           <thead class="bg-slate-900/60 text-xs uppercase text-slate-400 border-b border-slate-800">
             <tr>
               <th class="py-3 px-4">序号</th>
-              <th class="py-3 px-4">账号标签</th>
+              <th class="py-3 px-4">Google 账号真实名称与邮箱</th>
               <th class="py-3 px-4">URL 路由前缀</th>
               <th class="py-3 px-4">会话状态</th>
               <th class="py-3 px-4">连续失败数</th>
@@ -562,7 +583,7 @@ DASHBOARD_HTML = """
           <h2 class="text-lg font-bold text-slate-100 flex items-center gap-2">
             <i class="fa-solid fa-terminal text-cyan-400"></i> 在线 API 调试工作台
           </h2>
-          <p class="text-xs text-slate-400">快速发起真实接口请求，查看响应数据与详细元信息</p>
+          <p class="text-xs text-slate-400">快速发起真实接口请求，支持自选模型与实时查看响应数据</p>
         </div>
 
         <div>
@@ -571,11 +592,30 @@ DASHBOARD_HTML = """
             <option value="gemini_chat">[POST] /api/gemini/chat (Gemini 4账号轮询对话)</option>
             <option value="openai_chat">[POST] /v1/chat/completions (OpenAI 兼容对话)</option>
             <option value="gemini_accounts">[GET] /api/gemini/accounts (查看4账号状态)</option>
+            <option value="sync_profiles">[POST] /api/gemini/accounts/sync-profiles (同步各账号真实名称)</option>
             <option value="hub_status">[GET] /api/hub/status (Cookie Hub 状态)</option>
             <option value="hub_cookies">[GET] /api/hub/cookies?domain=google.com (提取实时Cookie)</option>
             <option value="bili_user">[GET] /api/bilibili/user (B站个人资料与大会员)</option>
             <option value="baidu_quota">[GET] /api/baidupan/quota (百度网盘总配额)</option>
             <option value="chatgpt_session">[GET] /api/chatgpt/session (ChatGPT 会话提取)</option>
+          </select>
+        </div>
+
+        <!-- 模型选择下拉控件 -->
+        <div id="model-select-container">
+          <label class="text-xs font-semibold text-slate-300 uppercase block mb-1.5 flex items-center justify-between">
+            <span><i class="fa-solid fa-cube text-cyan-400 mr-1.5"></i> 选择模型 (Model Selector)</span>
+            <span class="text-[10px] text-cyan-400/90 font-normal">切换自动联动 Body 参数</span>
+          </label>
+          <select id="model-selector" onchange="onModelChange()" class="w-full bg-slate-900 border border-cyan-500/40 rounded-xl px-3.5 py-2 text-sm text-cyan-300 focus:outline-none focus:border-cyan-400 shadow-inner">
+            <option value="gemini-3.5-flash-lite">gemini-3.5-flash-lite (极速响应 · 推荐默认)</option>
+            <option value="gemini-3.1-pro">gemini-3.1-pro (高智力强推理 · 复杂任务)</option>
+            <option value="gemini-3.6-flash">gemini-3.6-flash (多模态高通量 · 综合均衡)</option>
+            <option value="gemini-3.8-flash">gemini-3.8-flash (最新版 3.8 Flash 架构)</option>
+            <option value="gemini-3.1-pro-thinking">gemini-3.1-pro-thinking (深度长思考链模式)</option>
+            <option value="chatgpt-web">chatgpt-web (ChatGPT 网页原生桥接)</option>
+            <option value="gpt-4o">gpt-4o (OpenAI 协议通道映射)</option>
+            <option value="gpt-3.5-turbo">gpt-3.5-turbo (OpenAI 兼容协议)</option>
           </select>
         </div>
 
@@ -694,6 +734,11 @@ DASHBOARD_HTML = """
         url: "/api/gemini/accounts",
         body: ""
       },
+      sync_profiles: {
+        method: "POST",
+        url: "/api/gemini/accounts/sync-profiles",
+        body: "{}"
+      },
       hub_status: {
         method: "GET",
         url: "/api/hub/status",
@@ -721,6 +766,19 @@ DASHBOARD_HTML = """
       }
     };
 
+    function onModelChange() {
+      const model = document.getElementById("model-selector").value;
+      const bodyEl = document.getElementById("req-body");
+      if (!bodyEl || !bodyEl.value) return;
+      try {
+        const data = JSON.parse(bodyEl.value);
+        if ("model" in data) {
+          data.model = model;
+          bodyEl.value = JSON.stringify(data, null, 2);
+        }
+      } catch (e) {}
+    }
+
     function switchApiTemplate() {
       const key = document.getElementById("api-selector").value;
       const t = TEMPLATES[key];
@@ -728,11 +786,26 @@ DASHBOARD_HTML = """
       document.getElementById("req-method-badge").innerText = t.method;
       document.getElementById("req-endpoint").value = t.url;
       const container = document.getElementById("req-body-container");
+      const modelContainer = document.getElementById("model-select-container");
+
       if (t.method === "GET") {
         container.style.display = "none";
+        if (modelContainer) modelContainer.style.display = "none";
       } else {
         container.style.display = "block";
         document.getElementById("req-body").value = t.body;
+        // 仅对对话类请求展示模型选择框并自动对齐模型
+        if (key === "gemini_chat" || key === "openai_chat") {
+          if (modelContainer) modelContainer.style.display = "block";
+          try {
+            const data = JSON.parse(t.body);
+            if (data.model && document.getElementById("model-selector")) {
+              document.getElementById("model-selector").value = data.model;
+            }
+          } catch (e) {}
+        } else {
+          if (modelContainer) modelContainer.style.display = "none";
+        }
       }
     }
 
@@ -795,7 +868,7 @@ DASHBOARD_HTML = """
           document.getElementById("gemini-status-text").innerText = `${sys.services.gemini_pool.active_accounts} 账号就绪`;
         }
 
-        // 2. 账号列表
+        // 2. 账号列表 (真实名称与邮箱美化卡片展示)
         const acctRes = await fetch("/api/gemini/accounts");
         if (acctRes.ok) {
           const data = await acctRes.json();
@@ -805,16 +878,37 @@ DASHBOARD_HTML = """
             const tr = document.createElement("tr");
             tr.className = "hover:bg-slate-900/40 transition";
             const lastUsed = a.last_used_at > 0 ? new Date(a.last_used_at * 1000).toLocaleTimeString() : "从未调用";
+            
+            // 头像与初始字符
+            const displayName = a.name ? a.name : (a.label || `账号槽位 u/${a.auth_user}`);
+            const displayEmail = a.email ? a.email : '未解析邮箱';
+            const initialChar = (displayName || displayEmail || 'G').trim().charAt(0).toUpperCase();
+
             tr.innerHTML = `
-              <td class="py-3 px-4 font-mono text-cyan-400">u/${a.auth_user}</td>
-              <td class="py-3 px-4 font-medium text-slate-200">${a.label}</td>
-              <td class="py-3 px-4 text-xs font-mono text-slate-400">${a.url_prefix}</td>
+              <td class="py-3 px-4 font-mono text-cyan-400 font-bold">#${a.id}</td>
+              <td class="py-3 px-4">
+                <div class="flex items-center gap-3">
+                  <div class="w-8 h-8 rounded-full bg-gradient-to-tr from-amber-500 to-indigo-600 flex items-center justify-center text-xs font-bold text-white shadow-md shadow-indigo-500/20 shrink-0">
+                    ${initialChar}
+                  </div>
+                  <div>
+                    <div class="font-semibold text-slate-100 flex items-center gap-2">
+                      <span>${displayName}</span>
+                      <span class="text-[10px] px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300 font-mono font-medium">u/${a.auth_user}</span>
+                    </div>
+                    <div class="text-xs text-slate-400 font-mono flex items-center gap-1.5 mt-0.5">
+                      <i class="fa-regular fa-envelope text-[11px] text-cyan-400"></i> ${displayEmail}
+                    </div>
+                  </div>
+                </div>
+              </td>
+              <td class="py-3 px-4 text-xs font-mono text-slate-400">gemini.google.com/u/${a.auth_user}</td>
               <td class="py-3 px-4"><span class="px-2 py-0.5 rounded text-xs font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">可用 (LRU)</span></td>
               <td class="py-3 px-4 font-mono ${a.fail_count > 0 ? 'text-rose-400 font-bold' : 'text-slate-400'}">${a.fail_count}</td>
               <td class="py-3 px-4 text-xs text-slate-400 font-mono">${lastUsed}</td>
               <td class="py-3 px-4 text-right space-x-1.5">
-                <button onclick="checkAccount(${a.id})" class="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-xs text-slate-300">检测</button>
-                <button onclick="rotateAccount(${a.id})" class="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-xs text-amber-400">保活</button>
+                <button onclick="checkAccount(${a.id})" class="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-slate-300 border border-slate-700 transition">检测</button>
+                <button onclick="rotateAccount(${a.id})" class="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-amber-400 border border-slate-700 transition">保活</button>
               </td>
             `;
             tbody.appendChild(tr);
@@ -824,6 +918,23 @@ DASHBOARD_HTML = """
         console.error("刷新失败:", e);
       } finally {
         icon.classList.remove("fa-spin");
+      }
+    }
+
+    async function syncProfiles() {
+      const btn = document.getElementById("btn-sync-profiles");
+      btn.disabled = true;
+      btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> 正在提取 Google 用户名与邮箱...`;
+      try {
+        const res = await fetch("/api/gemini/accounts/sync-profiles", { method: "POST" });
+        const data = await res.json();
+        alert(data.message || "账号真实用户名与邮箱已同步！");
+        await refreshDashboard();
+      } catch (err) {
+        alert("同步异常: " + err.message);
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = `<i class="fa-solid fa-id-card"></i> 同步真实名称与邮箱`;
       }
     }
 

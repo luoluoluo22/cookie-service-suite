@@ -11,8 +11,10 @@ import json
 import sqlite3
 import subprocess
 import urllib.request
+import re
+import ssl
 import asyncio
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 # 保证本地回环网络请求不走外部代理（Clash 等），避免 502 Bad Gateway
 os.environ["NO_PROXY"] = "127.0.0.1,localhost,::1"
@@ -272,30 +274,146 @@ class MultiAccountGeminiPool:
                 self.proc.kill()
             self.proc = None
 
+    def fetch_account_profile(
+        self, authuser: int, cookie_override: Optional[str] = None
+    ) -> Tuple[str, str]:
+        """通过抓取 Google Gemini /u/{authuser}/app 页面，提取该槽位的 Google 真实用户昵称与 Gmail 邮箱。"""
+        cookie = cookie_override
+        if not cookie:
+            try:
+                conn = sqlite3.connect(self.db_path)
+                row = conn.execute(
+                    "SELECT cookie FROM accounts WHERE authuser = ?", (authuser,)
+                ).fetchone()
+                conn.close()
+                if row and row[0]:
+                    cookie = row[0]
+            except Exception:
+                pass
+
+        if not cookie:
+            return "", ""
+
+        url = f"https://gemini.google.com/u/{authuser}/app"
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Cookie": cookie,
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+                ),
+            },
+        )
+        proxy_handler = (
+            urllib.request.ProxyHandler({"http": self.proxy, "https": self.proxy})
+            if self.proxy
+            else urllib.request.ProxyHandler({})
+        )
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        opener = urllib.request.build_opener(proxy_handler, urllib.request.HTTPSHandler(context=ctx))
+
+        try:
+            with opener.open(req, timeout=12) as resp:
+                html = resp.read().decode("utf-8", errors="ignore")
+
+            # 匹配 aria-label="Google Account: Alena Bray  &#10;(wargowskytom404@gmail.com)" 或中文 帐号：
+            m = re.search(
+                r'Google\s*[^:："]*[:：]\s*([^&"\(]+?)\s*(?:&#10;|\n)?\(([^)]+@gmail\.com)\)',
+                html,
+            )
+            if m:
+                name = m.group(1).strip()
+                email = m.group(2).strip()
+                return name, email
+
+            # 兜底匹配 aria-label 中任何邮箱
+            m2 = re.search(r'aria-label="[^"]*?\(([^)]+@gmail\.com)\)"', html)
+            if m2:
+                return "", m2.group(1).strip()
+
+            # 兜底全页面正则提取 Gmail
+            gm = re.findall(r"[\w\.-]+@gmail\.com", html)
+            if gm:
+                return "", gm[0]
+        except Exception as e:
+            print(f"⚠️ [Profile 获取] u/{authuser} 提取失败: {e}")
+
+        return "", ""
+
+    def sync_account_profiles(self) -> Dict[int, Dict[str, str]]:
+        """批量同步并更新 SQLite 数据库中所有 Google 账号的真实昵称与邮箱。"""
+        results = {}
+        if not os.path.exists(self.db_path):
+            self.init_database()
+
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+        rows = cur.execute("SELECT authuser FROM accounts").fetchall()
+        conn.close()
+
+        for (u,) in rows:
+            name, email = self.fetch_account_profile(u)
+            if email:
+                if name:
+                    new_label = f"{name} ({email})"
+                else:
+                    new_label = email
+                note = f"authuser={u} | {email}"
+            else:
+                new_label = f"Google Account [u/{u}]"
+                note = f"Browser Multi-Account Index {u}"
+
+            conn = sqlite3.connect(self.db_path)
+            conn.execute(
+                "UPDATE accounts SET label = ?, note = ? WHERE authuser = ?",
+                (new_label, note, u),
+            )
+            conn.commit()
+            conn.close()
+            results[u] = {"name": name, "email": email, "label": new_label}
+
+        return results
+
     def list_accounts(self) -> List[Dict[str, Any]]:
-        """获取账号池内所有账号的状态与轮转统计。"""
+        """获取账号池内所有账号的状态、真实名称与轮转统计。"""
         if not os.path.exists(self.db_path):
             self.init_database()
 
         conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
         rows = cur.execute(
-            """SELECT id, label, authuser, status, last_used_at, fail_count 
+            """SELECT id, label, authuser, status, last_used_at, fail_count, note 
                FROM accounts ORDER BY authuser ASC"""
         ).fetchall()
         conn.close()
 
         res = []
         for r in rows:
+            label_val = r[1]
+            name = ""
+            email = ""
+            if "(" in label_val and label_val.endswith(")"):
+                parts = label_val.rsplit("(", 1)
+                name = parts[0].strip()
+                email = parts[1].rstrip(")").strip()
+            elif "@" in label_val:
+                email = label_val.strip()
+
             res.append(
                 {
                     "id": r[0],
-                    "label": r[1],
+                    "label": label_val,
+                    "name": name,
+                    "email": email,
                     "auth_user": r[2],
                     "url_prefix": f"https://gemini.google.com/u/{r[2]}",
                     "status": r[3],
                     "last_used_at": r[4],
                     "fail_count": r[5],
+                    "note": r[6],
                 }
             )
         return res
