@@ -618,8 +618,17 @@ def openai_chat_completions(req: OpenAIChatRequest):
             },
         }
 
-    # 2. ChatGPT 分流 (逆向引擎 + 扩展桥接)
-    target_gpt_model = req.model if req.model and req.model not in ("chatgpt-web", "gpt-4o", "gpt-3.5-turbo") else "auto"
+    # 2. ChatGPT 分流 (逆向引擎 + 扩展模拟桥接)
+    req_model_lower = (req.model or "").lower().strip()
+    if "moni" in req_model_lower or req_model_lower in ("chatgpt-web", "chatgpt-web-moni"):
+        target_gpt_model = "chatgpt-web-moni"
+    elif req_model_lower in ("gpt-4o", "gpt-3.5-turbo"):
+        target_gpt_model = "auto"  # 已下线模型平滑过渡至 auto
+    elif req.model:
+        target_gpt_model = req.model
+    else:
+        target_gpt_model = "auto"
+
     messages_payload = [{"role": m.role, "content": m.content} for m in req.messages]
     effort = req.reasoning_effort or req.reasoning_level or ""
 
@@ -682,28 +691,99 @@ def openai_image_generations(body: OpenAIImageGenerationRequest):
         raise HTTPException(status_code=502, detail=f"ChatGPT 图片生成失败: {str(e)}")
 
 
+# 模型元数据中文描述字典 (覆盖官方逆向全部核心与思考系列)
+REVERSE_MODEL_DESCRIPTIONS = {
+    # 核心优选与思考推理 (Thinking 系列)
+    "gpt-6-thinking": "[协议逆向直连] GPT-6 扩展深度思考链模型 (官方默认首选)",
+    "gpt-6": "[协议逆向直连] GPT-6 官方默认新一代架构模型",
+    "gpt-6-instant": "[协议逆向直连] GPT-6 极速即时响应模型",
+    "gpt-6-mini": "[协议逆向直连] GPT-6 轻量紧凑高通量模型",
+    "gpt-6-t-mini": "[协议逆向直连] GPT-6 轻量深度思考推理模型",
+    "gpt-5-6-thinking": "[协议逆向直连] GPT-5.6 扩展深度思考链模型",
+    "gpt-5-6": "[协议逆向直连] GPT-5.6 Web 逆向旗舰模型",
+    "gpt-5-6-instant": "[协议逆向直连] GPT-5.6 极速即时响应模型",
+    "gpt-5-6-mini": "[协议逆向直连] GPT-5.6 轻量高效模型",
+    "gpt-5-6-t-mini": "[协议逆向直连] GPT-5.6 轻量深度思考推理模型",
+    "auto": "[协议逆向直连] ChatGPT 智能自动优选模型",
+    "research": "[协议逆向直连] ChatGPT 全网深度学术与研报挖掘模型 (Deep Research)",
+    "gpt-image-2": "[协议逆向直连] ChatGPT 逆向文生图专用 (DALL-E 3)",
+    "codex-gpt-image-2": "[协议逆向直连] ChatGPT Codex 高清画图专用",
+    "gpt-6.1-sol-wm": "[协议逆向直连] GPT-6.1 Sol 专属架构模型",
+    "gpt-6.1-terra-wm": "[协议逆向直连] GPT-6.1 Terra 专属架构模型",
+    "gpt-6-sol-wm": "[协议逆向直连] GPT-6 Sol 变体模型",
+    "gpt-6-luna-wm": "[协议逆向直连] GPT-6 Luna 变体模型",
+    "gpt-6-astra-wm": "[协议逆向直连] GPT-6 Astra 变体模型",
+    "gpt-5.6-sol-wm": "[协议逆向直连] GPT-5.6 Sol 变体模型",
+    "gpt-5.6-luna-wm": "[协议逆向直连] GPT-5.6 Luna 变体模型",
+    "gpt-5.6-terra-wm": "[协议逆向直连] GPT-5.6 Terra 变体模型",
+}
+
+
 @app.get("/v1/models", summary="OpenAI 兼容模型列表", tags=["OpenAI 兼容接口"])
 def openai_models():
-    gpt_models = [
-        {"id": "auto", "object": "model", "owned_by": "openai-reverse", "description": "ChatGPT 智能自动优选模型"},
-        {"id": "gpt-5-6", "object": "model", "owned_by": "openai-reverse", "description": "ChatGPT Web 逆向旗舰模型"},
-        {"id": "gpt-5-6-mini", "object": "model", "owned_by": "openai-reverse", "description": "ChatGPT Web 极速轻量模型"},
-        {"id": "gpt-6", "object": "model", "owned_by": "openai-reverse", "description": "ChatGPT Web 新一代架构模型"},
-        {"id": "gpt-image-2", "object": "model", "owned_by": "openai-reverse", "description": "ChatGPT 逆向文生图专用 (DALL-E 3)"},
-        {"id": "codex-gpt-image-2", "object": "model", "owned_by": "openai-reverse", "description": "ChatGPT Codex 高清画图专用"},
-        {"id": "chatgpt-web", "object": "model", "owned_by": "openai-cookie-suite", "description": "ChatGPT 浏览器同源桥接"},
-        {"id": "gpt-4o", "object": "model", "owned_by": "openai-cookie-suite", "description": "OpenAI 兼容映射通道"},
+    """返回 OpenAI 兼容模型列表，动态同步逆向引擎真实可用模型并打标：
+    - moni (网页模拟输入): 基于浏览器 DOM 模拟键盘输入与发送 (chatgpt-web, chatgpt-web-moni)
+    - reverse (协议逆向直连): 包含 GPT-6 / GPT-5.6 的 thinking、instant、mini 系列及深度研究模型
+    - pool (谷歌号池直连): Google Gemini 多账号自动轮询直连
+    - 已彻底移除官方下线的过时 gpt-4o 模型
+    """
+    reverse_models = []
+    seen_ids = set()
+
+    # 1. 优先从运行中的逆向引擎动态提取实时模型
+    if chatgpt_client.reverse.is_running():
+        try:
+            raw_res = chatgpt_client.reverse.get_models()
+            for item in raw_res.get("data", []):
+                mid = str(item.get("id") or "").strip()
+                if not mid or mid in seen_ids:
+                    continue
+                # 过滤内部 gate 占位符
+                if "reserved_gate" in mid:
+                    continue
+                seen_ids.add(mid)
+                desc = REVERSE_MODEL_DESCRIPTIONS.get(mid, f"[协议逆向直连] ChatGPT 官方模型 ({mid})")
+                reverse_models.append({
+                    "id": mid,
+                    "object": "model",
+                    "owned_by": "openai-reverse",
+                    "tag": "reverse",
+                    "type": "api_reverse",
+                    "description": desc,
+                })
+        except Exception:
+            pass
+
+    # 兜底回退：若逆向引擎暂时未拉取到，使用内建全量逆向清单 (包含 thinking，无 4o)
+    if not reverse_models:
+        for mid, desc in REVERSE_MODEL_DESCRIPTIONS.items():
+            reverse_models.append({
+                "id": mid,
+                "object": "model",
+                "owned_by": "openai-reverse",
+                "tag": "reverse",
+                "type": "api_reverse",
+                "description": desc,
+            })
+
+    # 2. 网页模拟输入模型 (专属 moni 标签)
+    moni_models = [
+        {"id": "chatgpt-web-moni", "object": "model", "owned_by": "moni", "tag": "moni", "type": "dom_simulated", "description": "[网页模拟输入/moni] 浏览器扩展 DOM 按键与点击输入模拟"},
+        {"id": "chatgpt-web", "object": "model", "owned_by": "moni", "tag": "moni", "type": "dom_simulated", "description": "[网页模拟输入/moni] ChatGPT 浏览器同源页面输入桥接"},
     ]
+
+    # 3. Google 多账号池直连模型
     gemini_models = [
-        {"id": "gemini-3.5-flash-lite", "object": "model", "owned_by": "google-cookie-suite", "description": "极速响应毫秒级，推荐默认"},
-        {"id": "gemini-3.1-pro", "object": "model", "owned_by": "google-cookie-suite", "description": "高智力强推理，适合复杂任务"},
-        {"id": "gemini-3.6-flash", "object": "model", "owned_by": "google-cookie-suite", "description": "多模态高通量，通用均衡"},
-        {"id": "gemini-3.8-flash", "object": "model", "owned_by": "google-cookie-suite", "description": "新一代 Flash 架构"},
-        {"id": "gemini-3.1-pro-thinking", "object": "model", "owned_by": "google-cookie-suite", "description": "扩展深度思考链模式"},
+        {"id": "gemini-3.5-flash-lite", "object": "model", "owned_by": "google-cookie-suite", "tag": "pool", "type": "gemini_pool", "description": "[号池协议直连] 极速响应毫秒级，推荐默认"},
+        {"id": "gemini-3.1-pro", "object": "model", "owned_by": "google-cookie-suite", "tag": "pool", "type": "gemini_pool", "description": "[号池协议直连] 高智力强推理，适合复杂任务"},
+        {"id": "gemini-3.6-flash", "object": "model", "owned_by": "google-cookie-suite", "tag": "pool", "type": "gemini_pool", "description": "[号池协议直连] 多模态高通量，通用均衡"},
+        {"id": "gemini-3.8-flash", "object": "model", "owned_by": "google-cookie-suite", "tag": "pool", "type": "gemini_pool", "description": "[号池协议直连] 新一代 Flash 架构"},
+        {"id": "gemini-3.1-pro-thinking", "object": "model", "owned_by": "google-cookie-suite", "tag": "pool", "type": "gemini_pool", "description": "[号池协议直连] 扩展深度思考链模式"},
     ]
+
     return {
         "object": "list",
-        "data": gpt_models + gemini_models,
+        "data": reverse_models + moni_models + gemini_models,
     }
 
 

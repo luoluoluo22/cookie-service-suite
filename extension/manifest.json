@@ -26,6 +26,15 @@
       ],
       "js": ["chatgpt_bridge.js"],
       "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://suno.com/*",
+        "https://*.suno.com/*"
+      ],
+      "js": ["suno_hook.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
     }
   ],
   "action": {

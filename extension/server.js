@@ -584,6 +584,34 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // 5.1 Suno Save In-Page Decrypted Audio (/suno/save_audio) -> 浏览器播放解密音频无损复用与持久化
+  if (pathname === '/suno/save_audio' && req.method === 'POST') {
+    try {
+      const clipId = req.headers['x-suno-clip-id'] || `clip_${Date.now()}`;
+      const format = req.headers['x-suno-format'] || 'm4a';
+
+      const chunks = [];
+      req.on('data', chunk => chunks.push(chunk));
+      req.on('end', () => {
+        const buffer = Buffer.concat(chunks);
+        const downloadDir = path.join(__dirname, '..', 'downloads', 'suno');
+        if (!fs.existsSync(downloadDir)) {
+          fs.mkdirSync(downloadDir, { recursive: true });
+        }
+        const fileName = `${clipId}.${format}`;
+        const filePath = path.join(downloadDir, fileName);
+        fs.writeFileSync(filePath, buffer);
+        console.log(`[Bridge Server] 🎵 成功复用并保存浏览器播放解密音频: ${fileName} (${(buffer.length / 1024 / 1024).toFixed(2)} MB)`);
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ success: true, clipId, path: filePath, size: buffer.length }));
+      });
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ success: false, error: err.message }));
+    }
+    return;
+  }
+
   // Fallback 404
   res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify({ error: 'Endpoint not found' }));

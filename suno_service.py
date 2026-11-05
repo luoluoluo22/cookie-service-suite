@@ -518,18 +518,135 @@ class SunoService:
 
         raise TimeoutError(f"等待 Suno 生成超时 ({timeout} 秒)！当前 IDs: {clip_ids}")
 
+    def decrypt_and_download_clip(
+        self,
+        clip_id: str,
+        output_file_path: Optional[str] = None,
+        media_url: Optional[str] = None,
+        transcode_to_mp3: bool = False,
+    ) -> str:
+        """
+        全量获取 Suno 最新加密渐进式媒体流 (delivery: progressive, content_type: m4a-opus, encoding: 1.0.0)。
+        自动向 /api/mango/rights 端点获取封装凭证，以用户会话 JWT 为主密钥进行 AES-256-GCM 解包，
+        最后通过 AES-CTR 逐块解密还原出 100% 原汁原味的标准无损 M4A/Opus 音频文件。
+        """
+        import base64
+        import hashlib
+        from Crypto.Cipher import AES
+
+        self.ensure_jwt()
+        if not self.jwt_token:
+            raise RuntimeError("缺失有效的 Clerk JWT 凭据，无法解包 Suno 音频播放密钥！")
+
+        # 1. 构造主解包密钥: SHA-256(jwt_token)
+        master_key = hashlib.sha256(self.jwt_token.encode("utf-8")).digest()
+
+        # 2. 调用 /api/mango/rights 获取 clip 对应的 Wrapped Key 与 Wrapped IV
+        rights = self._api_request(
+            "POST",
+            "/api/mango/rights",
+            json_data={
+                "content_params": {
+                    "content_id": clip_id,
+                    "content_type": "clip"
+                }
+            }
+        )
+
+        key_b64 = rights.get("key")
+        iv_b64 = rights.get("iv")
+        if not key_b64 or not iv_b64:
+            raise RuntimeError(f"获取媒体权限响应异常: {rights}")
+
+        raw_key_wrapped = base64.b64decode(key_b64)
+        raw_iv_wrapped = base64.b64decode(iv_b64)
+
+        # 3. AES-256-GCM 解包出 Content Key (16字节) 和 Stream IV (16字节)
+        def _unwrap(wrapped_data: bytes, aad_str: str) -> bytes:
+            iv = wrapped_data[:12]
+            ciphertext = wrapped_data[12:-16]
+            tag = wrapped_data[-16:]
+            cipher = AES.new(master_key, AES.MODE_GCM, nonce=iv)
+            cipher.update(aad_str.encode("utf-8"))
+            return cipher.decrypt_and_verify(ciphertext, tag)
+
+        content_key = _unwrap(raw_key_wrapped, clip_id)
+        content_iv = _unwrap(raw_iv_wrapped, clip_id)
+
+        # 4. 下载 CDN 渐进加密音频流
+        if not media_url:
+            media_url = f"https://d2lwuy8qc234o3.cloudfront.net/1/clip/{clip_id}.m4a"
+
+        headers = dict(COMMON_HEADERS)
+        resp = self.session.get(media_url, headers=headers, timeout=60)
+        resp.raise_for_status()
+        encrypted_bytes = resp.content
+
+        # 5. AES-CTR 解密出原汁原味的 M4A 容器 (内含 Opus 音频)
+        ctr_cipher = AES.new(content_key, AES.MODE_CTR, initial_value=content_iv, nonce=b"")
+        decrypted_bytes = ctr_cipher.decrypt(encrypted_bytes)
+
+        if len(decrypted_bytes) >= 8 and b"ftyp" not in decrypted_bytes[:16]:
+            raise RuntimeError("解密后未检测到标准 MP4/M4A 头部标识 (ftyp)！")
+
+        # 6. 保存到文件
+        if not output_file_path:
+            output_file_path = os.path.join(".", "downloads", "suno", f"{clip_id}.m4a")
+
+        os.makedirs(os.path.dirname(os.path.abspath(output_file_path)), exist_ok=True)
+
+        wants_mp3 = output_file_path.lower().endswith(".mp3") or transcode_to_mp3
+        m4a_path = output_file_path if not wants_mp3 else (output_file_path[:-4] + ".m4a" if output_file_path.lower().endswith(".mp3") else output_file_path + ".m4a")
+
+        with open(m4a_path, "wb") as f:
+            f.write(decrypted_bytes)
+
+        # 可选自动转码为 MP3 (若用户指定了 .mp3 扩展名)
+        if wants_mp3:
+            mp3_path = output_file_path if output_file_path.lower().endswith(".mp3") else output_file_path + ".mp3"
+            try:
+                import imageio_ffmpeg
+                import subprocess
+                ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
+                subprocess.run(
+                    [ffmpeg_bin, "-y", "-i", m4a_path, "-c:a", "libmp3lame", "-q:a", "1", mp3_path],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=True
+                )
+                return os.path.abspath(mp3_path)
+            except Exception:
+                return os.path.abspath(m4a_path)
+
+        return os.path.abspath(m4a_path)
+
     def download_song(
         self,
-        audio_url: str,
+        audio_url_or_clip_id: str,
         output_file_path: str,
         chunk_size: int = 64 * 1024,
     ) -> str:
         """
-        流式下载生成的 MP3 音频文件到本地
+        智能下载音频：
+        - 若传入的是 Clip ID 或包含 UUID / forbidden 的链接，自动执行 AES 密钥解包与 CTR 解密还原 M4A；
+        - 若传入的是普通 MP3 CDN 直链，则按传统流式拉取。
         """
         os.makedirs(os.path.dirname(os.path.abspath(output_file_path)), exist_ok=True)
+
+        # 识别 UUID 智能转入解密流
+        uuid_match = re.search(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', audio_url_or_clip_id.lower())
+        if uuid_match:
+            clip_id = uuid_match.group(0)
+            try:
+                return self.decrypt_and_download_clip(clip_id=clip_id, output_file_path=output_file_path)
+            except Exception as e:
+                # 若常规直链可用且不含 forbidden，降级尝试传统拉取
+                if "forbidden" in audio_url_or_clip_id or not audio_url_or_clip_id.startswith("http"):
+                    raise
+                pass
+
         headers = dict(COMMON_HEADERS)
-        resp = self.session.get(audio_url, headers=headers, stream=True, timeout=60)
+        resp = self.session.get(audio_url_or_clip_id, headers=headers, stream=True, timeout=60)
         resp.raise_for_status()
 
         with open(output_file_path, "wb") as f:
@@ -612,14 +729,25 @@ class SunoService:
             filename = f"{safe_title}_{clip['id'][:6]}.mp3"
             save_path = os.path.join(output_dir, filename)
 
+            clip_id = clip.get("id")
             audio_url = clip.get("audio_url")
-            if audio_url:
-                if progress_callback:
-                    progress_callback(f"📥 正在下载第 {idx}/{len(completed_clips)} 首歌曲: {filename}...")
-                downloaded_file = self.download_song(audio_url, save_path)
+            if progress_callback:
+                progress_callback(f"📥 正在解密下载第 {idx}/{len(completed_clips)} 首歌曲: {filename}...")
+
+            try:
+                # 优先走最新 Progressive 加密流解密通道
+                downloaded_file = self.decrypt_and_download_clip(clip_id, save_path)
                 clip["local_file"] = downloaded_file
-            else:
-                clip["local_file"] = None
+            except Exception as e:
+                # 降级尝试旧版直链
+                if audio_url and "forbidden" not in audio_url:
+                    try:
+                        downloaded_file = self.download_song(audio_url, save_path)
+                        clip["local_file"] = downloaded_file
+                    except Exception:
+                        clip["local_file"] = None
+                else:
+                    clip["local_file"] = None
 
             results.append(clip)
 

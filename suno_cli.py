@@ -22,6 +22,7 @@ import sys
 import os
 import argparse
 import time
+import re
 
 # 统一 Windows 终端 UTF-8 编码
 if sys.platform == "win32":
@@ -338,22 +339,25 @@ def main():
         target = args.target.strip()
         print(f"📥 正在准备下载: {target}...")
         try:
-            if target.startswith("http://") or target.startswith("https://"):
-                url = target
-                save_name = f"suno_track_{int(time.time())}.mp3"
+            uuid_match = re.search(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', target.lower())
+            if uuid_match:
+                clip_id = uuid_match.group(0)
+                try:
+                    clips = service.fetch_clips_status([clip_id])
+                    title = clips[0].get("title") or f"track_{clip_id[:6]}"
+                except Exception:
+                    title = f"track_{clip_id[:6]}"
+                safe_title = re.sub(r'[\\/*?:"<>|]', "_", title)
+                save_name = f"{safe_title}_{clip_id[:6]}.m4a"
+                out_path = os.path.join(args.out, save_name)
+                print(f"🔐 识别到 Suno Clip ID: {clip_id}，正在执行渐进流解密下载...")
+                downloaded = service.download_song(clip_id, out_path)
             else:
-                # 假设为 clip ID
-                clips = service.fetch_clips_status([target])
-                if not clips or not clips[0].get("audio_url"):
-                    print(f"❌ 未能找到 Clip ID [{target}] 的有效音频链接")
-                    return
-                url = clips[0]["audio_url"]
-                title = clips[0].get("title", f"track_{target[:6]}")
-                save_name = f"{title}_{target[:6]}.mp3"
+                save_name = f"suno_track_{int(time.time())}.mp3"
+                out_path = os.path.join(args.out, save_name)
+                downloaded = service.download_song(target, out_path)
 
-            out_path = os.path.join(args.out, save_name)
-            downloaded = service.download_song(url, out_path)
-            print(f"✅ 下载成功！本地文件: {downloaded}")
+            print(f"✅ 解密与下载完成！本地音频文件:\n   {downloaded}")
         except Exception as e:
             print(f"❌ 下载失败: {e}")
 

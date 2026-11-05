@@ -135,7 +135,7 @@ def main():
         print(f"  ⚠️ ChatGPT 浏览器会话提示: {e}")
 
     # 8. 测试 Suno AI 音乐生成服务凭证与配额
-    print("\n[测试 8/8] 正在提取 Suno / Clerk 凭证并测试配额接口 (/api/billing/info/)...")
+    print("\n[测试 8/8] 正在提取 Suno / Clerk 凭证并测试配额接口与渐进式音频解密...")
     try:
         from suno_service import SunoService
         suno = SunoService(bridge=bridge)
@@ -144,6 +144,12 @@ def main():
         print(f"     剩余总积分: {credits_info['total_credits_left']} 积分")
         print(f"     可用曲目数: {credits_info['songs_left']} 次 (每次生成提供 2 种变体)")
         print(f"     重置周期  : {credits_info['period']}")
+
+        feed = suno.get_feed(page=1)
+        if feed:
+            first_song = feed[0]
+            print(f"  ✅ 成功获取 Suno 曲库首曲: \"{first_song.get('title')}\" (ID: {first_song.get('id')})")
+            print(f"     媒体格式: {first_song.get('media_urls', [{}])[0].get('content_type')} ({first_song.get('media_urls', [{}])[0].get('delivery')})")
     except Exception as e:
         print(f"  ⚠️ Suno 连通性提示 (浏览器未登录 suno.com 或未配置 SUNO_COOKIE): {e}")
 

@@ -46,7 +46,7 @@ class ChatGPTBridgeClient:
         """检查本地桥接服务是否正常运行且扩展已连接"""
         url = f"{self.base_url}/status"
         req = urllib.request.Request(url)
-        with self.opener.open(req, timeout=5) as resp:
+        with self.opener.open(req, timeout=1.5) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
     def get_session(self) -> dict:
@@ -159,7 +159,7 @@ class ChatGPTReverseEngine:
         """检查逆向后台服务是否健康运行"""
         try:
             req = urllib.request.Request(f"{self.base_url}/version")
-            with self.opener.open(req, timeout=2) as resp:
+            with self.opener.open(req, timeout=0.8) as resp:
                 return resp.status == 200
         except Exception:
             return False
@@ -470,34 +470,42 @@ class UnifiedChatGPTService:
         }
 
     def ask(self, prompt: str, model: str = "auto", stream: bool = False) -> Union[str, Generator[str, None, None]]:
-        """统一提问接口：优先使用逆向引擎，若未配置或异常则回退至浏览器扩展"""
-        if self.is_reverse_available():
-            try:
-                if stream:
-                    def _gen():
-                        for chunk in self.reverse.chat([{"role": "user", "content": prompt}], model=model, stream=True):
-                            delta = chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
-                            if delta:
-                                yield delta
-                    return _gen()
-                else:
-                    res = self.reverse.chat([{"role": "user", "content": prompt}], model=model, stream=False)
-                    return res["choices"][0]["message"]["content"]
-            except Exception as e:
-                # 逆向失败，降级尝试浏览器桥接
-                pass
+        """统一提问接口：
+        - 若模型显式包含 moni 或为 chatgpt-web / chatgpt-web-moni，强制走浏览器 DOM 模拟输入
+        - 其他模型 (gpt-6, gpt-5-6, auto 等) 走 Web API 协议逆向直连，绝不静默降级到浏览器输入！
+        """
+        model_lower = (model or "").lower().strip()
+        if "moni" in model_lower or model_lower in ("chatgpt-web", "chatgpt-web-moni"):
+            return self.bridge.ask(prompt, model="chatgpt-web", stream=stream)
 
-        # 降级至浏览器扩展同源桥接
-        return self.bridge.ask(prompt, model=model if model == "chatgpt-web" else "chatgpt-web", stream=stream)
+        # 协议逆向直连通道 (绝不回退到浏览器 DOM 输入，两者严格物理隔离)
+        if not self.reverse.is_running():
+            self.reverse.start()
+
+        if stream:
+            def _gen():
+                for chunk in self.reverse.chat([{"role": "user", "content": prompt}], model=model, stream=True):
+                    delta = chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                    if delta:
+                        yield delta
+            return _gen()
+        else:
+            res = self.reverse.chat([{"role": "user", "content": prompt}], model=model, stream=False)
+            return res["choices"][0]["message"]["content"]
 
     def chat(self, messages: List[Dict[str, Any]], model: str = "auto", stream: bool = False, thinking_effort: str = "") -> Union[dict, Generator[dict, None, None]]:
-        """OpenAI 兼容对话调用接口"""
-        if self.is_reverse_available():
-            try:
-                return self.reverse.chat(messages, model=model, stream=stream, thinking_effort=thinking_effort)
-            except Exception:
-                pass
-        return self.bridge.chat(messages, model=model, stream=stream)
+        """OpenAI 兼容对话调用接口：
+        - 若模型显式包含 moni 或为 chatgpt-web / chatgpt-web-moni，强制走浏览器 DOM 模拟输入
+        - 其他模型 (gpt-6, gpt-5-6, auto 等) 走 Web API 协议逆向直连，绝不静默降级到浏览器输入！
+        """
+        model_lower = (model or "").lower().strip()
+        if "moni" in model_lower or model_lower in ("chatgpt-web", "chatgpt-web-moni"):
+            return self.bridge.chat(messages, model="chatgpt-web", stream=stream)
+
+        # 协议逆向直连通道 (严格隔离，若报错直接抛出真实异常，禁止篡改用户意图偷调浏览器)
+        if not self.reverse.is_running():
+            self.reverse.start()
+        return self.reverse.chat(messages, model=model, stream=stream, thinking_effort=thinking_effort)
 
     def generate_image(self, prompt: str, model: str = "gpt-image-2", n: int = 1) -> dict:
         """文生图接口"""
