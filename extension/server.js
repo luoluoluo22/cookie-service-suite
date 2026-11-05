@@ -268,16 +268,65 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // 2.89 OpenAI Compatible Models (/v1/models) -> 自动代理至统一中枢服务 (18800)
+  if (pathname === '/v1/models' && req.method === 'GET') {
+    const proxyReq = http.request({
+      hostname: '127.0.0.1',
+      port: 18800,
+      path: '/v1/models',
+      method: 'GET',
+      headers: { ...(req.headers.authorization ? { 'Authorization': req.headers.authorization } : {}) }
+    }, (proxyRes) => {
+      res.writeHead(proxyRes.statusCode, proxyRes.headers);
+      proxyRes.pipe(res);
+    });
+    proxyReq.on('error', (err) => {
+      res.writeHead(502, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: `模型列表代理失败 (18800): ${err.message}` }));
+    });
+    proxyReq.end();
+    return;
+  }
+
   // 2.9 ChatGPT Chat / OpenAI Compatible Completions (/v1/chat/completions or /chatgpt/chat)
   if ((pathname === '/chatgpt/chat' || pathname === '/v1/chat/completions') && req.method === 'POST') {
-    if (extensionSockets.size === 0) {
-      res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({ error: '浏览器扩展未连接' }));
-      return;
-    }
     try {
       const body = await readRequestBody(req);
       const json = JSON.parse(body || '{}');
+
+      const reqModel = String(json.model || '').toLowerCase().trim();
+      const isMoniModel = reqModel.includes('moni') || reqModel === 'chatgpt-web' || reqModel === 'chatgpt-web-moni';
+
+      // 严格分流：如果不是显式的 moni / chatgpt-web 模拟输入模型，一律代理转发至 18800 逆向引擎，绝不触碰浏览器！
+      if (!isMoniModel && reqModel && reqModel !== 'default') {
+        const proxyReq = http.request({
+          hostname: '127.0.0.1',
+          port: 18800,
+          path: '/v1/chat/completions',
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(req.headers.authorization ? { 'Authorization': req.headers.authorization } : {})
+          }
+        }, (proxyRes) => {
+          res.writeHead(proxyRes.statusCode, proxyRes.headers);
+          proxyRes.pipe(res);
+        });
+        proxyReq.on('error', (err) => {
+          res.writeHead(502, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ error: { message: `逆向引擎代理转发失败 (18800): ${err.message}`, type: 'proxy_error' } }));
+        });
+        proxyReq.write(body);
+        proxyReq.end();
+        return;
+      }
+
+      // 仅当为 moni 或 chatgpt-web 时，才需要浏览器扩展注入
+      if (extensionSockets.size === 0) {
+        res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: '浏览器扩展未连接，无法执行网页模拟输入' }));
+        return;
+      }
 
       let promptText = json.prompt || '';
       if (!promptText && Array.isArray(json.messages)) {

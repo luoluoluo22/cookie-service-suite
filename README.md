@@ -93,46 +93,56 @@ $env:PYTHONIOENCODING="utf-8"
 python test_suite.py
 ```
 
-### 3. ChatGPT Web 桥接对话与标准接口
-#### (1) Python 代码直接调用（兼容 OpenAI SDK）
+### 3. ChatGPT 双引擎：chatgpt2api 深度网页逆向 + 浏览器同源桥接
+本套件支持 **无头深度逆向引擎** 与 **浏览器同源桥接** 双模智能协同：
+
+#### (1) 逆向原理解析：Cookie 与请求构造机制
+- **核心对话与生图**：OpenAI 官方 Web 前端在发起实际对话（`/backend-api/conversation`）或生图接口时，**并不在 Cookie 中传递鉴权**，而是使用 `Authorization: Bearer <access_token>`，并配合设备指纹、`curl_cffi` 模拟的 Chrome TLS 指纹以及 Sentinel PoW（Proof of Work，基于 Fnv1a-32 哈希与 Seed 碰撞）算力证明请求头。
+- **与 Cookie 的关键桥梁**：浏览器已登录用户的 `__Secure-next-auth.session-token` Cookie 可通过同源请求 `/api/auth/session` 换取有效期内的 `accessToken`。本套件支持 **一键从浏览器 Cookie Hub 自动提取该 Token 注入逆向号池**，省去人工复制与邮箱密码登录环节！
+
+#### (2) Python 代码直接调用
 ```python
-from chatgpt_service import ChatGPTBridgeClient
+from chatgpt_service import chatgpt_service
 
-client = ChatGPTBridgeClient()
+# 1. 自动从当前前台浏览器同步已登录 Token 入池
+sync_res = chatgpt_service.sync_token_from_browser()
+print("已导入账号:", sync_res.get("email"), "方案:", sync_res.get("plan"))
 
-# 1. 查询当前 ChatGPT 账号会话
-session = client.get_session()
-print("用户:", session.get("session", {}).get("user", {}).get("email"))
+# 2. 智能对话 (支持 auto, gpt-5-6, gpt-4o 等模型)
+reply = chatgpt_service.ask("请用一句话做个自我介绍！")
+print("回复:", reply)
 
-# 2. 直接提问
-answer = client.ask("请用一句话说明：量子纠缠是什么？")
-print("回复:", answer)
+# 3. 实时打字机流式输出 (SSE Stream)
+for token in chatgpt_service.ask("写一首关于春天的五言绝句", stream=True):
+    print(token, end="", flush=True)
+
+# 4. 逆向文生图与图像编辑 (gpt-image-2 / DALL-E 3)
+img_res = chatgpt_service.generate_image("一只在太空漫步的赛博朋克猫咪", model="gpt-image-2")
+print("生图任务结果:", img_res.get("data", [{}])[0].get("b64_json")[:50], "...")
 ```
 
-#### (2) 标准 OpenAI 兼容 API 与流式输出 (Stream: true)
-本地服务开放了标准 `/v1/chat/completions` 接口，支持纯文本与打字机流式 SSE (`text/event-stream`)：
+#### (3) 标准 OpenAI 兼容 API 与流式输出 (Stream: true)
+本地服务开放了标准 `/v1/chat/completions` 与 `/v1/images/generations`：
 ```bash
-# 流式调用 (实时返回 data: {...} SSE 数据块)
-curl -N -X POST http://127.0.0.1:18888/v1/chat/completions \
+# 1. OpenAI 兼容流式调用 (auto / gpt-5-6 / gpt-4o)
+curl -N -X POST http://127.0.0.1:18800/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "chatgpt-web",
+    "model": "auto",
     "messages": [
       {"role": "user", "content": "用Python写一个快速排序算法并解释原理"}
     ],
     "stream": true
   }'
-```
 
-#### (3) Python SDK 流式生成器调用
-```python
-from chatgpt_service import ChatGPTBridgeClient
-
-client = ChatGPTBridgeClient()
-
-# 流式打字机逐字输出
-for token in client.ask("写一首关于夏天的五言绝句", stream=True):
-    print(token, end="", flush=True)
+# 2. OpenAI 兼容图片生成 (gpt-image-2)
+curl -X POST http://127.0.0.1:18800/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-image-2",
+    "prompt": "水彩插画风格的一只橙色猫咪在木质窗台晒太阳",
+    "n": 1
+  }'
 ```
 
 ---

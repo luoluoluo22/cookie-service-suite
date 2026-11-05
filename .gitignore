@@ -26,3 +26,8 @@ downloads/
 *.log
 .vscode/
 .idea/
+.venv/
+*/.venv/
+*/*/.venv/
+candidate_repos/**/.venv/
+candidate_repos/**/data/
