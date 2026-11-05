@@ -31,6 +31,7 @@ from gemini_service import MultiAccountGeminiPool, GeminiService
 from chatgpt_service import ChatGPTBridgeClient
 from bilibili_service import BilibiliService
 from baidu_pan_service import BaiduPanService
+from suno_service import SunoService, suno_service
 
 # 初始化 FastAPI 应用
 app = FastAPI(
@@ -56,6 +57,7 @@ gemini_pool = MultiAccountGeminiPool(port=18083, account_count=4)
 chatgpt_client = ChatGPTBridgeClient()
 bili_service = BilibiliService()
 baidu_service = BaiduPanService()
+suno_client = suno_service
 
 START_TIME = datetime.datetime.now()
 
@@ -82,6 +84,21 @@ class OpenAIChatRequest(BaseModel):
     reasoning_level: Optional[str] = Field(None, description="推理级别: 'off', 'medium', 'high'", example="off")
     stream: Optional[bool] = Field(False, description="是否启用流式输出")
     temperature: Optional[float] = Field(0.7, example=0.7)
+
+
+class SunoGenerateRequest(BaseModel):
+    prompt: str = Field(..., description="音乐描述词或歌词全文", example="一段欢快的夏日流行海滩音乐，带有原声吉他和轻快的鼓点")
+    is_custom: Optional[bool] = Field(False, description="是否为自定义模式 (歌词+风格)")
+    tags: Optional[str] = Field("pop, acoustic guitar, cheerful", description="音乐流派风格标签 (仅自定义模式)")
+    title: Optional[str] = Field("My Suno Song", description="歌曲标题")
+    make_instrumental: Optional[bool] = Field(False, description="是否生成纯器乐伴奏 (无主唱)")
+    model: Optional[str] = Field("chirp-v3-5", description="模型版本: chirp-v3-5, chirp-v4, chirp-v3-0")
+    wait: Optional[bool] = Field(False, description="是否等待渲染完成 (若为 False 则立即返回任务 clip ids)")
+    download: Optional[bool] = Field(False, description="当 wait 为 True 时是否自动下载 MP3 到本地")
+
+
+class SunoLyricsRequest(BaseModel):
+    prompt: str = Field(..., description="歌词创作主题或提示词", example="写一首关于秋天落叶与远方思念的流行歌词")
 
 
 # ==========================================
@@ -352,6 +369,93 @@ def get_hub_cookies(domain: str = Query("google.com", description="要提取 Coo
 
 
 # ==========================================
+# 6.5. Suno AI 音乐生成服务
+# ==========================================
+@app.get("/api/suno/quota", summary="获取当前 Suno 账户积分与可用曲目数", tags=["Suno 音乐生成"])
+def get_suno_quota():
+    try:
+        return suno_client.get_credits()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"查询 Suno 配额失败: {str(e)}")
+
+
+@app.get("/api/suno/feed", summary="获取 Suno 历史作品曲库列表", tags=["Suno 音乐生成"])
+def get_suno_feed(page: int = Query(1, ge=1, description="页码")):
+    try:
+        return suno_client.get_feed(page=page)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取 Suno 历史曲库失败: {str(e)}")
+
+
+@app.post("/api/suno/generate", summary="提交 Suno 音乐创作任务", tags=["Suno 音乐生成"])
+def generate_suno_music(req: SunoGenerateRequest):
+    try:
+        if req.wait:
+            if req.download:
+                return suno_client.generate_and_download(
+                    prompt=req.prompt,
+                    is_custom=req.is_custom,
+                    tags=req.tags,
+                    title=req.title,
+                    make_instrumental=req.make_instrumental,
+                    model=req.model,
+                )
+            else:
+                clips = suno_client.generate_music(
+                    prompt=req.prompt,
+                    is_custom=req.is_custom,
+                    tags=req.tags,
+                    title=req.title,
+                    make_instrumental=req.make_instrumental,
+                    model=req.model,
+                )
+                clip_ids = [c["id"] for c in clips]
+                return suno_client.wait_for_completion(clip_ids, timeout=600)
+        else:
+            clips = suno_client.generate_music(
+                prompt=req.prompt,
+                is_custom=req.is_custom,
+                tags=req.tags,
+                title=req.title,
+                make_instrumental=req.make_instrumental,
+                model=req.model,
+            )
+            return {
+                "success": True,
+                "submitted_count": len(clips),
+                "clip_ids": [c["id"] for c in clips],
+                "clips": clips,
+            }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"提交 Suno 音乐生成失败: {str(e)}")
+
+
+@app.get("/api/suno/status", summary="查询指定 clip ids 的生成状态与音频直链", tags=["Suno 音乐生成"])
+def get_suno_status(clip_ids: str = Query(..., description="待查询的 clip ID，多个用英文逗号隔开")):
+    try:
+        id_list = [i.strip() for i in clip_ids.split(",") if i.strip()]
+        return suno_client.fetch_clips_status(id_list)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"查询任务状态失败: {str(e)}")
+
+
+@app.post("/api/suno/lyrics", summary="使用 Suno AI 单独创作歌词", tags=["Suno 音乐生成"])
+def generate_suno_lyrics(req: SunoLyricsRequest):
+    try:
+        return suno_client.generate_lyrics(prompt=req.prompt)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"创作歌词失败: {str(e)}")
+
+
+@app.post("/api/suno/refresh", summary="强制刷新 Suno 凭证与 Clerk JWT 令牌", tags=["Suno 音乐生成"])
+def refresh_suno_auth():
+    try:
+        return suno_client.refresh_auth()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"刷新 Suno 凭证失败: {str(e)}")
+
+
+# ==========================================
 # 7. 标准 OpenAI 兼容 API 路由 (/v1/*)
 # ==========================================
 @app.post("/v1/chat/completions", summary="OpenAI 兼容聊天接口", tags=["OpenAI 兼容接口"])
@@ -613,6 +717,10 @@ DASHBOARD_HTML = """
             <option value="bili_user">[GET] /api/bilibili/user (B站个人资料与大会员)</option>
             <option value="baidu_quota">[GET] /api/baidupan/quota (百度网盘总配额)</option>
             <option value="chatgpt_session">[GET] /api/chatgpt/session (ChatGPT 会话提取)</option>
+            <option value="suno_quota">[GET] /api/suno/quota (Suno 账户积分与可用曲目)</option>
+            <option value="suno_feed">[GET] /api/suno/feed (Suno 历史曲库作品)</option>
+            <option value="suno_gen">[POST] /api/suno/generate (Suno 音乐创作任务)</option>
+            <option value="suno_lyrics">[POST] /api/suno/lyrics (Suno 独立歌词创作)</option>
           </select>
         </div>
 
@@ -725,9 +833,9 @@ DASHBOARD_HTML = """
         <!-- 外部 Web 业务组 -->
         <div class="bg-slate-900/60 p-4 rounded-xl border border-slate-800 space-y-2.5 md:col-span-2">
           <div class="font-bold text-cyan-300 text-sm flex items-center gap-1.5">
-            <i class="fa-solid fa-globe"></i> ChatGPT Web / Bilibili / 百度网盘
+            <i class="fa-solid fa-globe"></i> ChatGPT Web / Bilibili / 百度网盘 / Suno AI 音乐
           </div>
-          <div class="grid grid-cols-1 md:grid-cols-3 gap-2 font-mono">
+          <div class="grid grid-cols-1 md:grid-cols-4 gap-2 font-mono">
             <div>
               <div class="text-slate-400 font-semibold mb-1">ChatGPT Web 桥接:</div>
               <div class="flex items-center gap-1.5"><span class="px-1 py-0.5 rounded bg-blue-500/20 text-blue-300 font-bold">GET</span> /api/chatgpt/session</div>
@@ -742,6 +850,11 @@ DASHBOARD_HTML = """
               <div class="text-slate-400 font-semibold mb-1">百度网盘免密:</div>
               <div class="flex items-center gap-1.5"><span class="px-1 py-0.5 rounded bg-blue-500/20 text-blue-300 font-bold">GET</span> /api/baidupan/quota</div>
               <div class="flex items-center gap-1.5"><span class="px-1 py-0.5 rounded bg-blue-500/20 text-blue-300 font-bold">GET</span> /api/baidupan/files</div>
+            </div>
+            <div>
+              <div class="text-slate-400 font-semibold mb-1">Suno AI 音乐生成:</div>
+              <div class="flex items-center gap-1.5"><span class="px-1 py-0.5 rounded bg-blue-500/20 text-blue-300 font-bold">GET</span> /api/suno/quota</div>
+              <div class="flex items-center gap-1.5"><span class="px-1 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold">POST</span> /api/suno/generate</div>
             </div>
           </div>
         </div>
@@ -796,6 +909,33 @@ DASHBOARD_HTML = """
         method: "GET",
         url: "/api/chatgpt/session",
         body: ""
+      },
+      suno_quota: {
+        method: "GET",
+        url: "/api/suno/quota",
+        body: ""
+      },
+      suno_feed: {
+        method: "GET",
+        url: "/api/suno/feed?page=1",
+        body: ""
+      },
+      suno_gen: {
+        method: "POST",
+        url: "/api/suno/generate",
+        body: JSON.stringify({
+          prompt: "一段欢快阳光的夏日流行海滩音乐，带有原声吉他和轻快的鼓点",
+          is_custom: false,
+          model: "chirp-v3-5",
+          wait: false
+        }, null, 2)
+      },
+      suno_lyrics: {
+        method: "POST",
+        url: "/api/suno/lyrics",
+        body: JSON.stringify({
+          prompt: "关于海风、阳光与夏天恋爱的流行歌词"
+        }, null, 2)
       }
     };
 

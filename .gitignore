@@ -13,6 +13,8 @@ npm-debug.log*
 *cookies*.txt
 *_test.txt
 bili_netscape_test.txt
+.suno_cookie*
+*suno_cookie*
 downloads/
 *.db
 *.sqlite

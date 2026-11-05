@@ -18,16 +18,18 @@ if sys.platform == "win32":
 class BaiduPanService:
     def __init__(self, bridge: Optional[CookieBridge] = None):
         self.bridge = bridge or CookieBridge()
+        self.cookie_header = ""
         
-        # 使用 pan.baidu.com/disk/main 完整 URL 获取 Cookie，
-        # 确保自动包含父域 .baidu.com 的核心鉴权票据 BDUSS 以及 pan.baidu.com 的 STOKEN
-        resp = requests.get(
-            f"{self.bridge.bridge_url}/cookies",
-            params={"url": "https://pan.baidu.com/disk/main", "format": "header"},
-            timeout=5
-        )
-        resp.raise_for_status()
-        self.cookie_header = resp.text.strip()
+        try:
+            resp = requests.get(
+                f"{self.bridge.bridge_url}/cookies",
+                params={"url": "https://pan.baidu.com/disk/main", "format": "header"},
+                timeout=5
+            )
+            if resp.ok:
+                self.cookie_header = resp.text.strip()
+        except Exception:
+            pass
 
         self.session = requests.Session()
         self.session.headers.update({
@@ -36,8 +38,20 @@ class BaiduPanService:
             "Cookie": self.cookie_header
         })
 
+    def _ensure_cookies(self):
+        if not self.cookie_header:
+            resp = requests.get(
+                f"{self.bridge.bridge_url}/cookies",
+                params={"url": "https://pan.baidu.com/disk/main", "format": "header"},
+                timeout=5
+            )
+            resp.raise_for_status()
+            self.cookie_header = resp.text.strip()
+            self.session.headers["Cookie"] = self.cookie_header
+
     def get_user_info(self) -> Dict[str, Any]:
         """获取百度网盘当前登录用户信息 (用户名、网盘昵称、UK)"""
+        self._ensure_cookies()
         url = "https://pan.baidu.com/rest/2.0/xpan/nas?method=uinfo"
         resp = self.session.get(url, timeout=5)
         resp.raise_for_status()
@@ -48,6 +62,7 @@ class BaiduPanService:
 
     def get_quota(self) -> Dict[str, Any]:
         """获取网盘总容量、已用空间及剩余空间 (单位: GB)"""
+        self._ensure_cookies()
         url = "https://pan.baidu.com/api/quota?checkexpire=1&checkfree=1"
         resp = self.session.get(url, timeout=5)
         resp.raise_for_status()
@@ -72,6 +87,7 @@ class BaiduPanService:
 
     def list_files(self, dir_path: str = "/", limit: int = 50) -> Dict[str, Any]:
         """获取网盘指定目录下的文件与文件夹列表"""
+        self._ensure_cookies()
         url = "https://pan.baidu.com/api/list"
         params = {
             "dir": dir_path,

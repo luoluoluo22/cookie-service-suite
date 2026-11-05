@@ -13,8 +13,13 @@ from cookie_bridge import CookieBridge
 class BilibiliService:
     def __init__(self, bridge: Optional[CookieBridge] = None):
         self.bridge = bridge or CookieBridge()
-        self.cookie_header = self.bridge.get_cookies_header("bilibili.com")
-        self.cookie_dict = self.bridge.get_cookies_dict("bilibili.com")
+        self.cookie_header = ""
+        self.cookie_dict = {}
+        try:
+            self.cookie_header = self.bridge.get_cookies_header("bilibili.com")
+            self.cookie_dict = self.bridge.get_cookies_dict("bilibili.com")
+        except Exception:
+            pass
 
         self.session = requests.Session()
         self.session.headers.update({
@@ -23,8 +28,15 @@ class BilibiliService:
             "Cookie": self.cookie_header
         })
 
+    def _ensure_cookies(self):
+        if not self.cookie_header:
+            self.cookie_header = self.bridge.get_cookies_header("bilibili.com")
+            self.cookie_dict = self.bridge.get_cookies_dict("bilibili.com")
+            self.session.headers["Cookie"] = self.cookie_header
+
     def get_user_info(self) -> Dict[str, Any]:
         """获取当前登录账号的完整个人中心信息"""
+        self._ensure_cookies()
         url = "https://api.bilibili.com/x/web-interface/nav"
         resp = self.session.get(url, timeout=5)
         resp.raise_for_status()

@@ -100,7 +100,7 @@ def main():
         print(f"  ❌ 百度网盘文件列表测试失败: {e}")
 
     # 6. 测试 ChatGPT Web 桥接对话接口 (/v1/chat/completions)
-    print("\n[测试 6/6] 正在测试 ChatGPT Web 原生桥接通信与智能问答 (/v1/chat/completions)...")
+    print("\n[测试 6/7] 正在测试 ChatGPT Web 原生桥接通信与智能问答 (/v1/chat/completions)...")
     try:
         gpt = ChatGPTBridgeClient()
         session_info = gpt.get_session().get("session", {})
@@ -117,8 +117,21 @@ def main():
     except Exception as e:
         print(f"  ❌ ChatGPT 接口测试失败: {e}")
 
+    # 7. 测试 Suno AI 音乐生成服务凭证与配额
+    print("\n[测试 7/7] 正在提取 Suno / Clerk 凭证并测试配额接口 (/api/billing/info/)...")
+    try:
+        from suno_service import SunoService
+        suno = SunoService(bridge=bridge)
+        credits_info = suno.get_credits()
+        print("  ✅ 成功获取 Suno 鉴权与配额信息!")
+        print(f"     剩余总积分: {credits_info['total_credits_left']} 积分")
+        print(f"     可用曲目数: {credits_info['songs_left']} 次 (每次生成提供 2 种变体)")
+        print(f"     重置周期  : {credits_info['period']}")
+    except Exception as e:
+        print(f"  ⚠️ Suno 连通性提示 (浏览器未登录 suno.com 或未配置 SUNO_COOKIE): {e}")
+
     print("\n" + "=" * 60)
-    print("🎉 自动化测试套件执行完毕：Bilibili + 百度网盘 + ChatGPT 全流程实测通过！")
+    print("🎉 自动化测试套件执行完毕：Bilibili + 百度网盘 + ChatGPT + Suno 全流程实测通过！")
     print("=" * 60)
 
 

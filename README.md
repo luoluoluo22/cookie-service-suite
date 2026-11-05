@@ -18,11 +18,12 @@
          ▲  (暴露 HTTP REST 接口: /cookies, /v1/chat/completions)
          │
 [ 业务层 SDK 与 CLI 工具 (Python) ]
-   ├── 🔌 cookie_bridge.py   (通用 Cookie 获取 SDK)
-   ├── 🤖 chatgpt_service.py (ChatGPT 页面桥接、会话提取与 OpenAI 兼容对话)
-   ├── 📺 bilibili_service.py (B 站用户信息、Dash 4K 流解析、yt-dlp 高清下载)
+   ├── 🔌 cookie_bridge.py    (通用 Cookie 获取 SDK)
+   ├── 🤖 chatgpt_service.py  (ChatGPT 页面桥接、会话提取与 OpenAI 兼容对话)
+   ├── 🎵 suno_service.py     (Suno AI 音乐创作、Clerk 令牌兑换、状态轮询与 MP3 下载)
+   ├── 📺 bilibili_service.py  (B 站用户信息、Dash 4K 流解析、yt-dlp 高清下载)
    ├── 💾 baidu_pan_service.py (百度网盘 BDUSS 鉴权、配额计算、文件遍历)
-   └── 🧪 test_suite.py       (六合一自动化端到端测试套件)
+   └── 🧪 test_suite.py        (全套自动化端到端测试套件)
 ```
 
 ---
@@ -32,6 +33,7 @@
 | 服务平台 | 实测提取凭证 / 桥接技术 | 测试场景 / 接口 | 实测结果 | 数据反馈与能力 |
 | :--- | :--- | :--- | :--- | :--- |
 | **OpenAI ChatGPT Web** | 浏览器原生桥接<br>`Bearer AccessToken`<br>`__Secure-next-auth`<br>**SSE Stream Hook** | 1. 登录会话与用户提取 (`/chatgpt/session`)<br>2. 账号可用模型列表 (`/chatgpt/models`)<br>3. 标准兼容对话 (`/v1/chat/completions`)<br>4. 实时流式响应 (`stream: true`) | 🟢 **100% 通过** | 彻底绕过 Cloudflare Turnstile 403 拦截，提取账号 `7501243@qq.com` 会话与实时模型库；通过页面主环境 (`MAIN` world) 挂载 `window.fetch` 流式拦截器，毫秒级逐字提取 SSE 数据块 (`text/event-stream`)，兼具 DOM 兜底保底，实现长文本无截断完整输出。 |
+| **Suno AI 音乐创作** | Clerk 动态 Token 换取<br>`__client`<br>`Bearer JWT`<br>`curl_cffi` 真实指纹伪装 | 1. 账户总积分与曲目配额 (`/api/suno/quota`)<br>2. 历史曲库与音频直链 (`/api/suno/feed`)<br>3. 灵感/歌词模式生成 (`/api/suno/generate`)<br>4. 本地 MP3 流式自动下载 | 🟢 **集成完毕** | 依托本地 Cookie Hub 自动提取 `suno.com` 与 `clerk.suno.com` 凭证，免手动 F12 抓包；基于 `curl_cffi` 原生模拟浏览器 TLS 指纹突破 Cloudflare 风控；实现从提示词输入到自动轮询、两组变体曲目渲染完成、MP3 流式下载入库的全闭环。 |
 | **百度网盘 (Baidu Pan)** | `BDUSS`<br>`STOKEN`<br>`PANPSC` | 1. 账号与会员鉴权<br>2. 网盘总配额/剩余容量<br>3. 目录与文件实时遍历 | 🟢 **100% 通过** | 自动提取 `BDUSS`，成功查询容量配额 **2055.0 GB**（已用 1913.86 GB，剩余 141.14 GB），成功遍历根目录下 19 项文件与文件夹。 |
 | **Bilibili (哔哩哔哩)** | `SESSDATA`<br>`bili_jct`<br>`DedeUserID` | 1. 个人中心与资产查询<br>2. 高清分P与Dash流解析<br>3. `yt-dlp` 高清下载 | 🟢 **100% 通过** | 自动提取 `SESSDATA`，成功识别账号等级 Lv.5、大会员特权与硬币，解锁 1080P+ / 4K 高码率视频流。 |
 | **yt-dlp 联动下载** | Netscape 格式 cookies.txt | B 站 1080P+ / 4K 原画视频解析提取 | 🟢 **100% 通过** | 本地服务自动导出标准 Netscape 格式，yt-dlp 无感绕过画质限制并自动下载。 |
@@ -59,6 +61,10 @@ cookie-service-suite/
 ├── run_gemini_cli.py     # Gemini 4 账号命令行管理工具
 ├── monitor_gemini_workflow.py # 长时间稳定性与多账号自动化轮询监控脚本
 ├── chatgpt_service.py    # ChatGPT 客户端 SDK：会话提取、模型列表、问答对话
+├── suno_service.py       # Suno 音乐生成服务：Clerk 令牌兑换、状态轮询与 MP3 下载
+├── suno_cli.py           # Suno 独立免服务客户端：免启动后台服务，直接查配额与生成下载
+├── suno_cli.bat          # Windows 一键执行批处理脚本
+├── run_suno_cli.py       # Suno 音乐生成命令行工具：与套件服务联动
 ├── baidu_pan_service.py  # 百度网盘业务实现：账号鉴权、配额计算、文件列表遍历
 ├── run_baidu_cli.py      # 百度网盘命令行工具：查看配额、用户信息、列出文件
 ├── bilibili_service.py   # Bilibili 业务封装：用户信息、Dash 直链提取、yt-dlp 联动
@@ -215,6 +221,72 @@ python run_service.py --no-tray
 # ReDoc 规范:    http://127.0.0.1:18800/redoc
 # OpenAI 接口:   http://127.0.0.1:18800/v1/chat/completions
 ```
+
+### 8. Suno AI 音乐创作 (Cookie 免密自动化与高清 MP3 下载)
+无需手动按 F12 抓包，只需在浏览器中登录一次 `suno.com`：
+- **自动换票与保活**：基于 Clerk 基础设施自动兑换短效 JWT 访问令牌，避免 Token 过期。
+- **TLS 指纹穿透**：通过 `curl_cffi` 完美模拟真实 Edge/Chrome 客户端指纹，突破 Cloudflare 拦截。
+- **全流程一键搞定**：提交灵感提示词 $\rightarrow$ 异步状态轮询 $\rightarrow$ 获取双版本变体 $\rightarrow$ 流式自动下载 MP3 到本地 `downloads/suno`。
+
+#### (1) 独立免服务模式 CLI (`suno_cli.py` / `suno_cli.bat` - 推荐)
+**即便不启动任何本地守护进程或 Bridge 服务**，也可直接运行：
+```powershell
+# 1. 首次配置 Cookie 凭证 (仅需配置一次，自动加密持久化至本地安全缓存 .suno_cookie)
+python suno_cli.py login
+
+# 2. 查询当前积分与可用生成额度
+python suno_cli.py quota
+
+# 3. 灵感描述模式快速生成 (自动流式下载 MP3 到 ./downloads/suno)
+python suno_cli.py gen "一段欢快的夏日海滩吉他流行曲，男女双人对唱"
+
+# 4. 纯伴奏模式 (无主唱人声)
+python suno_cli.py gen "赛博朋克电子音乐，强劲节拍与低音" --instrumental
+
+# 5. 自定义歌词与风格流派模式
+python suno_cli.py custom "[Verse]\n海风吹拂...\n[Chorus]\n夏天的歌..." --tags "acoustic pop, guitar" --title "夏日恋曲"
+
+# 6. 单独使用 AI 创作歌词
+python suno_cli.py lyrics "写一首关于秋天落叶与远方思念的流行歌词"
+
+# 7. 查看历史生成的曲库列表与直链
+python suno_cli.py feed
+
+# 8. 通过 Clip ID 或直链补下载音频
+python suno_cli.py download <clip_id_or_url>
+```
+
+#### (2) 套件统一命令行联动 (`run_suno_cli.py`)
+与本地 Cookie Hub 守护服务联动，自动无感同步浏览器 Cookie：
+```powershell
+python run_suno_cli.py quota
+python run_suno_cli.py gen "温暖治愈的民谣木吉他弹唱"
+```
+
+#### (3) Python 代码调用示例
+```python
+from suno_service import SunoService
+
+suno = SunoService()
+
+# 1. 查看额度
+credits_info = suno.get_credits()
+print("剩余可生成次数:", credits_info["songs_left"])
+
+# 2. 一键生成并下载到本地
+results = suno.generate_and_download(
+    prompt="温暖治愈的民谣木吉他弹唱，温柔男声",
+    output_dir="./downloads/suno",
+    progress_callback=print
+)
+
+for r in results:
+    print("曲名:", r.get("title"))
+    print("本地音频文件:", r.get("local_file"))
+    print("在线试听:", r.get("audio_url"))
+```
+
+---
 
 ---
 
