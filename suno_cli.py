@@ -90,6 +90,39 @@ def ensure_service_ready(args) -> SunoService:
     return service
 
 
+def convert_to_compatible_aac_m4a(input_path: str) -> str:
+    """将 Suno 的 Opus-in-M4A 转为通用播放器更易兼容的 AAC-LC M4A。"""
+    import shutil
+    import subprocess
+
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if not ffmpeg_bin:
+        try:
+            import imageio_ffmpeg
+            ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception as exc:
+            raise RuntimeError("未找到 FFmpeg，无法生成兼容性 AAC-M4A 文件") from exc
+
+    temp_path = input_path[:-4] + ".aac-tmp.m4a" if input_path.lower().endswith(".m4a") else input_path + ".aac-tmp.m4a"
+    try:
+        subprocess.run(
+            [ffmpeg_bin, "-y", "-i", input_path, "-map", "0:a:0", "-vn",
+             "-c:a", "aac", "-profile:a", "aac_low", "-b:a", "192k", "-ar", "48000",
+             "-movflags", "+faststart", temp_path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
+        )
+        # 转码后再完整解码一遍，验证文件不是仅有文件头的损坏产物。
+        subprocess.run(
+            [ffmpeg_bin, "-v", "error", "-i", temp_path, "-f", "null", "-"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
+        )
+        os.replace(temp_path, input_path)
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+    return os.path.abspath(input_path)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Suno AI 独立免服务命令行客户端 (Standalone CLI - 支持离线与直接调用)",
@@ -135,7 +168,7 @@ def main():
     lyrics_parser.add_argument("prompt", type=str, help="歌词灵感提示词")
 
     # 7. 下载单首歌曲
-    dl_parser = subparsers.add_parser("download", help="通过音频直链或 Clip ID 下载歌曲 MP3")
+    dl_parser = subparsers.add_parser("download", help="通过音频直链或 Clip ID 下载歌曲（Clip ID 输出兼容 AAC-M4A）")
     dl_parser.add_argument("target", type=str, help="音频直链 URL 或 歌曲 Clip ID")
     dl_parser.add_argument("--out", type=str, default="./downloads/suno", help="保存目录")
 
@@ -352,6 +385,8 @@ def main():
                 out_path = os.path.join(args.out, save_name)
                 print(f"🔐 识别到 Suno Clip ID: {clip_id}，正在执行渐进流解密下载...")
                 downloaded = service.download_song(clip_id, out_path)
+                print("🔄 正在转换为播放器兼容性更好的 AAC-M4A...")
+                downloaded = convert_to_compatible_aac_m4a(downloaded)
             else:
                 save_name = f"suno_track_{int(time.time())}.mp3"
                 out_path = os.path.join(args.out, save_name)

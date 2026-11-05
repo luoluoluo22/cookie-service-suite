@@ -691,31 +691,33 @@ def openai_image_generations(body: OpenAIImageGenerationRequest):
         raise HTTPException(status_code=502, detail=f"ChatGPT 图片生成失败: {str(e)}")
 
 
-# 模型元数据中文描述字典 (覆盖官方逆向全部核心与思考系列)
+# 模型元数据中文描述字典 (区分日常聊天 Chat 与工作台 Work 专有模型)
 REVERSE_MODEL_DESCRIPTIONS = {
-    # 核心优选与思考推理 (Thinking 系列)
-    "gpt-6-thinking": "[协议逆向直连] GPT-6 扩展深度思考链模型 (官方默认首选)",
-    "gpt-6": "[协议逆向直连] GPT-6 官方默认新一代架构模型",
-    "gpt-6-instant": "[协议逆向直连] GPT-6 极速即时响应模型",
-    "gpt-6-mini": "[协议逆向直连] GPT-6 轻量紧凑高通量模型",
-    "gpt-6-t-mini": "[协议逆向直连] GPT-6 轻量深度思考推理模型",
-    "gpt-5-6-thinking": "[协议逆向直连] GPT-5.6 扩展深度思考链模型",
-    "gpt-5-6": "[协议逆向直连] GPT-5.6 Web 逆向旗舰模型",
-    "gpt-5-6-instant": "[协议逆向直连] GPT-5.6 极速即时响应模型",
-    "gpt-5-6-mini": "[协议逆向直连] GPT-5.6 轻量高效模型",
-    "gpt-5-6-t-mini": "[协议逆向直连] GPT-5.6 轻量深度思考推理模型",
-    "auto": "[协议逆向直连] ChatGPT 智能自动优选模型",
-    "research": "[协议逆向直连] ChatGPT 全网深度学术与研报挖掘模型 (Deep Research)",
-    "gpt-image-2": "[协议逆向直连] ChatGPT 逆向文生图专用 (DALL-E 3)",
-    "codex-gpt-image-2": "[协议逆向直连] ChatGPT Codex 高清画图专用",
-    "gpt-6.1-sol-wm": "[协议逆向直连] GPT-6.1 Sol 专属架构模型",
-    "gpt-6.1-terra-wm": "[协议逆向直连] GPT-6.1 Terra 专属架构模型",
-    "gpt-6-sol-wm": "[协议逆向直连] GPT-6 Sol 变体模型",
-    "gpt-6-luna-wm": "[协议逆向直连] GPT-6 Luna 变体模型",
-    "gpt-6-astra-wm": "[协议逆向直连] GPT-6 Astra 变体模型",
-    "gpt-5.6-sol-wm": "[协议逆向直连] GPT-5.6 Sol 变体模型",
-    "gpt-5.6-luna-wm": "[协议逆向直连] GPT-5.6 Luna 变体模型",
-    "gpt-5.6-terra-wm": "[协议逆向直连] GPT-5.6 Terra 变体模型",
+    # --- 日常聊天专有模型 (Chat Mode: is_work_mode_model = false) ---
+    "auto": "[日常聊天/Auto] ChatGPT 智能自动优选模型",
+    "gpt-6-thinking": "[深度思考/Chat] GPT-6 扩展深度思考链模型 (官方默认首选)",
+    "gpt-6": "[日常聊天/Chat] GPT-6 官方默认新一代架构模型",
+    "gpt-6-instant": "[极速响应/Chat] GPT-6 极速即时响应模型",
+    "gpt-6-mini": "[轻量紧凑/Chat] GPT-6 轻量紧凑高通量模型",
+    "gpt-6-t-mini": "[轻量思考/Chat] GPT-6 轻量深度思考推理模型",
+    "gpt-5-6-thinking": "[深度思考/Chat] GPT-5.6 扩展深度思考链模型",
+    "gpt-5-6": "[日常聊天/Chat] GPT-5.6 Web 旗舰模型",
+    "gpt-5-6-instant": "[极速响应/Chat] GPT-5.6 极速即时响应模型",
+    "gpt-5-6-mini": "[轻量高效/Chat] GPT-5.6 轻量高效模型",
+    "gpt-5-6-t-mini": "[轻量思考/Chat] GPT-5.6 轻量深度思考推理模型",
+    "research": "[学术研报/Research] ChatGPT 全网深度学术与研报挖掘模型 (Deep Research)",
+    "gpt-image-2": "[文生图/Image] ChatGPT 官方逆向绘图专用 (DALL-E 3)",
+    "codex-gpt-image-2": "[高清绘图/Codex] ChatGPT Codex 高清画图专用",
+
+    # --- Work 协同工作台专有模型 (Work Mode: is_work_mode_model = true, 官方带 -wm 后缀) ---
+    "gpt-6-sol-wm": "[工作台专有/Work] GPT-6 Sol 协同工作区模型",
+    "gpt-6-luna-wm": "[工作台专有/Work] GPT-6 Luna 协同工作区模型",
+    "gpt-6-astra-wm": "[工作台专有/Work] GPT-6 Astra 协同工作区模型",
+    "gpt-6.1-sol-wm": "[工作台专有/Work] GPT-6.1 Sol 演进工作区模型",
+    "gpt-6.1-terra-wm": "[工作台专有/Work] GPT-6.1 Terra 演进工作区模型",
+    "gpt-5.6-sol-wm": "[工作台专有/Work] GPT-5.6 Sol 协同工作区模型",
+    "gpt-5.6-luna-wm": "[工作台专有/Work] GPT-5.6 Luna 协同工作区模型",
+    "gpt-5.6-terra-wm": "[工作台专有/Work] GPT-5.6 Terra 协同工作区模型",
 }
 
 
@@ -743,12 +745,14 @@ def openai_models():
                     continue
                 seen_ids.add(mid)
                 desc = REVERSE_MODEL_DESCRIPTIONS.get(mid, f"[协议逆向直连] ChatGPT 官方模型 ({mid})")
+                is_wm = "-wm" in mid.lower()
                 reverse_models.append({
                     "id": mid,
                     "object": "model",
                     "owned_by": "openai-reverse",
                     "tag": "reverse",
                     "type": "api_reverse",
+                    "scene": "work" if is_wm else "chat",
                     "description": desc,
                 })
         except Exception:
@@ -757,12 +761,14 @@ def openai_models():
     # 兜底回退：若逆向引擎暂时未拉取到，使用内建全量逆向清单 (包含 thinking，无 4o)
     if not reverse_models:
         for mid, desc in REVERSE_MODEL_DESCRIPTIONS.items():
+            is_wm = "-wm" in mid.lower()
             reverse_models.append({
                 "id": mid,
                 "object": "model",
                 "owned_by": "openai-reverse",
                 "tag": "reverse",
                 "type": "api_reverse",
+                "scene": "work" if is_wm else "chat",
                 "description": desc,
             })
 
