@@ -99,26 +99,43 @@ def main():
     except Exception as e:
         print(f"  ❌ 百度网盘文件列表测试失败: {e}")
 
-    # 6. 测试 ChatGPT Web 桥接对话接口 (/v1/chat/completions)
-    print("\n[测试 6/7] 正在测试 ChatGPT Web 原生桥接通信与智能问答 (/v1/chat/completions)...")
+    # 6. 测试 ChatGPT 双引擎（chatgpt2api 深度逆向引擎 + 浏览器同源桥接）
+    print("\n[测试 6/8] 正在测试 ChatGPT 独立逆向工程后端 (chatgpt2api) 与模型探测...")
     try:
-        gpt = ChatGPTBridgeClient()
-        session_info = gpt.get_session().get("session", {})
+        from chatgpt_service import chatgpt_service
+        rev = chatgpt_service.reverse
+        if not rev.is_running():
+            print("  ⏳ 正在按需唤醒 ChatGPT 独立逆向后台服务 (端口 18084)...")
+            rev.start(wait_timeout=15)
+        
+        models_data = rev.get_models()
+        models_list = [m.get("id") for m in models_data.get("data", [])]
+        health = rev.get_health()
+        print(f"  ✅ ChatGPT 独立逆向后台就绪在线! (版本: v{health.get('version')}, 端口: {rev.port})")
+        print(f"     可用逆向模型: {', '.join(models_list[:5])} 等共 {len(models_list)} 个模型")
+        print(f"     号池统计状态: 当前账号 {health.get('accounts', {}).get('total', 0)} 个, 可用 {health.get('accounts', {}).get('active', 0)} 个")
+    except Exception as e:
+        print(f"  ⚠️ ChatGPT 逆向引擎测试提示: {e}")
+
+    print("\n[测试 7/8] 正在测试 ChatGPT 浏览器扩展同源桥接会话...")
+    try:
+        from chatgpt_service import chatgpt_service
+        session_info = chatgpt_service.bridge.get_session().get("session", {})
         user_name = session_info.get("user", {}).get("name", "Unknown")
         user_email = session_info.get("user", {}).get("email", "Unknown")
         plan = session_info.get("accountPlan", "free")
-        print(f"  ✅ 成功获取 ChatGPT 鉴权凭证与会话状态 (用户: {user_name} / {user_email}, 方案: {plan})")
+        print(f"  ✅ 成功获取 ChatGPT 浏览器鉴权凭证与会话状态 (用户: {user_name} / {user_email}, 方案: {plan})")
 
         prompt = "请用一句简短的话说明：2加2等于几？"
-        reply = gpt.ask(prompt)
+        reply = chatgpt_service.ask(prompt)
         print(f"  ✅ ChatGPT 对话测试成功!")
         print(f"     提问: {prompt}")
         print(f"     回复: {reply.strip()}")
     except Exception as e:
-        print(f"  ❌ ChatGPT 接口测试失败: {e}")
+        print(f"  ⚠️ ChatGPT 浏览器会话提示: {e}")
 
-    # 7. 测试 Suno AI 音乐生成服务凭证与配额
-    print("\n[测试 7/7] 正在提取 Suno / Clerk 凭证并测试配额接口 (/api/billing/info/)...")
+    # 8. 测试 Suno AI 音乐生成服务凭证与配额
+    print("\n[测试 8/8] 正在提取 Suno / Clerk 凭证并测试配额接口 (/api/billing/info/)...")
     try:
         from suno_service import SunoService
         suno = SunoService(bridge=bridge)

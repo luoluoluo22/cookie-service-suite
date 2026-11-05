@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Path
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 # 保证本地通信不被外部代理拦截
@@ -28,7 +28,7 @@ os.environ["NO_PROXY"] = "127.0.0.1,localhost,::1"
 
 from cookie_bridge import CookieBridge
 from gemini_service import MultiAccountGeminiPool, GeminiService
-from chatgpt_service import ChatGPTBridgeClient
+from chatgpt_service import chatgpt_service, UnifiedChatGPTService, ChatGPTBridgeClient, ChatGPTReverseEngine
 from bilibili_service import BilibiliService
 from baidu_pan_service import BaiduPanService
 from suno_service import SunoService, suno_service
@@ -54,7 +54,7 @@ app.add_middleware(
 # 单例业务客户端
 bridge_hub = CookieBridge()
 gemini_pool = MultiAccountGeminiPool(port=18083, account_count=4)
-chatgpt_client = ChatGPTBridgeClient()
+chatgpt_client = chatgpt_service
 bili_service = BilibiliService()
 baidu_service = BaiduPanService()
 suno_client = suno_service
@@ -70,6 +70,24 @@ class ChatRequest(BaseModel):
     model: Optional[str] = Field("gemini-3.5-flash-lite", description="模型名称 (gemini-3.5-flash-lite, gemini-3.1-pro 等)", example="gemini-3.5-flash-lite")
     reasoning_level: Optional[str] = Field("off", description="推理级别: 'off'(关闭思考/极速), 'medium'(中等推理), 'high'(深度扩展思考)", example="off")
     timeout: Optional[int] = Field(60, description="请求超时时间 (秒)", example=60)
+
+
+class ChatGPTAccountImportRequest(BaseModel):
+    tokens: List[str] = Field(..., description="OpenAI Access Token 列表 (JWT 字符串)")
+
+
+class ChatGPTImageRequest(BaseModel):
+    prompt: str = Field(..., description="图片生成提示词", example="一只在太空漂浮的赛博朋克猫咪")
+    model: Optional[str] = Field("gpt-image-2", description="图片模型 (gpt-image-2, codex-gpt-image-2 等)")
+    n: Optional[int] = Field(1, description="生成张数 (1-4)", ge=1, le=4)
+    response_format: Optional[str] = Field("b64_json", description="返回格式 (b64_json 或 url)")
+
+
+class OpenAIImageGenerationRequest(BaseModel):
+    prompt: str = Field(..., description="图片生成提示词")
+    model: Optional[str] = Field("gpt-image-2")
+    n: Optional[int] = Field(1)
+    response_format: Optional[str] = Field("b64_json")
 
 
 class OpenAIMessage(BaseModel):
@@ -124,6 +142,7 @@ def get_system_overview():
             pass
 
     uptime_sec = int((datetime.datetime.now() - START_TIME).total_seconds())
+    chatgpt_status = chatgpt_client.get_status()
 
     return {
         "status": "online",
@@ -142,6 +161,13 @@ def get_system_overview():
                 "status": "running" if gemini_running else "stopped",
                 "account_count": len(gemini_accounts),
                 "active_accounts": sum(1 for a in gemini_accounts if a.get("status") == "enabled"),
+            },
+            "chatgpt": {
+                "mode": chatgpt_status.get("mode"),
+                "reverse_running": chatgpt_status.get("reverse_engine", {}).get("running", False),
+                "reverse_port": chatgpt_status.get("reverse_engine", {}).get("port", 18084),
+                "reverse_health": chatgpt_status.get("reverse_engine", {}).get("health", {}),
+                "bridge_connected": chatgpt_status.get("browser_bridge", {}).get("extension_connected", False),
             },
             "chatgpt_bridge": {
                 "status": "ready" if hub_ok else "waiting_hub",
@@ -267,33 +293,106 @@ def get_gemini_recent_requests(limit: int = Query(20, description="返回条数�
 
 
 # ==========================================
-# 3. ChatGPT Web 原生桥接服务
+# 3. ChatGPT 逆向工程与原生桥接号池 API
 # ==========================================
-@app.get("/api/chatgpt/session", summary="获取当前 ChatGPT 登录会话与邮箱", tags=["ChatGPT Web 桥接"])
+@app.get("/api/chatgpt/status", summary="获取 ChatGPT 运行模式与号池状态", tags=["ChatGPT 逆向与号池"])
+def get_chatgpt_status():
+    """检测当前 ChatGPT 服务状态（逆向服务端口、健康度、号池账号总数与浏览器桥接状态）。"""
+    return chatgpt_client.get_status()
+
+
+@app.post("/api/chatgpt/start", summary="启动 ChatGPT 本地独立逆向后台服务", tags=["ChatGPT 逆向与号池"])
+def start_chatgpt_reverse():
+    """手动按需启动基于 chatgpt2api 的独立无头逆向进程 (默认 18084 端口)。"""
+    try:
+        ok = chatgpt_client.reverse.start()
+        return {"success": ok, "port": chatgpt_client.reverse.port, "is_running": chatgpt_client.reverse.is_running()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"启动 ChatGPT 逆向后台失败: {str(e)}")
+
+
+@app.post("/api/chatgpt/stop", summary="停止 ChatGPT 本地独立逆向后台服务", tags=["ChatGPT 逆向与号池"])
+def stop_chatgpt_reverse():
+    """停止 ChatGPT 独立无头逆向进程。"""
+    try:
+        chatgpt_client.reverse.stop()
+        return {"success": True, "is_running": chatgpt_client.reverse.is_running()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"停止 ChatGPT 逆向后台失败: {str(e)}")
+
+
+@app.get("/api/chatgpt/session", summary="获取当前 ChatGPT 登录会话与邮箱", tags=["ChatGPT 逆向与号池"])
 def get_chatgpt_session():
-    """提取当前浏览器 ChatGPT 标签页的已登录用户与 Access Token。"""
+    """提取当前 ChatGPT 标签页或逆向号池中的已登录用户与 Access Token。"""
     try:
         return chatgpt_client.get_session()
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"无法获取 ChatGPT 会话: {str(e)}")
 
 
-@app.get("/api/chatgpt/models", summary="获取 ChatGPT 账号可用模型列表", tags=["ChatGPT Web 桥接"])
+@app.get("/api/chatgpt/models", summary="获取 ChatGPT 账号可用模型列表", tags=["ChatGPT 逆向与号池"])
 def get_chatgpt_models():
+    """拉取逆向暴露或浏览器同源支持的模型列表 (如 auto, gpt-5-6, gpt-image-2 等)。"""
     try:
         return chatgpt_client.get_models()
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"无法获取模型列表: {str(e)}")
 
 
-@app.post("/api/chatgpt/chat", summary="向 ChatGPT 发起网页端同源对话", tags=["ChatGPT Web 桥接"])
-def chatgpt_ask(req: ChatRequest):
-    """突破 Cloudflare Turnstile 验证码拦截，通过同源 SSE 拦截器获取模型回复。"""
+@app.get("/api/chatgpt/accounts", summary="获取当前 ChatGPT 逆向号池账号列表", tags=["ChatGPT 逆向与号池"])
+def list_chatgpt_accounts():
+    """查看已导入逆向引擎的账号列表、额度与健康状态。"""
     try:
-        reply = chatgpt_client.ask(req.prompt)
+        if not chatgpt_client.reverse.is_running():
+            chatgpt_client.reverse.start()
+        return {"items": chatgpt_client.reverse.list_accounts()}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"获取账号列表失败: {str(e)}")
+
+
+@app.post("/api/chatgpt/accounts", summary="向 ChatGPT 号池导入 AccessToken", tags=["ChatGPT 逆向与号池"])
+def import_chatgpt_accounts(body: ChatGPTAccountImportRequest):
+    """手动导入一个或多个 Access Token 进入号池并自动刷新有效性。"""
+    try:
+        if not chatgpt_client.reverse.is_running():
+            chatgpt_client.reverse.start()
+        res = chatgpt_client.reverse.import_tokens(body.tokens)
+        return res
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"导入账号失败: {str(e)}")
+
+
+@app.post("/api/chatgpt/accounts/sync-browser", summary="从浏览器 Cookie Hub 一键同步 Token 入池", tags=["ChatGPT 逆向与号池"])
+def sync_chatgpt_browser_token():
+    """通过 Cookie Hub 自动获取浏览器中当前 chatgpt.com 登录会话的 Access Token，并一键载入逆向号池。"""
+    try:
+        return chatgpt_client.sync_token_from_browser()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"从浏览器同步 Token 失败: {str(e)}")
+
+
+@app.post("/api/chatgpt/chat", summary="向 ChatGPT 发起智能对话 (支持逆向与桥接双引擎)", tags=["ChatGPT 逆向与号池"])
+def chatgpt_ask(req: ChatRequest):
+    """优先使用无头逆向引擎直连，若未就绪则自动降级到浏览器同源扩展。"""
+    try:
+        reply = chatgpt_client.ask(req.prompt, model=req.model or "auto")
         return {"success": True, "reply": reply}
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"ChatGPT 提问失败: {str(e)}")
+
+
+@app.post("/api/chatgpt/image", summary="ChatGPT 逆向图片生成 (gpt-image-2)", tags=["ChatGPT 逆向与号池"])
+def chatgpt_image_generation(body: ChatGPTImageRequest):
+    """基于 chatgpt2api 官方逆向实现文生图，支持 gpt-image-2 等模型。"""
+    try:
+        return chatgpt_client.generate_image(
+            prompt=body.prompt,
+            model=body.model or "gpt-image-2",
+            n=body.n or 1,
+            response_format=body.response_format or "b64_json"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"ChatGPT 图片生成失败: {str(e)}")
 
 
 # ==========================================
@@ -462,71 +561,149 @@ def refresh_suno_auth():
 def openai_chat_completions(req: OpenAIChatRequest):
     """
     提供标准 OpenAI 规范接口，可无缝对接 NextChat、Chatbox、OpenCat、Cursor 等第三方大模型客户端。
-    底层自动路由到 4 个 Google 账号池进行均衡轮询。
+    底层智能分流：
+    - gemini-* 模型自动分发至 Google Gemini 4 账号统一均衡池；
+    - gpt-* / chatgpt-* / auto 自动分发至 ChatGPT 逆向号池或同源扩展桥接；
+    - 支持 stream=True 标准 SSE 流式输出。
     """
     last_user_msg = next((m.content for m in reversed(req.messages) if m.role == "user"), "")
     if not last_user_msg:
         raise HTTPException(status_code=400, detail="未包含有效的 user 消息")
 
-    if not gemini_pool.is_running():
-        gemini_pool.start()
+    model_name = (req.model or "gemini-3.5-flash-lite").lower().strip()
 
-    target_model = req.model if req.model and "gemini" in req.model else "gemini-3.5-flash-lite"
-    reasoning = req.reasoning_effort or req.reasoning_level or "off"
-    try:
-        res = gemini_pool.ask_with_details(
-            prompt=last_user_msg, model=target_model, reasoning_level=reasoning
-        )
-    except Exception as first_err:
+    # 1. Gemini 分流
+    if model_name.startswith("gemini"):
+        if not gemini_pool.is_running():
+            gemini_pool.start()
+
+        target_model = req.model if req.model and "gemini" in req.model else "gemini-3.5-flash-lite"
+        reasoning = req.reasoning_effort or req.reasoning_level or "off"
         try:
-            gemini_pool.refresh_pool_cookies()
             res = gemini_pool.ask_with_details(
                 prompt=last_user_msg, model=target_model, reasoning_level=reasoning
             )
-        except Exception as retry_err:
-            raise HTTPException(status_code=502, detail=f"OpenAI 兼容接口调用失败: {str(retry_err)}")
+        except Exception as first_err:
+            try:
+                gemini_pool.refresh_pool_cookies()
+                res = gemini_pool.ask_with_details(
+                    prompt=last_user_msg, model=target_model, reasoning_level=reasoning
+                )
+            except Exception as retry_err:
+                raise HTTPException(status_code=502, detail=f"Gemini 兼容接口调用失败: {str(retry_err)}")
 
-    cid = f"chatcmpl-suite-{int(time.time()*1000)}"
-    return {
-        "id": cid,
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": target_model,
-        "choices": [
-            {
-                "index": 0,
-                "message": {"role": "assistant", "content": res.get("reply", "")},
-                "finish_reason": "stop",
+        cid = f"chatcmpl-gemini-{int(time.time()*1000)}"
+        return {
+            "id": cid,
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": target_model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": res.get("reply", "")},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": len(last_user_msg),
+                "completion_tokens": len(res.get("reply", "")),
+                "total_tokens": len(last_user_msg) + len(res.get("reply", "")),
+            },
+            "_meta": {
+                "account_id": res.get("account_id"),
+                "account_label": res.get("account_label"),
+                "authuser": res.get("authuser"),
+                "latency_ms": res.get("took_ms"),
+            },
+        }
+
+    # 2. ChatGPT 分流 (逆向引擎 + 扩展桥接)
+    target_gpt_model = req.model if req.model and req.model not in ("chatgpt-web", "gpt-4o", "gpt-3.5-turbo") else "auto"
+    messages_payload = [{"role": m.role, "content": m.content} for m in req.messages]
+    effort = req.reasoning_effort or req.reasoning_level or ""
+
+    if req.stream:
+        def _sse_generator():
+            try:
+                for chunk in chatgpt_client.chat(messages_payload, model=target_gpt_model, stream=True, thinking_effort=effort):
+                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+            except Exception as e:
+                err_data = {"error": {"message": str(e), "type": "chatgpt_error"}}
+                yield f"data: {json.dumps(err_data, ensure_ascii=False)}\n\n"
+
+        return StreamingResponse(_sse_generator(), media_type="text/event-stream")
+
+    try:
+        res = chatgpt_client.chat(messages_payload, model=target_gpt_model, stream=False, thinking_effort=effort)
+        return res
+    except Exception as e:
+        # 降级尝试单句提问
+        try:
+            reply = chatgpt_client.ask(last_user_msg, model=target_gpt_model)
+            cid = f"chatcmpl-gpt-{int(time.time()*1000)}"
+            return {
+                "id": cid,
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": target_gpt_model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": reply},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": len(last_user_msg),
+                    "completion_tokens": len(reply),
+                    "total_tokens": len(last_user_msg) + len(reply),
+                },
             }
-        ],
-        "usage": {
-            "prompt_tokens": len(last_user_msg),
-            "completion_tokens": len(res.get("reply", "")),
-            "total_tokens": len(last_user_msg) + len(res.get("reply", "")),
-        },
-        "_meta": {
-            "account_id": res.get("account_id"),
-            "account_label": res.get("account_label"),
-            "authuser": res.get("authuser"),
-            "latency_ms": res.get("took_ms"),
-        },
-    }
+        except Exception as fallback_err:
+            raise HTTPException(status_code=502, detail=f"ChatGPT 兼容调用失败: {str(fallback_err)}")
+
+
+@app.post("/v1/images/generations", summary="OpenAI 兼容图片生成接口", tags=["OpenAI 兼容接口"])
+def openai_image_generations(body: OpenAIImageGenerationRequest):
+    """
+    提供标准 OpenAI POST /v1/images/generations 接口，
+    底层自动路由到 chatgpt2api 官方逆向的 gpt-image-2 / DALL-E 3 生成能力。
+    """
+    try:
+        return chatgpt_client.generate_image(
+            prompt=body.prompt,
+            model=body.model or "gpt-image-2",
+            n=body.n or 1,
+            response_format=body.response_format or "b64_json"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"ChatGPT 图片生成失败: {str(e)}")
 
 
 @app.get("/v1/models", summary="OpenAI 兼容模型列表", tags=["OpenAI 兼容接口"])
 def openai_models():
+    gpt_models = [
+        {"id": "auto", "object": "model", "owned_by": "openai-reverse", "description": "ChatGPT 智能自动优选模型"},
+        {"id": "gpt-5-6", "object": "model", "owned_by": "openai-reverse", "description": "ChatGPT Web 逆向旗舰模型"},
+        {"id": "gpt-5-6-mini", "object": "model", "owned_by": "openai-reverse", "description": "ChatGPT Web 极速轻量模型"},
+        {"id": "gpt-6", "object": "model", "owned_by": "openai-reverse", "description": "ChatGPT Web 新一代架构模型"},
+        {"id": "gpt-image-2", "object": "model", "owned_by": "openai-reverse", "description": "ChatGPT 逆向文生图专用 (DALL-E 3)"},
+        {"id": "codex-gpt-image-2", "object": "model", "owned_by": "openai-reverse", "description": "ChatGPT Codex 高清画图专用"},
+        {"id": "chatgpt-web", "object": "model", "owned_by": "openai-cookie-suite", "description": "ChatGPT 浏览器同源桥接"},
+        {"id": "gpt-4o", "object": "model", "owned_by": "openai-cookie-suite", "description": "OpenAI 兼容映射通道"},
+    ]
+    gemini_models = [
+        {"id": "gemini-3.5-flash-lite", "object": "model", "owned_by": "google-cookie-suite", "description": "极速响应毫秒级，推荐默认"},
+        {"id": "gemini-3.1-pro", "object": "model", "owned_by": "google-cookie-suite", "description": "高智力强推理，适合复杂任务"},
+        {"id": "gemini-3.6-flash", "object": "model", "owned_by": "google-cookie-suite", "description": "多模态高通量，通用均衡"},
+        {"id": "gemini-3.8-flash", "object": "model", "owned_by": "google-cookie-suite", "description": "新一代 Flash 架构"},
+        {"id": "gemini-3.1-pro-thinking", "object": "model", "owned_by": "google-cookie-suite", "description": "扩展深度思考链模式"},
+    ]
     return {
         "object": "list",
-        "data": [
-            {"id": "gemini-3.5-flash-lite", "object": "model", "owned_by": "google-cookie-suite", "description": "极速响应毫秒级，推荐默认"},
-            {"id": "gemini-3.1-pro", "object": "model", "owned_by": "google-cookie-suite", "description": "高智力强推理，适合复杂任务"},
-            {"id": "gemini-3.6-flash", "object": "model", "owned_by": "google-cookie-suite", "description": "多模态高通量，通用均衡"},
-            {"id": "gemini-3.8-flash", "object": "model", "owned_by": "google-cookie-suite", "description": "新一代 Flash 架构"},
-            {"id": "gemini-3.1-pro-thinking", "object": "model", "owned_by": "google-cookie-suite", "description": "扩展深度思考链模式"},
-            {"id": "chatgpt-web", "object": "model", "owned_by": "openai-cookie-suite", "description": "ChatGPT 网页端原生桥接"},
-            {"id": "gpt-4o", "object": "model", "owned_by": "openai-cookie-suite", "description": "OpenAI 兼容通道映射"},
-            {"id": "gpt-3.5-turbo", "object": "model", "owned_by": "openai-cookie-suite", "description": "OpenAI 兼容通道映射"},
-        ],
+        "data": gpt_models + gemini_models,
     }
 
 
@@ -716,6 +893,13 @@ DASHBOARD_HTML = """
             <option value="hub_cookies">[GET] /api/hub/cookies?domain=google.com (提取实时Cookie)</option>
             <option value="bili_user">[GET] /api/bilibili/user (B站个人资料与大会员)</option>
             <option value="baidu_quota">[GET] /api/baidupan/quota (百度网盘总配额)</option>
+            <option value="chatgpt_status">[GET] /api/chatgpt/status (ChatGPT 逆向号池状态)</option>
+            <option value="chatgpt_models">[GET] /api/chatgpt/models (ChatGPT 逆向模型列表)</option>
+            <option value="chatgpt_accounts">[GET] /api/chatgpt/accounts (ChatGPT 号池账号总览)</option>
+            <option value="chatgpt_sync">[POST] /api/chatgpt/accounts/sync-browser (从浏览器一键同步Token)</option>
+            <option value="chatgpt_chat">[POST] /api/chatgpt/chat (ChatGPT 逆向智能问答)</option>
+            <option value="chatgpt_image">[POST] /api/chatgpt/image (ChatGPT 逆向文生图 gpt-image-2)</option>
+            <option value="openai_image">[POST] /v1/images/generations (OpenAI兼容图片生成)</option>
             <option value="chatgpt_session">[GET] /api/chatgpt/session (ChatGPT 会话提取)</option>
             <option value="suno_quota">[GET] /api/suno/quota (Suno 账户积分与可用曲目)</option>
             <option value="suno_feed">[GET] /api/suno/feed (Suno 历史曲库作品)</option>
@@ -737,6 +921,9 @@ DASHBOARD_HTML = """
               <option value="gemini-3.6-flash">gemini-3.6-flash (多模态高通量 · 均衡)</option>
               <option value="gemini-3.8-flash">gemini-3.8-flash (新版 3.8 Flash 架构)</option>
               <option value="gemini-4-argon">gemini-4-argon (4 Argon 复杂推理)</option>
+              <option value="auto">auto (ChatGPT 逆向智能优选)</option>
+              <option value="gpt-5-6">gpt-5-6 (ChatGPT Web 逆向旗舰)</option>
+              <option value="gpt-image-2">gpt-image-2 (ChatGPT 逆向文生图专用)</option>
               <option value="chatgpt-web">chatgpt-web (ChatGPT 网页原生)</option>
               <option value="gpt-4o">gpt-4o (OpenAI 协议通道映射)</option>
               <option value="gpt-3.5-turbo">gpt-3.5-turbo (OpenAI 兼容协议)</option>
@@ -904,6 +1091,53 @@ DASHBOARD_HTML = """
         method: "GET",
         url: "/api/baidupan/quota",
         body: ""
+      },
+      chatgpt_status: {
+        method: "GET",
+        url: "/api/chatgpt/status",
+        body: ""
+      },
+      chatgpt_models: {
+        method: "GET",
+        url: "/api/chatgpt/models",
+        body: ""
+      },
+      chatgpt_accounts: {
+        method: "GET",
+        url: "/api/chatgpt/accounts",
+        body: ""
+      },
+      chatgpt_sync: {
+        method: "POST",
+        url: "/api/chatgpt/accounts/sync-browser",
+        body: ""
+      },
+      chatgpt_chat: {
+        method: "POST",
+        url: "/api/chatgpt/chat",
+        body: JSON.stringify({
+          prompt: "请用幽默风趣的一句话自我介绍，并确认你已连接成功！",
+          model: "auto"
+        }, null, 2)
+      },
+      chatgpt_image: {
+        method: "POST",
+        url: "/api/chatgpt/image",
+        body: JSON.stringify({
+          prompt: "一只戴着宇航头盔的橙色猫咪在火星表面漫步，水彩插画风格，柔和光影",
+          model: "gpt-image-2",
+          n: 1,
+          response_format: "b64_json"
+        }, null, 2)
+      },
+      openai_image: {
+        method: "POST",
+        url: "/v1/images/generations",
+        body: JSON.stringify({
+          prompt: "一只赛博朋克风格的机械水母，发光透明触须，深海背景，8k超清",
+          model: "gpt-image-2",
+          n: 1
+        }, null, 2)
       },
       chatgpt_session: {
         method: "GET",

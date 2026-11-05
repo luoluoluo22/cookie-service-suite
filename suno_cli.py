@@ -31,6 +31,11 @@ if sys.platform == "win32":
     except Exception:
         pass
 
+# 保证任何工作目录下均能正确引入本地业务模块
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+if PROJECT_DIR not in sys.path:
+    sys.path.insert(0, PROJECT_DIR)
+
 from suno_service import SunoService, COOKIE_CACHE_FILE
 
 
