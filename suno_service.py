@@ -21,6 +21,7 @@ import sys
 import time
 import json
 import re
+import subprocess
 from typing import Optional, Dict, Any, List, Union, Callable
 from urllib.parse import urlparse
 
@@ -49,6 +50,50 @@ COMMON_HEADERS = {
     "Referer": "https://suno.com/",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 Edg/128.0.0.0",
 }
+
+
+def ensure_bridge_server_running(bridge_url: str = DEFAULT_BRIDGE_URL, timeout: int = 5) -> bool:
+    """检测并在需要时自动在后台静默拉起本地 Node 守护桥接服务 (node extension/server.js)"""
+    import urllib.request
+    try:
+        req = urllib.request.Request(f"{bridge_url.rstrip('/')}/status")
+        with urllib.request.urlopen(req, timeout=0.8) as resp:
+            if resp.status == 200:
+                return True
+    except Exception:
+        pass
+
+    server_js = os.path.join(os.path.dirname(os.path.abspath(__file__)), "extension", "server.js")
+    if not os.path.isfile(server_js):
+        return False
+
+    try:
+        creationflags = 0
+        if sys.platform == "win32":
+            creationflags = subprocess.CREATE_NO_WINDOW | 0x00000008  # DETACHED_PROCESS
+
+        subprocess.Popen(
+            ["node", server_js],
+            cwd=os.path.dirname(server_js),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=creationflags,
+        )
+
+        start = time.time()
+        while time.time() - start < timeout:
+            time.sleep(0.3)
+            try:
+                req = urllib.request.Request(f"{bridge_url.rstrip('/')}/status")
+                with urllib.request.urlopen(req, timeout=0.8) as resp:
+                    if resp.status == 200:
+                        return True
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return False
 
 
 class SunoService:
@@ -115,55 +160,88 @@ class SunoService:
         except Exception:
             return False
 
-    def get_raw_cookies(self, force_fetch: bool = False) -> str:
+    def get_raw_cookies(self, force_fetch: bool = False, auto_visit: bool = True) -> str:
         """
         获取 Suno 与 Clerk 完整 Cookie
-        采用多层级降级策略 (支持免启动后台服务直接使用)：
-        1. 显式传入的 manual_cookie
-        2. 环境变量 SUNO_COOKIE
-        3. 本地 Cookie Hub 扩展桥 (127.0.0.1:18888)，若成功获取则自动同步至本地持久缓存
-        4. 本地持久化缓存文件 (.suno_cookie)
+        采用全自动无感穿透策略：
+        1. 显式传入的 manual_cookie / 环境变量 SUNO_COOKIE
+        2. 本地持久化缓存 (.suno_cookie)
+        3. 自动静默拉起本地 Bridge 守护服务，并通过 Cookie Hub 扩展直接从浏览器提取
+        4. 若浏览器中尚未打开过 Suno，扩展将自动在后台静默打开 https://suno.com/create 唤醒会话并提取
         """
         if self.cookie_header and not force_fetch:
             return self.cookie_header
 
-        # 1. 显式传入
+        # 1. 显式传入或环境变量
         if self.manual_cookie and not force_fetch:
             self.cookie_header = self.manual_cookie.strip()
             self.save_cookie_cache(self.cookie_header)
             return self.cookie_header
 
-        # 2. 环境变量
         env_cookie = os.getenv("SUNO_COOKIE")
         if env_cookie and not force_fetch:
             self.cookie_header = env_cookie.strip()
             self.save_cookie_cache(self.cookie_header)
             return self.cookie_header
 
-        # 3. 尝试从本地 Cookie Hub 提取前台最新实时凭证
-        extracted_cookies = []
-        try:
-            c1 = self.bridge.get_cookies_header("suno.com")
-            if c1:
-                extracted_cookies.append(c1)
-        except Exception:
-            pass
+        # 2. 若未指定强制刷新，先检查本地持久缓存
+        if not force_fetch:
+            cached = self.load_cookie_cache()
+            if cached and ("__client" in cached or "__session" in cached):
+                self.cookie_header = cached
+                return self.cookie_header
 
-        try:
-            c2 = self.bridge.get_cookies_header("clerk.suno.com")
-            if c2 and c2 != (extracted_cookies[0] if extracted_cookies else ""):
-                extracted_cookies.append(c2)
-        except Exception:
-            pass
+        # 3. 自动探测并拉起本地 Bridge 服务，通知浏览器扩展自动提取或自动访问
+        bridge_alive = ensure_bridge_server_running(self.bridge.bridge_url, timeout=3)
+        if bridge_alive:
+            try:
+                # 首次尝试直接获取（若扩展已有 Cookie 则秒级返回）
+                auto_res = self.bridge.auto_fetch_suno_cookies(force_visit=False, timeout=6)
+                if auto_res.get("success") and auto_res.get("header"):
+                    hdr = auto_res["header"].strip()
+                    if "__client" in hdr or "__session" in hdr:
+                        self.cookie_header = hdr
+                        self.save_cookie_cache(hdr)
+                        return self.cookie_header
+            except Exception:
+                pass
 
-        merged = "; ".join(filter(None, extracted_cookies)).strip()
-        if merged:
-            self.cookie_header = merged
-            # 自动持久化到本地离线缓存，后续即便不启动 Bridge 服务也能直接调用
-            self.save_cookie_cache(merged)
-            return self.cookie_header
+            # 若未获取到且允许自动唤醒，通知扩展在后台静默打开 suno.com 唤醒会话
+            if auto_visit:
+                try:
+                    print("🌐 正在通过 Cookie Hub 扩展在浏览器中自动访问 suno.com 唤醒会话凭据...")
+                    auto_res = self.bridge.auto_fetch_suno_cookies(force_visit=True, timeout=12)
+                    if auto_res.get("success") and auto_res.get("header"):
+                        hdr = auto_res["header"].strip()
+                        if "__client" in hdr or "__session" in hdr:
+                            self.cookie_header = hdr
+                            self.save_cookie_cache(hdr)
+                            return self.cookie_header
+                except Exception:
+                    pass
 
-        # 4. 若 Bridge 服务未启动，自动降级读取本地缓存文件
+            # 普通域名提取兜底
+            extracted_cookies = []
+            try:
+                c1 = self.bridge.get_cookies_header("suno.com")
+                if c1:
+                    extracted_cookies.append(c1)
+            except Exception:
+                pass
+            try:
+                c2 = self.bridge.get_cookies_header("clerk.suno.com")
+                if c2 and c2 != (extracted_cookies[0] if extracted_cookies else ""):
+                    extracted_cookies.append(c2)
+            except Exception:
+                pass
+
+            merged = "; ".join(filter(None, extracted_cookies)).strip()
+            if merged and ("__client" in merged or "__session" in merged):
+                self.cookie_header = merged
+                self.save_cookie_cache(merged)
+                return self.cookie_header
+
+        # 4. 再次检查本地缓存
         cached = self.load_cookie_cache()
         if cached:
             self.cookie_header = cached
@@ -171,11 +249,10 @@ class SunoService:
 
         if not self.cookie_header:
             raise RuntimeError(
-                "未能获取到 Suno 登录 Cookie！支持以下无感使用方式：\n"
-                "1. [免启动服务] 运行: python suno_cli.py login 或直接粘贴 Cookie (自动持久化)\n"
-                "2. [本地配置文件] 在项目根目录创建 .suno_cookie 文件并写入 Cookie\n"
-                "3. [环境变量] 设置环境变量 SUNO_COOKIE\n"
-                "4. [浏览器联动] 启动本地服务并确认浏览器扩展已连接。"
+                "未能自动获取到 Suno 登录凭证！\n"
+                "提示：Cookie Hub 扩展已尝试在浏览器中自动访问 suno.com，若您尚未在浏览器登录 Suno，\n"
+                "请先在 Edge / Chrome 浏览器中登录一次 https://suno.com 账号（例如通过 Google 快捷登录），\n"
+                "完成后本工具即可永久全自动感知提取，无需手动 F12 抓包！"
             )
 
         return self.cookie_header

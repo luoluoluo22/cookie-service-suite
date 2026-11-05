@@ -183,6 +183,26 @@ function connectBridge() {
           }
           return;
         }
+
+        // 6. Suno 自动后台访问并提取 Cookie (免手动 F12)
+        if (req.action === 'suno_auto_fetch') {
+          try {
+            const result = await handleSunoAutoFetch(req.forceVisit);
+            ws.send(JSON.stringify({
+              id: req.id,
+              action: 'suno_auto_fetch',
+              ...result
+            }));
+          } catch (err) {
+            ws.send(JSON.stringify({
+              id: req.id,
+              action: 'suno_auto_fetch',
+              success: false,
+              error: err.message
+            }));
+          }
+          return;
+        }
       } catch (err) {
         console.error('[CookieHub Bridge] 处理请求失败:', err);
       }
@@ -279,6 +299,81 @@ async function handleGetActiveTabCookies() {
       ...result,
       activeTabTitle: tab.title,
       activeTabUrl: tab.url
+    };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+}
+
+// 自动提取 Suno 与 Clerk 完整 Cookie
+async function getSunoCookiesFromBrowser() {
+  try {
+    const sunoCookies = await chrome.cookies.getAll({ domain: 'suno.com' });
+    const dotSuno = await chrome.cookies.getAll({ domain: '.suno.com' });
+    const clerkCookies = await chrome.cookies.getAll({ domain: 'clerk.suno.com' });
+    const dotClerk = await chrome.cookies.getAll({ domain: '.clerk.suno.com' });
+    return [...sunoCookies, ...dotSuno, ...clerkCookies, ...dotClerk];
+  } catch (e) {
+    return [];
+  }
+}
+
+// Suno 自动后台访问并提取登录态 Cookie (免手动 F12 抓包)
+async function handleSunoAutoFetch(forceVisit = false) {
+  try {
+    console.log('[CookieHub] 正在检索浏览器中 Suno / Clerk Cookie...');
+    let rawCookies = await getSunoCookiesFromBrowser();
+    let hasAuthToken = rawCookies.some(c => c.name === '__client' || c.name === '__session');
+
+    // 如果还没有获取到登录凭据，或者明确指定了强制访问唤醒
+    if (!hasAuthToken || forceVisit) {
+      console.log('[CookieHub] 未在浏览器检测到已就绪的 __client，正在自动在后台静默访问 https://suno.com 唤醒会话...');
+      const existingTabs = await chrome.tabs.query({ url: '*://*.suno.com/*' });
+      let targetTab = null;
+      let createdByUs = false;
+
+      if (existingTabs && existingTabs.length > 0) {
+        targetTab = existingTabs[0];
+        try {
+          await chrome.tabs.reload(targetTab.id);
+        } catch (e) {}
+      } else {
+        targetTab = await chrome.tabs.create({
+          url: 'https://suno.com/create',
+          active: false
+        });
+        createdByUs = true;
+      }
+
+      // 等待 3.5 秒让页面完成首屏请求与 Clerk 鉴权脚本初始化
+      await new Promise(resolve => setTimeout(resolve, 3500));
+
+      // 再次刷新获取最新 Cookie
+      rawCookies = await getSunoCookiesFromBrowser();
+      hasAuthToken = rawCookies.some(c => c.name === '__client' || c.name === '__session');
+
+      // 如果是我们创建的且获取完成，可安全在后台保留或静默关闭
+    }
+
+    // 去重并排版格式
+    const map = new Map();
+    rawCookies.forEach(c => {
+      const key = `${c.name}@${c.domain}`;
+      if (!map.has(key)) map.set(key, c);
+    });
+
+    const uniqueCookies = Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name));
+    const header = uniqueCookies.map(c => `${c.name}=${c.value}`).join('; ');
+    const kv = {};
+    uniqueCookies.forEach(c => { kv[c.name] = c.value; });
+
+    return {
+      success: true,
+      hasAuth: hasAuthToken,
+      count: uniqueCookies.length,
+      header: header,
+      kv: kv,
+      cookies: uniqueCookies
     };
   } catch (err) {
     return { success: false, error: err.message };

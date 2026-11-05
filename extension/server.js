@@ -512,6 +512,29 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // 5. Suno Auto-Fetch & Session Wakeup (/suno/auto_fetch or /suno/cookies)
+  if (pathname === '/suno/auto_fetch' || pathname === '/suno/cookies') {
+    if (extensionSockets.size === 0) {
+      res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({
+        success: false,
+        error: '浏览器扩展未连接本地服务，请在浏览器中确认 Cookie Hub 扩展已加载并启用。'
+      }));
+      return;
+    }
+
+    try {
+      const forceVisit = parsedUrl.searchParams.get('force') === 'true' || parsedUrl.searchParams.get('visit') === 'true';
+      const data = await dispatchToExtension('suno_auto_fetch', { forceVisit });
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(data, null, 2));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ success: false, error: err.message }));
+    }
+    return;
+  }
+
   // Fallback 404
   res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify({ error: 'Endpoint not found' }));

@@ -37,17 +37,15 @@ from suno_service import SunoService, COOKIE_CACHE_FILE
 def prompt_for_cookie() -> str:
     """引导用户在终端直接粘贴 Cookie 并自动持久化"""
     print("\n" + "=" * 65)
-    print("🍪 [Suno 凭证引导] 当前未检测到已存储的 Suno Cookie，且本地服务未启动。")
+    print("🍪 [Suno 凭证提示] 插件已尝试自动唤醒，但检测到浏览器中可能尚未完成登录。")
     print("=" * 65)
-    print("获取方法十分简单：")
-    print("  1. 在浏览器打开 https://suno.com 并登录账号；")
-    print("  2. 按 F12 打开开发者工具 -> Network (网络) -> 刷新页面；")
-    print("  3. 找到含有 'client' 或 'suno.com' 的任意请求，复制 Request Headers 中的 'cookie' 字符串。")
-    print("-" * 65)
-    print("💡 提示: 只要包含 '__client' 字段即可。粘贴后将自动保存在本地，后续无需再次输入！\n")
+    print("支持以下两种方式获取凭证：")
+    print("  方式 1: 直接在打开的 Edge/Chrome 浏览器中登录 https://suno.com，插件将自动完成提取；")
+    print("  方式 2: 或直接在下方粘贴含有 '__client' 字段的 Cookie 字符串（自动持久化保存）：")
+    print("-" * 65 + "\n")
 
     try:
-        cookie_input = input("👉 请粘贴您的 Cookie 字符串后按回车: ").strip()
+        cookie_input = input("👉 请直接粘贴 Cookie 字符串后按回车 (或在浏览器登录后重试): ").strip()
     except (KeyboardInterrupt, EOFError):
         print("\n❌ 操作已取消。")
         sys.exit(1)

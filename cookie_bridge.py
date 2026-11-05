@@ -49,6 +49,16 @@ class CookieBridge:
         resp.raise_for_status()
         return resp.json()
 
+    def auto_fetch_suno_cookies(self, force_visit: bool = False, timeout: int = 15) -> Dict[str, Any]:
+        """通知浏览器扩展自动访问 Suno 并提取登录态 Cookie (免手动 F12 抓包)"""
+        resp = requests.get(
+            f"{self.bridge_url}/suno/auto_fetch",
+            params={"force": "true" if force_visit else "false"},
+            timeout=timeout
+        )
+        resp.raise_for_status()
+        return resp.json()
+
     def export_netscape_file(self, domain: str, output_path: str) -> str:
         """导出标准 Netscape 格式 cookies.txt (供 yt-dlp / curl -b / wget 使用)"""
         resp = requests.get(
