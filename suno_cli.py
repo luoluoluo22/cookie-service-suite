@@ -133,12 +133,53 @@ def main():
     dl_parser.add_argument("target", type=str, help="音频直链 URL 或 歌曲 Clip ID")
     dl_parser.add_argument("--out", type=str, default="./downloads/suno", help="保存目录")
 
+    # 8. 帮助说明
+    help_parser = subparsers.add_parser("help", help="显示全局帮助说明或指定子命令的详细用法")
+    help_parser.add_argument("subcmd", nargs="?", default=None, help="指定要查看帮助的子命令名称 (例如: gen, custom, feed, quota)")
+
+    subparser_map = {
+        "login": login_parser,
+        "quota": subparsers.choices.get("quota"),
+        "credits": subparsers.choices.get("credits"),
+        "feed": feed_parser,
+        "gen": gen_parser,
+        "custom": custom_parser,
+        "lyrics": lyrics_parser,
+        "download": dl_parser,
+        "help": help_parser,
+    }
+
     args = parser.parse_args()
 
-    if not args.command:
+    # 处理无参数调用 或 help 子命令
+    if not args.command or args.command.lower() == "help":
+        target_subcmd = getattr(args, "subcmd", None)
+        if target_subcmd and target_subcmd.lower() in subparser_map:
+            sub = subparser_map[target_subcmd.lower()]
+            if sub:
+                sub.print_help()
+                return
+
         parser.print_help()
-        print("\n💡 快速提示:")
-        print("  首次使用可直接运行: python suno_cli.py quota 或 python suno_cli.py login")
+        print("\n" + "=" * 65)
+        print("💡 常用命令示例 (PowerShell / CMD 均可直接运行):")
+        print("=" * 65)
+        print("  1. 查询额度与可用次数:")
+        print("     .\\suno_cli.ps1 quota")
+        print("  2. 查看历史生成的曲库作品:")
+        print("     .\\suno_cli.ps1 feed")
+        print("  3. 灵感模式生成音乐 (自动下载 MP3 到本地):")
+        print("     .\\suno_cli.ps1 gen \"一段欢快的夏日海滩吉他流行乐\"")
+        print("  4. 纯伴奏模式 (无主唱人声):")
+        print("     .\\suno_cli.ps1 gen \"雨夜咖啡厅爵士钢琴\" --instrumental")
+        print("  5. 自定义歌词模式:")
+        print("     .\\suno_cli.ps1 custom \"[Verse] 阳光洒在海平面 [Chorus] 我们奔向远方\" --tags \"民谣, 治愈\" --title \"夏日旅途\"")
+        print("  6. 单独让 AI 创作歌词:")
+        print("     .\\suno_cli.ps1 lyrics \"写一首关于赛博朋克都市与迷失夜行者的歌词\"")
+        print("  7. 查看特定子命令的详细参数:")
+        print("     .\\suno_cli.ps1 help gen")
+        print("     .\\suno_cli.ps1 help custom")
+        print("=" * 65)
         return
 
     cmd = args.command.lower()

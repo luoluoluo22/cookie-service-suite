@@ -58,9 +58,29 @@ def main():
     lyrics_parser = subparsers.add_parser("lyrics", help="利用 Suno AI 生成歌词文本")
     lyrics_parser.add_argument("prompt", type=str, help="歌词灵感提示词")
 
+    # 6. 帮助命令
+    help_parser = subparsers.add_parser("help", help="显示帮助说明或特定子命令用法")
+    help_parser.add_argument("subcmd", nargs="?", default=None, help="指定子命令")
+
+    subparser_map = {
+        "quota": subparsers.choices.get("quota"),
+        "credits": subparsers.choices.get("credits"),
+        "feed": feed_parser,
+        "gen": gen_parser,
+        "custom": custom_parser,
+        "lyrics": lyrics_parser,
+        "help": help_parser,
+    }
+
     args = parser.parse_args()
 
-    if not args.command:
+    if not args.command or args.command.lower() == "help":
+        target = getattr(args, "subcmd", None)
+        if target and target.lower() in subparser_map:
+            sub = subparser_map[target.lower()]
+            if sub:
+                sub.print_help()
+                return
         parser.print_help()
         return
 
