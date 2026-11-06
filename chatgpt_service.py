@@ -507,11 +507,20 @@ class UnifiedChatGPTService:
             self.reverse.start()
         return self.reverse.chat(messages, model=model, stream=stream, thinking_effort=thinking_effort)
 
-    def generate_image(self, prompt: str, model: str = "gpt-image-2", n: int = 1) -> dict:
+    def generate_image(
+        self,
+        prompt: str,
+        model: str = "gpt-image-2",
+        n: int = 1,
+        response_format: str = "b64_json",
+        timeout: int = 240,
+    ) -> dict:
         """文生图接口"""
         if not self.reverse.is_running():
             self.reverse.start()
-        return self.reverse.generate_image(prompt, model=model, n=n)
+        return self.reverse.generate_image(
+            prompt, model=model, n=n, response_format=response_format, timeout=timeout
+        )
 
 
 # 单例导出

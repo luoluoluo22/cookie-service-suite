@@ -133,16 +133,21 @@ def get_system_overview():
     except Exception:
         pass
 
-    gemini_running = gemini_pool.is_running()
+    gemini_running = False
     gemini_accounts = []
-    if gemini_running:
-        try:
+    try:
+        gemini_running = gemini_pool.is_running()
+        if gemini_running:
             gemini_accounts = gemini_pool.list_accounts()
-        except Exception:
-            pass
+    except Exception:
+        pass
 
     uptime_sec = int((datetime.datetime.now() - START_TIME).total_seconds())
-    chatgpt_status = chatgpt_client.get_status()
+    chatgpt_status = {}
+    try:
+        chatgpt_status = chatgpt_client.get_status()
+    except Exception:
+        pass
 
     return {
         "status": "online",

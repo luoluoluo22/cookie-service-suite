@@ -170,9 +170,12 @@ class MultiAccountGeminiPool:
     def _extract_cookie_header(self) -> str:
         """从 Cookie Hub 提取组装 Google 必要会话鉴权串。"""
         url = f"{self.bridge.bridge_url}/cookies?domain=google.com"
-        with _LOCAL_OPENER.open(url, timeout=10) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            cookies = data.get("cookies", [])
+        try:
+            with _LOCAL_OPENER.open(url, timeout=5) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                cookies = data.get("cookies", [])
+        except Exception as e:
+            raise ConnectionError(f"无法连接本地 Cookie Hub 提取凭证 ({self.bridge.bridge_url}): {e}")
 
         target_keys = [
             "SID",
@@ -196,7 +199,11 @@ class MultiAccountGeminiPool:
 
     def init_database(self, force_refresh: bool = False):
         """初始化多账号数据库与池化配额表。"""
-        cookie_str = self._extract_cookie_header()
+        cookie_str = ""
+        try:
+            cookie_str = self._extract_cookie_header()
+        except Exception as e:
+            print(f"⚠️ 初始化账号池凭证提示: {e}", flush=True)
         conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
 

@@ -55,9 +55,10 @@ COMMON_HEADERS = {
 def ensure_bridge_server_running(bridge_url: str = DEFAULT_BRIDGE_URL, timeout: int = 5) -> bool:
     """检测并在需要时自动在后台静默拉起本地 Node 守护桥接服务 (node extension/server.js)"""
     import urllib.request
+    local_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
         req = urllib.request.Request(f"{bridge_url.rstrip('/')}/status")
-        with urllib.request.urlopen(req, timeout=0.8) as resp:
+        with local_opener.open(req, timeout=0.8) as resp:
             if resp.status == 200:
                 return True
     except Exception:
@@ -85,7 +86,7 @@ def ensure_bridge_server_running(bridge_url: str = DEFAULT_BRIDGE_URL, timeout: 
             time.sleep(0.3)
             try:
                 req = urllib.request.Request(f"{bridge_url.rstrip('/')}/status")
-                with urllib.request.urlopen(req, timeout=0.8) as resp:
+                with local_opener.open(req, timeout=0.8) as resp:
                     if resp.status == 200:
                         return True
             except Exception:
