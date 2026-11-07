@@ -1528,5 +1528,23 @@ def dashboard():
     return HTMLResponse(content=DASHBOARD_HTML)
 
 
+def generate_responses_text(model, messages):
+    completion = chatgpt_client.chat(messages, model=model, stream=False)
+    return completion["choices"][0]["message"]["content"]
+
+
+try:
+    from gpt6_responses_api import make_responses_router
+except ModuleNotFoundError as error:
+    if error.name != "jsonschema":
+        raise
+
+    @app.post("/v1/responses")
+    def responses_dependency_unavailable():
+        raise HTTPException(status_code=503, detail="Install requirements-responses.txt to enable GPT-6 Responses")
+else:
+    app.include_router(make_responses_router(generate_responses_text))
+
+
 if __name__ == "__main__":
     uvicorn.run("app_service:app", host="127.0.0.1", port=18800, reload=False)

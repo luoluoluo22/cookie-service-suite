@@ -350,3 +350,14 @@ for r in results:
 ## 🔒 安全与隐私原则
 * 本地 Bridge 服务仅监听 `127.0.0.1` 本地回环地址，不接受任何外部网络请求。
 * Cookie 凭证与 Token 仅留存于本地内存与临时会话中，严禁写入 Git 仓库。
+
+
+## GPT-6 Responses 工具调用
+
+启动 API 前，在 Cookie Service Suite 的 Python 环境中执行：
+
+```powershell
+python -m pip install -r requirements-responses.txt
+```
+
+本机 API `POST /v1/responses` 支持 `gpt-6` 的函数工具和 SSE。调用方负责执行工具，并在下一次请求中回传对应的 `function_call_output`。安装依赖后重启 API 即可启用。现有 `/v1/chat/completions` 路由继续可用。
