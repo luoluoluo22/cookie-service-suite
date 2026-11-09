@@ -83,7 +83,7 @@ class ChatRequest(BaseModel):
     prompt: str = Field(..., description="提问正文或指令内容", example="量子纠缠的基本原理是什么？")
     model: Optional[str] = Field("gemini-3.5-flash-lite", description="模型名称 (gemini-3.5-flash-lite, gemini-3.1-pro 等)", example="gemini-3.5-flash-lite")
     reasoning_level: Optional[str] = Field("off", description="推理级别: 'off'(关闭思考/极速), 'medium'(中等推理), 'high'(深度扩展思考)", example="off")
-    timeout: Optional[int] = Field(60, description="请求超时时间 (秒)", example=60)
+    timeout: Optional[int] = Field(300, description="请求超时时间 (秒)，默认 300 秒", example=300)
 
 
 class ChatGPTAccountImportRequest(BaseModel):

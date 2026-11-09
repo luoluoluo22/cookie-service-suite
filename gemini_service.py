@@ -531,7 +531,7 @@ class MultiAccountGeminiPool:
         prompt: str,
         model: str = "gemini-3.5-flash-lite",
         reasoning_level: str = "off",
-        timeout: int = 60,
+        timeout: int = 300,
     ) -> str:
         """
         通过统一池化通道提问。
@@ -547,7 +547,7 @@ class MultiAccountGeminiPool:
         prompt: str,
         model: str = "gemini-3.5-flash-lite",
         reasoning_level: str = "off",
-        timeout: int = 60,
+        timeout: int = 300,
     ) -> Dict[str, Any]:
         """
         通过统一池化通道提问，支持选择推理级别，并返回包含实际调用账号、耗时等详细元数据。
