@@ -160,8 +160,26 @@ class TrayAppServer:
             print(f"❌ [Cookie Hub] 启动失败: {e}", flush=True)
             return False
 
+    @staticmethod
+    def _ensure_port_available(port: int):
+        """检查并释放被残留孤儿进程占用的端口"""
+        try:
+            cmd = f'netstat -ano | findstr ":{port}" | findstr "LISTENING"'
+            out = subprocess.check_output(cmd, shell=True, text=True, errors="replace")
+            for line in out.strip().split("\n"):
+                parts = line.strip().split()
+                if len(parts) >= 5 and parts[1].endswith(f":{port}"):
+                    pid = int(parts[4])
+                    if pid != os.getpid() and pid > 0:
+                        print(f"⚠️ [API 服务] 端口 {port} 被旧进程 (PID: {pid}) 占用，正在释放...", flush=True)
+                        subprocess.run(f'taskkill /F /PID {pid}', shell=True, capture_output=True)
+                        time.sleep(1.0)
+        except Exception:
+            pass
+
     def start_api_server(self):
         """在后台守护线程中启动 FastAPI + Uvicorn 统一本地 API 服务 (18800)"""
+        self._ensure_port_available(SERVER_PORT)
         config = uvicorn.Config(
             app=app,
             host=SERVER_HOST,

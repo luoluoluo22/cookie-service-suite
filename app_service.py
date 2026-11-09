@@ -23,6 +23,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Path
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 # 保证本地通信不被外部代理拦截
 os.environ["NO_PROXY"] = "127.0.0.1,localhost,::1"
@@ -58,6 +59,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# 静态资源挂载 (网站图标与媒体文件)
+ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+if os.path.exists(ASSETS_DIR):
+    app.mount("/assets", StaticFiles(directory=ASSETS_DIR), name="assets")
 
 # 单例业务客户端
 bridge_hub = CookieBridge()

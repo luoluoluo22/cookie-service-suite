@@ -25,6 +25,24 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     pre::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
     .tab-active { background: rgba(6, 182, 212, 0.15); color: #38bdf8; border-color: rgba(56, 189, 248, 0.4); }
     .nav-item-active { background: rgba(6, 182, 212, 0.15); color: #38bdf8; border-color: rgba(56, 189, 248, 0.35); font-weight: 600; }
+    .plat-tab {
+      background: rgba(15, 23, 42, 0.75);
+      border: 1px solid rgba(51, 65, 85, 0.55);
+      transition: all 0.22s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+    .plat-tab:hover {
+      background: rgba(30, 41, 59, 0.9);
+      border-color: rgba(56, 189, 248, 0.5);
+      transform: translateY(-2px);
+      box-shadow: 0 6px 16px -2px rgba(6, 182, 212, 0.18);
+    }
+    .plat-tab-active {
+      background: linear-gradient(135deg, rgba(6, 182, 212, 0.2) 0%, rgba(59, 130, 246, 0.14) 100%) !important;
+      border-color: rgba(56, 189, 248, 0.85) !important;
+      color: #38bdf8 !important;
+      box-shadow: 0 0 20px rgba(6, 182, 212, 0.25), inset 0 1px 0 rgba(255, 255, 255, 0.12) !important;
+      transform: translateY(-2px);
+    }
   </style>
 </head>
 <body class="bg-slate-950 text-slate-100 min-h-screen flex flex-col md:flex-row">
@@ -184,154 +202,133 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <!-- ==================================================== -->
       <!-- [第一位] 调试台 (在线 API 调试与交互工作台)         -->
       <!-- ==================================================== -->
-      <section id="section-playground" class="glass-card rounded-2xl p-6 shadow-2xl border border-cyan-500/20 grid grid-cols-1 lg:grid-cols-12 gap-6 scroll-mt-20">
-        <div class="lg:col-span-6 space-y-4">
-          <div class="flex items-center justify-between">
-            <div>
-              <h2 class="text-lg font-bold text-slate-100 flex items-center gap-2">
-                <i class="fa-solid fa-terminal text-cyan-400"></i> 调试台
-                <span class="text-xs font-normal px-2 py-0.5 rounded-full bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 font-mono">主调试工作台</span>
-              </h2>
-              <p class="text-xs text-slate-400">在线发起真实 API 请求，支持多模型、思考链与图片/动图渲染预览</p>
-            </div>
-            <button onclick="openProjectFolder()" class="hidden sm:flex text-xs px-2.5 py-1 rounded-lg bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 border border-amber-500/30 items-center gap-1.5 transition">
-              <i class="fa-solid fa-folder-open text-amber-400"></i> 打开目录
-            </button>
-          </div>
-
+      <section id="section-playground" class="glass-card rounded-2xl p-6 shadow-2xl border border-cyan-500/20 space-y-5 scroll-mt-20">
+        
+        <!-- 1. 调试台顶栏 Header: 标题 + 打开目录 -->
+        <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-800/80">
           <div>
-            <label class="text-xs font-semibold text-slate-300 uppercase block mb-1.5">选择预设 API 模板 (或在下方接口清单中点击「填入调试」)</label>
-            <select id="api-selector" onchange="switchApiTemplate()" class="w-full bg-slate-900 border border-slate-700 rounded-xl px-3.5 py-2 text-xs text-slate-200 focus:outline-none focus:border-cyan-400">
-              <optgroup label="── Google Gemini 4账号统一池 ──">
-                <option value="gemini_chat">[POST] /api/gemini/chat (Gemini 智能对话 · 推荐)</option>
-                <option value="gemini_accounts">[GET] /api/gemini/accounts (查看 4 账号状态与额度)</option>
-                <option value="gemini_sync_profiles">[POST] /api/gemini/accounts/sync-profiles (同步 Google 真实昵称邮箱)</option>
-                <option value="gemini_check">[POST] /api/gemini/accounts/1/check (检测账号 #1 凭证健康度)</option>
-                <option value="gemini_rotate">[POST] /api/gemini/accounts/1/rotate (触发账号 #1 令牌保活续期)</option>
-                <option value="gemini_refresh">[POST] /api/gemini/refresh (从 Cookie Hub 刷新多账号凭证)</option>
-                <option value="gemini_requests">[GET] /api/gemini/requests?limit=10 (查询最近调度轨迹历史)</option>
-              </optgroup>
-              <optgroup label="── OpenAI 标准兼容接口 ──">
-                <option value="openai_chat">[POST] /v1/chat/completions (OpenAI 兼容对话 · 智能分流)</option>
-                <option value="openai_image">[POST] /v1/images/generations (OpenAI 兼容生图 · DALL-E 3)</option>
-                <option value="openai_models">[GET] /v1/models (OpenAI 兼容模型列表)</option>
-              </optgroup>
-              <optgroup label="── ChatGPT 逆向工程与号池 ──">
-                <option value="chatgpt_chat">[POST] /api/chatgpt/chat (ChatGPT 逆向智能对话)</option>
-                <option value="chatgpt_image">[POST] /api/chatgpt/image (ChatGPT 逆向生图/GIF gpt-image-2)</option>
-                <option value="chatgpt_status">[GET] /api/chatgpt/status (ChatGPT 逆向号池运行状态)</option>
-                <option value="chatgpt_models">[GET] /api/chatgpt/models (ChatGPT 逆向可用模型列表)</option>
-                <option value="chatgpt_accounts">[GET] /api/chatgpt/accounts (ChatGPT 逆向号池账号总览)</option>
-                <option value="chatgpt_sync">[POST] /api/chatgpt/accounts/sync-browser (从浏览器一键同步Token)</option>
-                <option value="chatgpt_session">[GET] /api/chatgpt/session (ChatGPT 会话提取)</option>
-                <option value="chatgpt_start">[POST] /api/chatgpt/start (启动 ChatGPT 独立逆向后台)</option>
-                <option value="chatgpt_stop">[POST] /api/chatgpt/stop (停止 ChatGPT 独立逆向后台)</option>
-              </optgroup>
-              <optgroup label="── Cookie Hub 通信与系统管理 ──">
-                <option value="system_overview">[GET] /api/system/overview (系统全局子服务总览)</option>
-                <option value="system_open_dir">[POST] /api/system/open-directory (在资源管理器中打开项目目录)</option>
-                <option value="system_autostart_get">[GET] /api/system/autostart (查询 Windows 开机自启状态)</option>
-                <option value="system_autostart_toggle">[POST] /api/system/autostart/toggle (一键切换开机自启动)</option>
-                <option value="hub_status">[GET] /api/hub/status (Cookie Hub 扩展长连接状态)</option>
-                <option value="hub_cookies">[GET] /api/hub/cookies?domain=google.com (动态按域名提取Cookie)</option>
-              </optgroup>
-              <optgroup label="── 多平台生态服务 (B站/网盘/Suno) ──">
-                <option value="bili_user">[GET] /api/bilibili/user (B站 个人资料与大会员资产)</option>
-                <option value="bili_video">[GET] /api/bilibili/video?bvid=BV1GJ411x7h7 (B站 视频信息与特权流)</option>
-                <option value="baidu_quota">[GET] /api/baidupan/quota (百度网盘 总配额与使用量)</option>
-                <option value="baidu_user">[GET] /api/baidupan/user (百度网盘 用户资料与VIP等级)</option>
-                <option value="baidu_files">[GET] /api/baidupan/files?dir_path=/ (百度网盘 目录文件遍历)</option>
-                <option value="suno_quota">[GET] /api/suno/quota (Suno AI 账户积分与可用曲目)</option>
-                <option value="suno_feed">[GET] /api/suno/feed?page=1 (Suno AI 历史创作作品库)</option>
-                <option value="suno_gen">[POST] /api/suno/generate (Suno AI 提交音乐创作任务)</option>
-                <option value="suno_status">[GET] /api/suno/status?clip_ids=test (Suno AI 任务状态轮询)</option>
-                <option value="suno_lyrics">[POST] /api/suno/lyrics (Suno AI 独立歌词创作)</option>
-                <option value="suno_refresh">[POST] /api/suno/refresh (Suno AI 刷新鉴权凭证)</option>
-              </optgroup>
-            </select>
+            <h2 class="text-lg font-bold text-slate-100 flex items-center gap-2">
+              <i class="fa-solid fa-terminal text-cyan-400"></i> 调试台
+              <span class="text-xs font-normal px-2 py-0.5 rounded-full bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 font-mono">主调试工作台</span>
+            </h2>
+            <p class="text-xs text-slate-400 mt-0.5">在线发起真实 API 请求，支持多模型、思考链与图片/动图渲染预览</p>
           </div>
-
-          <!-- 模型与推理级别双控网格 -->
-          <div class="grid grid-cols-1 sm:grid-cols-2 gap-3" id="model-controls-grid">
-            <!-- 模型选择下拉控件 -->
-            <div id="model-select-container">
-              <label class="text-xs font-semibold text-slate-300 uppercase block mb-1.5 flex items-center justify-between">
-                <span><i class="fa-solid fa-cube text-cyan-400 mr-1.5"></i> 选择模型 (Model)</span>
-              </label>
-              <select id="model-selector" onchange="onModelOrReasoningChange()" class="w-full bg-slate-900 border border-cyan-500/40 rounded-xl px-3 py-2 text-xs text-cyan-300 focus:outline-none focus:border-cyan-400 shadow-inner">
-                <option value="gemini-3.5-flash-lite">gemini-3.5-flash-lite (极速响应 · 推荐)</option>
-                <option value="gemini-3.1-pro">gemini-3.1-pro (强推理 · 复杂任务)</option>
-                <option value="gemini-3.6-flash">gemini-3.6-flash (多模态高通量 · 均衡)</option>
-                <option value="gemini-3.8-flash">gemini-3.8-flash (新版 3.8 Flash 架构)</option>
-                <option value="gemini-4-argon">gemini-4-argon (4 Argon 复杂推理)</option>
-                <option value="auto">auto (ChatGPT 逆向智能优选)</option>
-                <option value="gpt-6">gpt-6 (GPT-6 官方默认新架构)</option>
-                <option value="gpt-6-thinking">gpt-6-thinking (GPT-6 深度思考链)</option>
-                <option value="gpt-5-6">gpt-5-6 (ChatGPT Web 旗舰)</option>
-                <option value="gpt-image-2">gpt-image-2 (ChatGPT 绘图/动图专用)</option>
-                <option value="chatgpt-web">chatgpt-web (ChatGPT 网页原生)</option>
-              </select>
-            </div>
-
-            <!-- 推理级别下拉控件 -->
-            <div id="reasoning-level-container">
-              <label class="text-xs font-semibold text-slate-300 uppercase block mb-1.5 flex items-center justify-between">
-                <span><i class="fa-solid fa-brain text-purple-400 mr-1.5"></i> 推理级别 (Reasoning)</span>
-                <span class="text-[10px] text-purple-300 font-mono">思考链</span>
-              </label>
-              <select id="reasoning-selector" onchange="onModelOrReasoningChange()" class="w-full bg-slate-900 border border-purple-500/40 rounded-xl px-3 py-2 text-xs text-purple-300 focus:outline-none focus:border-purple-400 shadow-inner">
-                <option value="off">🟢 关闭思考 / 快速模式 (Off · 直出)</option>
-                <option value="medium">🟡 中等推理 (Medium · 适度权衡)</option>
-                <option value="high">🟣 深度扩展思考 (High · 长思维链)</option>
-              </select>
-            </div>
-          </div>
-
-          <div class="flex gap-2 items-center">
-            <span id="req-method-badge" class="px-2.5 py-1 rounded-lg text-xs font-bold bg-amber-500/20 text-amber-300 border border-amber-500/30 font-mono">POST</span>
-            <input type="text" id="req-endpoint" class="flex-1 bg-slate-900 border border-slate-700 rounded-xl px-3 py-1.5 text-xs font-mono text-slate-300 focus:outline-none focus:border-cyan-400" value="/api/gemini/chat">
-          </div>
-
-          <div id="req-body-container">
-            <label class="text-xs font-semibold text-slate-300 uppercase block mb-1.5 flex items-center justify-between">
-              <span>请求 Body (JSON)</span>
-              <span class="text-[10px] text-slate-400 font-normal">支持直接修改入参</span>
-            </label>
-            <textarea id="req-body" rows="6" class="w-full bg-slate-900 font-mono text-xs border border-slate-700 rounded-xl p-3 text-cyan-300 focus:outline-none focus:border-cyan-400"></textarea>
-          </div>
-
-          <button onclick="executeApiCall()" id="btn-send" class="w-full py-2.5 rounded-xl font-medium text-sm bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-slate-950 font-bold transition shadow-lg shadow-cyan-500/20 flex items-center justify-center gap-2">
-            <i class="fa-solid fa-paper-plane"></i> 发送请求 (Send Request)
+          <button onclick="openProjectFolder()" class="self-start sm:self-auto text-xs px-3 py-1.5 rounded-lg bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 border border-amber-500/30 items-center gap-1.5 transition flex shadow-sm">
+            <i class="fa-solid fa-folder-open text-amber-400"></i> 打开目录
           </button>
         </div>
 
-        <!-- 响应输出区 -->
-        <div class="lg:col-span-6 flex flex-col space-y-2">
+        <!-- 2. 平台专属分类导航栏 (上图标 + 下名称 + 接口数徽章) -->
+        <div class="space-y-2.5">
           <div class="flex items-center justify-between">
-            <span class="text-xs font-semibold text-slate-300 uppercase flex items-center gap-1.5">
-              <i class="fa-solid fa-square-poll-vertical text-cyan-400"></i> 响应结果 (Response)
-            </span>
-            <div class="flex items-center gap-2">
-              <span id="resp-status" class="text-xs px-2 py-0.5 rounded font-mono hidden">200 OK</span>
-              <span id="resp-time" class="text-xs text-slate-400 font-mono">耗时: 0ms</span>
-              <button onclick="copyResponseOutput()" class="text-xs px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition" title="复制返回 JSON 结果">
-                <i class="fa-regular fa-copy"></i> 复制
-              </button>
+            <div class="text-[11px] font-bold uppercase tracking-wider text-cyan-400 flex items-center gap-1.5">
+              <i class="fa-solid fa-layer-group text-cyan-400"></i> 平台分类导航
+              <span class="text-[10px] text-slate-500 font-normal font-sans">(点击分类单独过滤下方 API 模板)</span>
+            </div>
+            <div id="current-playground-cat-indicator" class="text-[11px] font-mono text-slate-400">
+              当前: <span class="text-cyan-300 font-semibold">Google Gemini</span> (7个模板)
             </div>
           </div>
+          <div class="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-7 gap-2.5" id="playground-category-nav">
+            <!-- 由 JS 渲染 7 个分类导航按钮 (上图标 + 下名称 + 接口数徽章) -->
+          </div>
+        </div>
 
-          <!-- 图片/GIF 实时渲染卡片 (如有) -->
-          <div id="image-preview-card" class="hidden bg-slate-900/90 border border-cyan-500/40 rounded-xl p-3 flex flex-col items-center gap-2">
-            <div class="w-full flex items-center justify-between text-xs text-cyan-300">
-              <span class="font-semibold flex items-center gap-1"><i class="fa-solid fa-image"></i> 检测到模型生成图片 / GIF</span>
-              <a id="btn-download-img" href="#" download="generated_image.png" class="px-2 py-0.5 rounded bg-cyan-500/20 text-cyan-300 hover:bg-cyan-500/30 text-[11px] font-mono flex items-center gap-1">
-                <i class="fa-solid fa-download"></i> 保存图片
-              </a>
+        <!-- 3. 双栏工作区 (左侧入参配置，右侧响应结果) -->
+        <div class="grid grid-cols-1 lg:grid-cols-12 gap-6 pt-1">
+          <div class="lg:col-span-6 space-y-4">
+            <div>
+              <div class="flex items-center justify-between mb-1.5">
+                <label class="text-xs font-semibold text-slate-300 uppercase block">选择预设 API 模板</label>
+                <span id="api-template-badge" class="text-[10px] px-2 py-0.5 rounded-full bg-cyan-500/10 text-cyan-300 border border-cyan-500/20 font-mono">Gemini · 7 个模板</span>
+              </div>
+              <select id="api-selector" onchange="switchApiTemplate()" class="w-full bg-slate-900 border border-slate-700 rounded-xl px-3.5 py-2 text-xs text-slate-200 focus:outline-none focus:border-cyan-400 shadow-sm transition">
+                <!-- 动态由 populateApiSelector 填充 -->
+              </select>
             </div>
-            <img id="rendered-image" src="" alt="生成的图片预览" class="max-h-64 max-w-full rounded-lg border border-slate-800 shadow-lg object-contain">
+
+            <!-- 模型与推理级别双控网格 -->
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-3" id="model-controls-grid">
+              <!-- 模型选择下拉控件 -->
+              <div id="model-select-container">
+                <label class="text-xs font-semibold text-slate-300 uppercase block mb-1.5 flex items-center justify-between">
+                  <span><i class="fa-solid fa-cube text-cyan-400 mr-1.5"></i> 选择模型 (Model)</span>
+                </label>
+                <select id="model-selector" onchange="onModelOrReasoningChange()" class="w-full bg-slate-900 border border-cyan-500/40 rounded-xl px-3 py-2 text-xs text-cyan-300 focus:outline-none focus:border-cyan-400 shadow-inner">
+                  <option value="gemini-3.5-flash-lite">gemini-3.5-flash-lite (极速响应 · 推荐)</option>
+                  <option value="gemini-3.1-pro">gemini-3.1-pro (强推理 · 复杂任务)</option>
+                  <option value="gemini-3.6-flash">gemini-3.6-flash (多模态高通量 · 均衡)</option>
+                  <option value="gemini-3.8-flash">gemini-3.8-flash (新版 3.8 Flash 架构)</option>
+                  <option value="gemini-4-argon">gemini-4-argon (4 Argon 复杂推理)</option>
+                  <option value="auto">auto (ChatGPT 逆向智能优选)</option>
+                  <option value="gpt-6">gpt-6 (GPT-6 官方默认新架构)</option>
+                  <option value="gpt-6-thinking">gpt-6-thinking (GPT-6 深度思考链)</option>
+                  <option value="gpt-5-6">gpt-5-6 (ChatGPT Web 旗舰)</option>
+                  <option value="gpt-image-2">gpt-image-2 (ChatGPT 绘图/动图专用)</option>
+                  <option value="chatgpt-web">chatgpt-web (ChatGPT 网页原生)</option>
+                </select>
+              </div>
+
+              <!-- 推理级别下拉控件 -->
+              <div id="reasoning-level-container">
+                <label class="text-xs font-semibold text-slate-300 uppercase block mb-1.5 flex items-center justify-between">
+                  <span><i class="fa-solid fa-brain text-purple-400 mr-1.5"></i> 推理级别 (Reasoning)</span>
+                  <span class="text-[10px] text-purple-300 font-mono">思考链</span>
+                </label>
+                <select id="reasoning-selector" onchange="onModelOrReasoningChange()" class="w-full bg-slate-900 border border-purple-500/40 rounded-xl px-3 py-2 text-xs text-purple-300 focus:outline-none focus:border-purple-400 shadow-inner">
+                  <option value="off">🟢 关闭思考 / 快速模式 (Off · 直出)</option>
+                  <option value="medium">🟡 中等推理 (Medium · 适度权衡)</option>
+                  <option value="high">🟣 深度扩展思考 (High · 长思维链)</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="flex gap-2 items-center">
+              <span id="req-method-badge" class="px-2.5 py-1 rounded-lg text-xs font-bold bg-amber-500/20 text-amber-300 border border-amber-500/30 font-mono">POST</span>
+              <input type="text" id="req-endpoint" class="flex-1 bg-slate-900 border border-slate-700 rounded-xl px-3 py-1.5 text-xs font-mono text-slate-300 focus:outline-none focus:border-cyan-400" value="/api/gemini/chat">
+            </div>
+
+            <div id="req-body-container">
+              <label class="text-xs font-semibold text-slate-300 uppercase block mb-1.5 flex items-center justify-between">
+                <span>请求 Body (JSON)</span>
+                <span class="text-[10px] text-slate-400 font-normal">支持直接修改入参</span>
+              </label>
+              <textarea id="req-body" rows="6" class="w-full bg-slate-900 font-mono text-xs border border-slate-700 rounded-xl p-3 text-cyan-300 focus:outline-none focus:border-cyan-400"></textarea>
+            </div>
+
+            <button onclick="executeApiCall()" id="btn-send" class="w-full py-2.5 rounded-xl font-medium text-sm bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-slate-950 font-bold transition shadow-lg shadow-cyan-500/20 flex items-center justify-center gap-2">
+              <i class="fa-solid fa-paper-plane"></i> 发送请求 (Send Request)
+            </button>
           </div>
 
-          <pre id="resp-output" class="flex-1 bg-slate-900 border border-slate-800 rounded-xl p-4 text-xs font-mono text-emerald-400 overflow-auto min-h-[260px] max-h-[380px]">点击左侧「发送请求」或下方接口列表中「立即测试」，结果将实时展示在此处...</pre>
+          <!-- 响应输出区 -->
+          <div class="lg:col-span-6 flex flex-col space-y-2">
+            <div class="flex items-center justify-between">
+              <span class="text-xs font-semibold text-slate-300 uppercase flex items-center gap-1.5">
+                <i class="fa-solid fa-square-poll-vertical text-cyan-400"></i> 响应结果 (Response)
+              </span>
+              <div class="flex items-center gap-2">
+                <span id="resp-status" class="text-xs px-2 py-0.5 rounded font-mono hidden">200 OK</span>
+                <span id="resp-time" class="text-xs text-slate-400 font-mono">耗时: 0ms</span>
+                <button onclick="copyResponseOutput()" class="text-xs px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition" title="复制返回 JSON 结果">
+                  <i class="fa-regular fa-copy"></i> 复制
+                </button>
+              </div>
+            </div>
+
+            <!-- 图片/GIF 实时渲染卡片 (如有) -->
+            <div id="image-preview-card" class="hidden bg-slate-900/90 border border-cyan-500/40 rounded-xl p-3 flex flex-col items-center gap-2">
+              <div class="w-full flex items-center justify-between text-xs text-cyan-300">
+                <span class="font-semibold flex items-center gap-1"><i class="fa-solid fa-image"></i> 检测到模型生成图片 / GIF</span>
+                <a id="btn-download-img" href="#" download="generated_image.png" class="px-2 py-0.5 rounded bg-cyan-500/20 text-cyan-300 hover:bg-cyan-500/30 text-[11px] font-mono flex items-center gap-1">
+                  <i class="fa-solid fa-download"></i> 保存图片
+                </a>
+              </div>
+              <img id="rendered-image" src="" alt="生成的图片预览" class="max-h-64 max-w-full rounded-lg border border-slate-800 shadow-lg object-contain">
+            </div>
+
+            <pre id="resp-output" class="flex-1 bg-slate-900 border border-slate-800 rounded-xl p-4 text-xs font-mono text-emerald-400 overflow-auto min-h-[260px] max-h-[380px]">点击左侧「发送请求」或下方接口列表中「立即测试」，结果将实时展示在此处...</pre>
+          </div>
         </div>
       </section>
 
@@ -583,7 +580,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <!-- 3. 全局脚本 (JavaScript)                                -->
   <!-- ======================================================== -->
   <script>
-    // 36 个 API 端点完整定义
+        // 平台分类导航定义 (上图标 + 下名称 + 独立分类)
+    const PLATFORM_CATEGORIES = [
+      { key: "all", name: "全部平台", shortName: "全部", icon: "/assets/icons/all.svg", fallbackIcon: "fa-solid fa-shapes text-sky-400", count: 36 },
+      { key: "gemini", name: "Google Gemini", shortName: "Gemini", icon: "/assets/icons/gemini.svg", fallbackIcon: "fa-solid fa-sparkles text-purple-400", count: 7 },
+      { key: "gpt", name: "ChatGPT / OpenAI", shortName: "GPT / 逆向", icon: "/assets/icons/chatgpt.png", fallbackIcon: "fa-solid fa-robot text-emerald-400", count: 12 },
+      { key: "suno", name: "Suno AI 音乐", shortName: "Suno AI", icon: "/assets/icons/suno.png", fallbackIcon: "fa-solid fa-music text-amber-400", count: 6 },
+      { key: "baidu", name: "百度网盘", shortName: "百度网盘", icon: "/assets/icons/baidupan.png", fallbackIcon: "fa-solid fa-cloud text-blue-400", count: 3 },
+      { key: "bilibili", name: "哔哩哔哩", shortName: "哔哩哔哩", icon: "/assets/icons/bilibili.png", fallbackIcon: "fa-solid fa-tv text-pink-400", count: 2 },
+      { key: "system", name: "Cookie Hub & 系统", shortName: "系统服务", icon: "/assets/icons/system.svg", fallbackIcon: "fa-solid fa-terminal text-cyan-400", count: 6 },
+    ];
+
+    let currentPlaygroundCategory = "gemini";
+
+    // 36 个 API 端点完整定义 (按平台精细化归属)
     const ALL_ENDPOINTS = [
       // 1. Google Gemini (7)
       { id: "gemini_chat", category: "gemini", method: "POST", url: "/api/gemini/chat", name: "Gemini 智能对话", desc: "4账号 LRU 自动轮换，支持模型切换与思考链推理级别", body: { prompt: "请用一句话告诉我：量子纠缠是什么？", model: "gemini-3.5-flash-lite", reasoning_level: "off", timeout: 60 } },
@@ -610,31 +620,151 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       { id: "chatgpt_start", category: "chatgpt", method: "POST", url: "/api/chatgpt/start", name: "启动独立逆向后台", desc: "手动按需启动基于 chatgpt2api 的独立无头逆向进程 (18084)", body: {} },
       { id: "chatgpt_stop", category: "chatgpt", method: "POST", url: "/api/chatgpt/stop", name: "停止独立逆向后台", desc: "停止 ChatGPT 独立无头逆向进程", body: {} },
 
-      // 4. Cookie Hub 通信与系统管理 (6)
+      // 4. Suno AI 音乐创作 (6)
+      { id: "suno_quota", category: "suno", method: "GET", url: "/api/suno/quota", name: "Suno AI 积分与可用曲目", desc: "查询 Suno 账号剩余积分及本月可用生成曲目数", body: null },
+      { id: "suno_feed", category: "suno", method: "GET", url: "/api/suno/feed?page=1", name: "Suno AI 历史创作作品库", desc: "拉取已生成的音乐曲目、封面、歌词与音频直链", body: null },
+      { id: "suno_gen", category: "suno", method: "POST", url: "/api/suno/generate", name: "Suno AI 提交音乐生成任务", desc: "根据描述词生成两首完整人声/器乐歌曲 (支持自定义模式)", body: { prompt: "一段欢快阳光的夏日流行海滩音乐，带有原声吉他和轻快的鼓点", is_custom: false, model: "chirp-v3-5", wait: false } },
+      { id: "suno_status", category: "suno", method: "GET", url: "/api/suno/status?clip_ids=test", name: "Suno AI 任务状态轮询", desc: "查询音乐任务渲染进度与 MP3/视频播放直链", body: null },
+      { id: "suno_lyrics", category: "suno", method: "POST", url: "/api/suno/lyrics", name: "Suno AI 独立歌词创作", desc: "输入主题生成结构完整的双节押韵歌词", body: { prompt: "写一首关于秋天落叶与思念的流行歌词" } },
+      { id: "suno_refresh", category: "suno", method: "POST", url: "/api/suno/refresh", name: "Suno AI 刷新鉴权凭证", desc: "强制刷新 Suno 会话凭证与 Clerk JWT 令牌", body: {} },
+
+      // 5. 百度网盘 存储与文件 (3)
+      { id: "baidu_quota", category: "baidu", method: "GET", url: "/api/baidupan/quota", name: "百度网盘 存储容量与配额", desc: "获取已用空间、总空间与 VIP 配额详情", body: null },
+      { id: "baidu_user", category: "baidu", method: "GET", url: "/api/baidupan/user", name: "百度网盘 用户账号资料", desc: "获取百度网盘用户名、头像与 VIP 等级", body: null },
+      { id: "baidu_files", category: "baidu", method: "GET", url: "/api/baidupan/files?dir_path=/", name: "百度网盘 目录文件遍历", desc: "遍历网盘根目录 / 或指定子目录下的文件清单", body: null },
+
+      // 6. 哔哩哔哩 个人与视频 (2)
+      { id: "bili_user", category: "bilibili", method: "GET", url: "/api/bilibili/user", name: "B站 登录用户信息与资产", desc: "查看当前 B 站登录用户资料、硬币、B币与大会员有效期", body: null },
+      { id: "bili_video", category: "bilibili", method: "GET", url: "/api/bilibili/video?bvid=BV1GJ411x7h7", name: "B站 视频信息与特权流", desc: "查询视频元数据与大会员专属 4K/1080P60 播放直链", body: null },
+
+      // 7. Cookie Hub 通信与系统管理 (6)
       { id: "system_overview", category: "system", method: "GET", url: "/api/system/overview", name: "系统全局运行总览", desc: "查看 Cookie Hub、Gemini 池、ChatGPT 与开机自启动全景状态", body: null },
       { id: "system_open_dir", category: "system", method: "POST", url: "/api/system/open-directory", name: "打开项目本地目录", desc: "在 Windows 资源管理器中弹出打开套件根目录文件夹", body: {} },
       { id: "system_autostart_get", category: "system", method: "GET", url: "/api/system/autostart", name: "查询 Windows 开机自启状态", desc: "检查注册表 Run 与开始菜单 Startup 双重持久化配置", body: null },
       { id: "system_autostart_toggle", category: "system", method: "POST", url: "/api/system/autostart/toggle", name: "一键切换开机自启动", desc: "在开启 (双重保障) 与关闭之间一键无缝切换", body: {} },
       { id: "hub_status", category: "system", method: "GET", url: "/api/hub/status", name: "Cookie Hub 扩展桥状态", desc: "检测 Chrome/Edge 扩展与本地 Node 服务长连接", body: null },
       { id: "hub_cookies", category: "system", method: "GET", url: "/api/hub/cookies?domain=google.com", name: "按域名动态提取 Cookie", desc: "从浏览器实时提取指定域名 (如 google.com) 的 Cookie 字典与 Header", body: null },
-
-      // 5. 多平台生态 (11)
-      { id: "bili_user", category: "ecosystem", method: "GET", url: "/api/bilibili/user", name: "B站 登录用户信息与资产", desc: "查看当前 B 站登录用户资料、硬币、B币与大会员有效期", body: null },
-      { id: "bili_video", category: "ecosystem", method: "GET", url: "/api/bilibili/video?bvid=BV1GJ411x7h7", name: "B站 视频信息与特权流", desc: "查询视频元数据与大会员专属 4K/1080P60 播放直链", body: null },
-      { id: "baidu_quota", category: "ecosystem", method: "GET", url: "/api/baidupan/quota", name: "百度网盘 存储容量与配额", desc: "获取已用空间、总空间与 VIP 配额详情", body: null },
-      { id: "baidu_user", category: "ecosystem", method: "GET", url: "/api/baidupan/user", name: "百度网盘 用户账号资料", desc: "获取百度网盘用户名、头像与 VIP 等级", body: null },
-      { id: "baidu_files", category: "ecosystem", method: "GET", url: "/api/baidupan/files?dir_path=/", name: "百度网盘 目录文件遍历", desc: "遍历网盘根目录 / 或指定子目录下的文件清单", body: null },
-      { id: "suno_quota", category: "ecosystem", method: "GET", url: "/api/suno/quota", name: "Suno AI 积分与可用曲目", desc: "查询 Suno 账号剩余积分及本月可用生成曲目数", body: null },
-      { id: "suno_feed", category: "ecosystem", method: "GET", url: "/api/suno/feed?page=1", name: "Suno AI 历史创作作品库", desc: "拉取已生成的音乐曲目、封面、歌词与音频直链", body: null },
-      { id: "suno_gen", category: "ecosystem", method: "POST", url: "/api/suno/generate", name: "Suno AI 提交音乐生成任务", desc: "根据描述词生成两首完整人声/器乐歌曲 (支持自定义模式)", body: { prompt: "一段欢快阳光的夏日流行海滩音乐，带有原声吉他和轻快的鼓点", is_custom: false, model: "chirp-v3-5", wait: false } },
-      { id: "suno_status", category: "ecosystem", method: "GET", url: "/api/suno/status?clip_ids=test", name: "Suno AI 任务状态轮询", desc: "查询音乐任务渲染进度与 MP3/视频播放直链", body: null },
-      { id: "suno_lyrics", category: "ecosystem", method: "POST", url: "/api/suno/lyrics", name: "Suno AI 独立歌词创作", desc: "输入主题生成结构完整的双节押韵歌词", body: { prompt: "写一首关于秋天落叶与思念的流行歌词" } },
-      { id: "suno_refresh", category: "ecosystem", method: "POST", url: "/api/suno/refresh", name: "Suno AI 刷新鉴权凭证", desc: "强制刷新 Suno 会话凭证与 Clerk JWT 令牌", body: {} },
     ];
 
     let currentCategory = "all";
 
     // 切换左侧导航激活样式
+    
+    function endpointMatchesPlatform(ep, platformKey) {
+      if (platformKey === "all") return true;
+      if (platformKey === "gemini") return ep.category === "gemini";
+      if (platformKey === "gpt") return ep.category === "chatgpt" || ep.category === "openai";
+      if (platformKey === "suno") return ep.category === "suno";
+      if (platformKey === "baidu") return ep.category === "baidu";
+      if (platformKey === "bilibili") return ep.category === "bilibili";
+      if (platformKey === "system") return ep.category === "system";
+      return ep.category === platformKey;
+    }
+
+    function getPlatformKeyForEndpoint(ep) {
+      if (ep.category === "gemini") return "gemini";
+      if (ep.category === "chatgpt" || ep.category === "openai") return "gpt";
+      if (ep.category === "suno") return "suno";
+      if (ep.category === "baidu") return "baidu";
+      if (ep.category === "bilibili") return "bilibili";
+      if (ep.category === "system") return "system";
+      return "all";
+    }
+
+    // 渲染调试台顶部分类导航栏 (上图标 + 下名称 + 接口数徽章)
+    function renderPlaygroundCategoryNav() {
+      const nav = document.getElementById("playground-category-nav");
+      if (!nav) return;
+
+      nav.innerHTML = PLATFORM_CATEGORIES.map(cat => {
+        const isActive = cat.key === currentPlaygroundCategory;
+        const activeClass = isActive ? "plat-tab-active" : "";
+        const indicatorClass = isActive ? "block" : "hidden";
+        const iconBgClass = isActive ? "bg-cyan-500/20 shadow-inner" : "bg-slate-800/80";
+        const titleClass = isActive ? "text-cyan-300 font-bold" : "text-slate-300 group-hover:text-cyan-200";
+        const countBadgeClass = isActive ? "text-cyan-300 bg-cyan-500/20 border-cyan-500/40" : "text-slate-400 bg-slate-800/80 border-slate-700/60";
+
+        return `
+          <button onclick="setPlaygroundCategory('${cat.key}', true)" 
+                  id="plat-tab-${cat.key}"
+                  class="plat-tab relative group flex flex-col items-center justify-between py-2.5 px-2 rounded-xl text-center focus:outline-none ${activeClass}">
+            <!-- 上图标 (28x28 居中高清晰度，带降级处理) -->
+            <div class="w-8 h-8 rounded-lg ${iconBgClass} p-1 flex items-center justify-center transition duration-200 group-hover:scale-110 shrink-0">
+              <img src="${cat.icon}" alt="${cat.name}" class="w-6 h-6 object-contain" onerror="this.onerror=null; this.outerHTML='<i class=\'${cat.fallbackIcon}\'></i>';">
+            </div>
+            <!-- 下名称 -->
+            <span class="text-xs font-semibold mt-1.5 text-center ${titleClass} truncate w-full">
+              ${cat.shortName}
+            </span>
+            <!-- 接口数量徽章 -->
+            <span class="text-[10px] ${countBadgeClass} px-1.5 py-0.2 rounded-full border font-mono mt-1">
+              ${cat.count} 模板
+            </span>
+            <!-- 激活呼吸指示条 -->
+            <div class="plat-indicator ${indicatorClass} w-6 h-0.5 rounded-full bg-cyan-400 mt-1 shadow-sm shadow-cyan-400"></div>
+          </button>
+        `;
+      }).join("");
+    }
+
+    // 切换分类导航：更新选中态并按分类重构下方下拉框
+    function setPlaygroundCategory(catKey, autoSelect = true) {
+      currentPlaygroundCategory = catKey;
+      renderPlaygroundCategoryNav();
+      const filtered = populateApiSelector(catKey);
+      if (autoSelect && filtered && filtered.length > 0) {
+        loadEndpoint(filtered[0].id, false);
+      }
+    }
+
+    // 按当前分类动态填充下方 API 模板下拉框
+    function populateApiSelector(catKey) {
+      const selector = document.getElementById("api-selector");
+      if (!selector) return [];
+
+      const filtered = ALL_ENDPOINTS.filter(ep => endpointMatchesPlatform(ep, catKey));
+      
+      const badge = document.getElementById("api-template-badge");
+      const catObj = PLATFORM_CATEGORIES.find(c => c.key === catKey) || PLATFORM_CATEGORIES[0];
+      if (badge) {
+        badge.innerText = `${catObj.shortName} · ${filtered.length} 个模板`;
+      }
+      const indicator = document.getElementById("current-playground-cat-indicator");
+      if (indicator) {
+        indicator.innerHTML = `当前: <span class="text-cyan-300 font-bold">${catObj.name}</span> (${filtered.length}个模板)`;
+      }
+
+      if (catKey === "all") {
+        let html = "";
+        const groups = [
+          { label: "── Google Gemini 4账号统一池 ──", key: "gemini" },
+          { label: "── OpenAI 标准兼容接口 ──", key: "openai" },
+          { label: "── ChatGPT 逆向工程与号池 ──", key: "chatgpt" },
+          { label: "── Suno AI 音乐创作 ──", key: "suno" },
+          { label: "── 百度网盘 存储与资产 ──", key: "baidu" },
+          { label: "── 哔哩哔哩 视频与特权 ──", key: "bilibili" },
+          { label: "── Cookie Hub 通信与系统管理 ──", key: "system" }
+        ];
+        groups.forEach(g => {
+          const gEps = ALL_ENDPOINTS.filter(e => e.category === g.key);
+          if (gEps.length > 0) {
+            html += `<optgroup label="${g.label}">`;
+            gEps.forEach(e => {
+              html += `<option value="${e.id}">[${e.method}] ${e.url} (${e.name})</option>`;
+            });
+            html += `</optgroup>`;
+          }
+        });
+        selector.innerHTML = html;
+      } else {
+        selector.innerHTML = filtered.map(e => {
+          return `<option value="${e.id}">[${e.method}] ${e.url} (${e.name})</option>`;
+        }).join("");
+      }
+
+      return filtered;
+    }
+
     function setActiveNav(element) {
       document.querySelectorAll(".nav-item").forEach(item => {
         item.classList.remove("nav-item-active");
@@ -664,7 +794,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const searchKeyword = (document.getElementById("api-search-input").value || "").trim().toLowerCase();
       
       const filtered = ALL_ENDPOINTS.filter(ep => {
-        const matchesCategory = currentCategory === "all" || ep.category === currentCategory;
+        let matchesCategory = false;
+        if (currentCategory === "all") matchesCategory = true;
+        else if (currentCategory === "ecosystem") matchesCategory = ["bilibili", "baidu", "suno"].includes(ep.category);
+        else if (currentCategory === "chatgpt") matchesCategory = ep.category === "chatgpt";
+        else if (currentCategory === "openai") matchesCategory = ep.category === "openai";
+        else if (currentCategory === "gemini") matchesCategory = ep.category === "gemini";
+        else if (currentCategory === "system") matchesCategory = ep.category === "system";
+        else matchesCategory = (ep.category === currentCategory);
         if (!matchesCategory) return false;
         if (!searchKeyword) return true;
         return ep.url.toLowerCase().includes(searchKeyword) ||
@@ -754,7 +891,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const ep = ALL_ENDPOINTS.find(e => e.id === endpointId);
       if (!ep) return;
 
-      // 同步选择器
+      // 同步调试台平台分类导航栏与下拉模板
+      const epPlat = getPlatformKeyForEndpoint(ep);
+      if (currentPlaygroundCategory !== "all" && currentPlaygroundCategory !== epPlat) {
+        setPlaygroundCategory(epPlat, false);
+      } else if (!document.getElementById("api-selector").options.length) {
+        populateApiSelector(currentPlaygroundCategory);
+      }
+
+      // 同步选择器值
       const selector = document.getElementById("api-selector");
       if (selector) selector.value = ep.id;
 
@@ -785,7 +930,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
 
       // 平滑滚动至调试台
-      document.getElementById("section-playground").scrollIntoView({ behavior: "smooth" });
+      const playSection = document.getElementById("section-playground");
+      if (playSection && playSection.scrollIntoView && window.__pageLoaded) {
+        playSection.scrollIntoView({ behavior: "smooth" });
+      }
 
       if (autoRun) {
         setTimeout(() => { executeApiCall(); }, 200);
@@ -1084,9 +1232,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     // 初始化运行
     renderEndpointsList();
-    switchApiTemplate();
+    renderPlaygroundCategoryNav();
+    setPlaygroundCategory("gemini", true);
     refreshDashboard();
     setInterval(refreshDashboard, 12000); // 12秒自动更新一次
+    window.__pageLoaded = true;
   </script>
 </body>
 </html>"""
