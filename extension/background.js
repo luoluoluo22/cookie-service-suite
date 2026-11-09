@@ -609,14 +609,65 @@ async function dispatchToChatGPTTab(action, payload) {
     const results = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: async () => {
+        const diagnostics = {};
+        diagnostics.location = window.location.href;
+        diagnostics.title = document.title;
+        
+        // 1. Try standard /api/auth/session
         try {
-          const res = await fetch('/api/auth/session');
-          if (!res.ok) return { success: false, error: 'Session fetch failed: ' + res.status };
-          const data = await res.json();
-          return { success: true, session: data };
+          const res = await fetch('/api/auth/session', { credentials: 'include' });
+          diagnostics.api_auth_session_status = res.status;
+          if (res.ok) {
+            const data = await res.json();
+            if (data && data.accessToken) {
+              return { success: true, session: data };
+            }
+            diagnostics.api_auth_session_body = data;
+          }
         } catch (e) {
-          return { success: false, error: e.message };
+          diagnostics.api_auth_session_err = e.message;
         }
+
+        // 2. Try candidate endpoints
+        const candidateUrls = [
+          '/backend-api/me',
+          '/backend-api/session',
+          '/api/auth/csrf',
+          '/api/auth/providers'
+        ];
+        for (const url of candidateUrls) {
+          try {
+            const r = await fetch(url, { credentials: 'include' });
+            diagnostics[url] = { status: r.status };
+            if (r.ok) {
+              const text = await r.text();
+              try { diagnostics[url].data = JSON.parse(text); } catch(e) { diagnostics[url].text = text.slice(0, 100); }
+            }
+          } catch(e) {
+            diagnostics[url] = { error: e.message };
+          }
+        }
+
+        // 3. Check performance resource entries
+        try {
+          const resources = performance.getEntriesByType('resource')
+            .map(r => r.name)
+            .filter(n => n.includes('/backend-api/') || n.includes('/api/auth/') || n.includes('token') || n.includes('session'));
+          diagnostics.matched_resources = resources.slice(-15);
+        } catch(e) {}
+
+        // 4. Check window / localStorage keys
+        try {
+          const lsKeys = Object.keys(localStorage);
+          diagnostics.localStorageKeys = lsKeys.slice(0, 30);
+          for (const k of lsKeys) {
+            if (k.toLowerCase().includes('token') || k.toLowerCase().includes('session') || k.toLowerCase().includes('auth')) {
+              diagnostics['ls_' + k] = String(localStorage.getItem(k)).slice(0, 100);
+            }
+          }
+        } catch(e) {}
+
+        return { success: false, error: 'Session fetch failed', diagnostics };
       }
     });
     return results[0]?.result || { success: false, error: 'No result returned' };

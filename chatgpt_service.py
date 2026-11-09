@@ -505,7 +505,18 @@ class UnifiedChatGPTService:
         # 协议逆向直连通道 (严格隔离，若报错直接抛出真实异常，禁止篡改用户意图偷调浏览器)
         if not self.reverse.is_running():
             self.reverse.start()
-        return self.reverse.chat(messages, model=model, stream=stream, thinking_effort=thinking_effort)
+        try:
+            return self.reverse.chat(messages, model=model, stream=stream, thinking_effort=thinking_effort)
+        except Exception as first_err:
+            err_msg = str(first_err).lower()
+            if any(k in err_msg for k in ("429", "401", "quota", "token", "unauthorized", "too many requests")):
+                try:
+                    sync_res = self.sync_token_from_browser()
+                    if sync_res.get("success"):
+                        return self.reverse.chat(messages, model=model, stream=stream, thinking_effort=thinking_effort)
+                except Exception:
+                    pass
+            raise first_err
 
     def generate_image(
         self,
@@ -515,12 +526,25 @@ class UnifiedChatGPTService:
         response_format: str = "b64_json",
         timeout: int = 240,
     ) -> dict:
-        """文生图接口"""
+        """文生图接口 (支持自动从浏览器同步 Token 并自愈重试)"""
         if not self.reverse.is_running():
             self.reverse.start()
-        return self.reverse.generate_image(
-            prompt, model=model, n=n, response_format=response_format, timeout=timeout
-        )
+        try:
+            return self.reverse.generate_image(
+                prompt, model=model, n=n, response_format=response_format, timeout=timeout
+            )
+        except Exception as first_err:
+            err_msg = str(first_err).lower()
+            if any(k in err_msg for k in ("429", "401", "quota", "token", "unauthorized", "too many requests")):
+                try:
+                    sync_res = self.sync_token_from_browser()
+                    if sync_res.get("success"):
+                        return self.reverse.generate_image(
+                            prompt, model=model, n=n, response_format=response_format, timeout=timeout
+                        )
+                except Exception:
+                    pass
+            raise first_err
 
 
 # 单例导出
