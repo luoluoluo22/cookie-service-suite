@@ -15,6 +15,7 @@ import time
 import json
 import sqlite3
 import datetime
+import subprocess
 from typing import Optional, Dict, Any, List
 from pydantic import BaseModel, Field
 
@@ -231,6 +232,23 @@ def toggle_system_autostart():
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/system/open-directory", summary="在系统资源管理器中打开项目根目录", tags=["系统管理"])
+def open_project_directory():
+    """在 Windows 资源管理器中打开当前项目所在目录。"""
+    try:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        if sys.platform == "win32":
+            try:
+                os.startfile(base_dir)
+            except Exception:
+                subprocess.Popen(["explorer.exe", base_dir])
+        else:
+            subprocess.Popen(["xdg-open", base_dir])
+        return {"success": True, "message": "已在资源管理器中打开项目目录", "path": base_dir}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"打开项目目录失败: {str(e)}")
 
 
 # ==========================================
