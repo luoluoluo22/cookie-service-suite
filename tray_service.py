@@ -637,8 +637,28 @@ class TrayAppServer:
             except Exception:
                 pass
 
-        # 运行托盘消息循环（阻塞主线程直至用户点击退出）
-        self.tray_icon.run(setup=on_tray_setup)
+        # 运行托盘消息循环（守护主线程，防止托盘意外关闭导致服务中止）
+        while self.is_running:
+            try:
+                self.tray_icon.run(setup=on_tray_setup)
+            except Exception as e:
+                print(f"⚠️ [系统托盘] 托盘消息循环提示: {e}", flush=True)
+
+            if not self.is_running:
+                break
+
+            time.sleep(1.5)
+            try:
+                self.tray_icon = pystray.Icon(
+                    name="CookieServiceSuite",
+                    icon=icon_image,
+                    title=initial_title[:125],
+                    menu=menu,
+                )
+            except Exception:
+                # 托盘不可用时，维持主线程等待，确保 FastAPI/Node/Gemini 等后台服务不中断
+                while self.is_running:
+                    time.sleep(1.0)
 
 
 if __name__ == "__main__":
