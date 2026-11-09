@@ -149,7 +149,7 @@ def main():
     gen_parser = subparsers.add_parser("gen", help="描述模式快速生成音乐 (自动流式下载)")
     gen_parser.add_argument("prompt", type=str, help="音乐风格或情境描述文本")
     gen_parser.add_argument("--instrumental", action="store_true", help="纯伴奏模式 (无主唱人声)")
-    gen_parser.add_argument("--model", type=str, default="chirp-v3-5", choices=["chirp-v3-5", "chirp-v4", "chirp-v3-0"], help="模型版本")
+    gen_parser.add_argument("--model", type=str, default="chirp-goose", choices=["chirp-goose", "chirp-v3-5", "chirp-v4", "chirp-v3-0"], help="模型版本 (默认: chirp-goose · 推荐免费音质最佳)")
     gen_parser.add_argument("--out", type=str, default="./downloads/suno", help="音频保存目录")
     gen_parser.add_argument("--no-download", action="store_true", help="仅轮询生成结果，不自动下载 MP3 文件")
 
@@ -159,7 +159,7 @@ def main():
     custom_parser.add_argument("--tags", type=str, default="pop, acoustic guitar", help="风格标签 (如 'r&b, soulful, bpm 80')")
     custom_parser.add_argument("--title", type=str, default="My Custom Song", help="歌曲标题")
     custom_parser.add_argument("--instrumental", action="store_true", help="纯伴奏模式")
-    custom_parser.add_argument("--model", type=str, default="chirp-v3-5", help="模型版本")
+    custom_parser.add_argument("--model", type=str, default="chirp-goose", choices=["chirp-goose", "chirp-v3-5", "chirp-v4", "chirp-v3-0"], help="模型版本 (默认: chirp-goose)")
     custom_parser.add_argument("--out", type=str, default="./downloads/suno", help="音频保存目录")
     custom_parser.add_argument("--no-download", action="store_true", help="不自动下载 MP3 文件")
 
@@ -284,7 +284,12 @@ def main():
                 duration = round(item.get("metadata", {}).get("duration", 0), 1)
                 audio_url = item.get("audio_url") or "尚未就绪"
                 print(f"[{idx}] {title} ({status}) - 时长: {duration}s")
-                print(f"    🔗 音频直链: {audio_url}")
+                if "forbidden" in audio_url:
+                    print(f"    🔒 官方流: 已加密 (Suno 官方已阻断 Progressive 直链)")
+                    print(f"    🎧 本地代理: http://127.0.0.1:18800/api/suno/audio/{item.get('id')}")
+                    print(f"    📥 一键解密下载: python suno_cli.py download {item.get('id')}")
+                else:
+                    print(f"    🔗 音频直链: {audio_url}")
                 if item.get("metadata", {}).get("tags"):
                     print(f"    🏷️ 风格标签: {item['metadata']['tags']}")
                 print("-" * 50)

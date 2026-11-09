@@ -434,7 +434,7 @@ class SunoService:
         tags: Optional[str] = None,
         title: str = "",
         make_instrumental: bool = False,
-        model: str = "chirp-v3-5",
+        model: str = "chirp-goose",
     ) -> List[Dict[str, Any]]:
         """
         提交音乐生成任务
@@ -443,7 +443,7 @@ class SunoService:
         :param tags: 音乐风格标签 (仅自定义模式有效，如 "acoustic pop, guitar, upbeat, male vocal")
         :param title: 歌曲标题 (仅自定义模式有效)
         :param make_instrumental: 是否生成纯器乐伴奏 (无主唱人声)
-        :param model: 模型版本 ("chirp-v3-5", "chirp-v4", "chirp-v3-0")
+        :param model: 模型版本 ("chirp-goose" (v6-mini 免费推荐), "chirp-v3-5", "chirp-v4" (需Pro))
         :return: 包含 2 个任务 clip 对象的列表 (含 clip id)
         """
         payload: Dict[str, Any] = {
@@ -460,7 +460,18 @@ class SunoService:
             payload["gpt_description_prompt"] = prompt.strip()
             payload["prompt"] = ""
 
-        result = self._api_request("POST", "/api/generate/v2/", json_data=payload)
+        try:
+            result = self._api_request("POST", "/api/generate/v2/", json_data=payload)
+        except Exception as e:
+            err_str = str(e).lower()
+            # 若指定的模型需要 Pro 会员权限 (permission_denied)，自动降级为免费推荐模型 chirp-goose 重试
+            if ("permission_denied" in err_str or "403" in err_str) and model != "chirp-goose":
+                print(f"⚠️ 指定模型 {model} 限制 Pro 用户，自动降级为免费推荐模型 chirp-goose 重试...")
+                payload["mv"] = "chirp-goose"
+                result = self._api_request("POST", "/api/generate/v2/", json_data=payload)
+            else:
+                raise
+
         clips = result.get("clips", [])
         if not clips:
             raise RuntimeError(f"Suno 响应成功但未返回有效 clips: {result}")
@@ -502,13 +513,12 @@ class SunoService:
             all_done = True
             for c in clips:
                 status = c.get("status")
-                # 当 status 为 complete，或者已有音频直链即视为就绪
-                has_audio = bool(c.get("audio_url"))
+                # 严格等待 Suno 渲染状态到达 complete，确保音轨与 Progressive CDN 完全就绪
                 if status == "error":
                     raise RuntimeError(
                         f"歌曲生成失败: Clip {c.get('id')} 状态为 error! (元数据: {c.get('metadata')})"
                     )
-                if not (status == "complete" or has_audio):
+                if status != "complete":
                     all_done = False
                     break
 
@@ -621,6 +631,39 @@ class SunoService:
 
         return os.path.abspath(m4a_path)
 
+    def get_or_decrypt_clip(
+        self,
+        clip_id: str,
+        cache_dir: Optional[str] = None,
+    ) -> str:
+        """
+        获取解密后的本地音频文件路径。
+        若本地已有有效缓存（>10KB）则直接秒级返回缓存路径；
+        若不存在则自动从 Suno CDN 拉取加密流并解密后存盘返回。
+        """
+        base_dir = cache_dir or os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads", "suno")
+        os.makedirs(base_dir, exist_ok=True)
+
+        for ext in [".m4a", ".mp3"]:
+            target_path = os.path.join(base_dir, f"{clip_id}{ext}")
+            if os.path.isfile(target_path) and os.path.getsize(target_path) > 10240:
+                return os.path.abspath(target_path)
+
+        # 检查是否已有带有短 id 或歌名的本地文件 (如 午后咖啡杯_a8d052.m4a)
+        short_id = clip_id[:6]
+        try:
+            for fname in os.listdir(base_dir):
+                if (clip_id in fname or fname.endswith(f"_{short_id}.m4a") or fname.endswith(f"_{short_id}.mp3")):
+                    fpath = os.path.join(base_dir, fname)
+                    if os.path.isfile(fpath) and os.path.getsize(fpath) > 10240:
+                        return os.path.abspath(fpath)
+        except Exception:
+            pass
+
+        # 缓存未命中，执行解密下载
+        save_path = os.path.join(base_dir, f"{clip_id}.m4a")
+        return self.decrypt_and_download_clip(clip_id=clip_id, output_file_path=save_path)
+
     def download_song(
         self,
         audio_url_or_clip_id: str,
@@ -727,7 +770,7 @@ class SunoService:
         for idx, clip in enumerate(completed_clips, 1):
             song_title = clip.get("title") or f"suno_track_{clip['id'][:8]}"
             safe_title = re.sub(r'[\\/*?:"<>|]', "_", song_title)
-            filename = f"{safe_title}_{clip['id'][:6]}.mp3"
+            filename = f"{safe_title}_{clip['id'][:6]}.m4a"
             save_path = os.path.join(output_dir, filename)
 
             clip_id = clip.get("id")

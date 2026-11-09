@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Path
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -124,7 +124,7 @@ class SunoGenerateRequest(BaseModel):
     tags: Optional[str] = Field("pop, acoustic guitar, cheerful", description="音乐流派风格标签 (仅自定义模式)")
     title: Optional[str] = Field("My Suno Song", description="歌曲标题")
     make_instrumental: Optional[bool] = Field(False, description="是否生成纯器乐伴奏 (无主唱)")
-    model: Optional[str] = Field("chirp-v3-5", description="模型版本: chirp-v3-5, chirp-v4, chirp-v3-0")
+    model: Optional[str] = Field("chirp-goose", description="模型版本: chirp-goose (v6-mini 免费推荐), chirp-v3-5, chirp-v4 (需Pro)")
     wait: Optional[bool] = Field(False, description="是否等待渲染完成 (若为 False 则立即返回任务 clip ids)")
     download: Optional[bool] = Field(False, description="当 wait 为 True 时是否自动下载 MP3 到本地")
 
@@ -558,10 +558,26 @@ def get_suno_quota():
         raise HTTPException(status_code=500, detail=f"查询 Suno 配额失败: {str(e)}")
 
 
+def _enrich_suno_clips(clips_data: Any) -> Any:
+    """自动将 Suno 加密的 forbidden audio_url 重写为本地无缝代理流，并保留原始直链"""
+    if isinstance(clips_data, list):
+        for item in clips_data:
+            if isinstance(item, dict):
+                cid = item.get("id")
+                if cid:
+                    item["local_audio_url"] = f"/api/suno/audio/{cid}"
+                    raw_audio = str(item.get("audio_url", ""))
+                    if "forbidden" in raw_audio or not raw_audio:
+                        item["raw_audio_url"] = raw_audio
+                        item["audio_url"] = f"/api/suno/audio/{cid}"
+    return clips_data
+
+
 @app.get("/api/suno/feed", summary="获取 Suno 历史作品曲库列表", tags=["Suno 音乐生成"])
 def get_suno_feed(page: int = Query(1, ge=1, description="页码")):
     try:
-        return suno_client.get_feed(page=page)
+        clips = suno_client.get_feed(page=page)
+        return _enrich_suno_clips(clips)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"获取 Suno 历史曲库失败: {str(e)}")
 
@@ -613,7 +629,8 @@ def generate_suno_music(req: SunoGenerateRequest):
 def get_suno_status(clip_ids: str = Query(..., description="待查询的 clip ID，多个用英文逗号隔开")):
     try:
         id_list = [i.strip() for i in clip_ids.split(",") if i.strip()]
-        return suno_client.fetch_clips_status(id_list)
+        clips = suno_client.fetch_clips_status(id_list)
+        return _enrich_suno_clips(clips)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"查询任务状态失败: {str(e)}")
 
@@ -632,6 +649,25 @@ def refresh_suno_auth():
         return suno_client.refresh_auth()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"刷新 Suno 凭证失败: {str(e)}")
+
+
+@app.get("/api/suno/audio/{clip_id}", summary="解密并流式播放/下载指定 Clip 音频", tags=["Suno 音乐生成"])
+def get_suno_audio(clip_id: str = Path(..., description="Suno 歌曲 Clip ID")):
+    try:
+        file_path = suno_client.get_or_decrypt_clip(clip_id)
+        if not os.path.isfile(file_path):
+            raise HTTPException(status_code=404, detail="音频文件未能成功解密")
+
+        media_type = "audio/mp4" if file_path.lower().endswith(".m4a") else "audio/mpeg"
+        filename = os.path.basename(file_path)
+        return FileResponse(
+            path=file_path,
+            media_type=media_type,
+            filename=filename,
+            headers={"Accept-Ranges": "bytes"}
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"解密音频流失败: {str(e)}")
 
 
 # ==========================================

@@ -22,7 +22,20 @@ import shutil
 import urllib.request
 import json
 import ctypes
+import traceback
 from typing import Optional, Dict, Any, List, Tuple
+
+def _global_exception_handler(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    print("🔥 [CRITICAL UNCAUGHT EXCEPTION]:", file=sys.stderr, flush=True)
+    traceback.print_exception(exc_type, exc_value, exc_traceback, file=sys.stderr)
+    sys.stderr.flush()
+
+sys.excepthook = _global_exception_handler
+if hasattr(threading, "excepthook"):
+    threading.excepthook = lambda args: _global_exception_handler(args.exc_type, args.exc_value, args.exc_traceback)
 
 # 编码与网络环境配置
 if sys.platform == "win32":
@@ -357,13 +370,9 @@ class TrayAppServer:
                     f"Hub: {hub_mark} | 插件: {ext_mark} | Gemini: {gem_mark}",
                     f"运行状态: {'🟢正常运行' if (api_ok and hub_ok) else '🟡部分服务异常'}",
                 ]
-                self.tray_icon.title = "\n".join(title_lines)[:125]
-            except Exception:
-                pass
-
-            # 触发菜单文字动态刷新
-            try:
-                self.tray_icon.update_menu()
+                new_title = "\n".join(title_lines)[:125]
+                if getattr(self.tray_icon, "title", None) != new_title:
+                    self.tray_icon.title = new_title
             except Exception:
                 pass
 
@@ -646,6 +655,10 @@ class TrayAppServer:
         def on_tray_setup(icon):
             attach_to_default_desktop()
             try:
+                icon.visible = True  # 核心：必须显式设为 True，Windows 托盘才能显示图标
+            except Exception:
+                pass
+            try:
                 icon.notify(
                     "Cookie Service Suite 已在系统托盘常驻！\n"
                     "左键点击托盘图标即可打开管理控制台并在线测试 API 端点。\n"
@@ -655,28 +668,46 @@ class TrayAppServer:
             except Exception:
                 pass
 
-        # 运行托盘消息循环（守护主线程，防止托盘意外关闭导致服务中止）
-        while self.is_running:
-            try:
-                self.tray_icon.run(setup=on_tray_setup)
-            except Exception as e:
-                print(f"⚠️ [系统托盘] 托盘消息循环提示: {e}", flush=True)
+        def _tray_worker():
+            """托盘独立守护线程：托盘任何偶发异常均被隔离，绝不影响后台 API 与服务运行"""
+            while self.is_running:
+                try:
+                    attach_to_default_desktop()
+                    if self.tray_icon is None:
+                        self.tray_icon = pystray.Icon(
+                            name="CookieServiceSuite",
+                            icon=icon_image,
+                            title=initial_title[:125],
+                            menu=menu,
+                        )
+                    self.tray_icon.run(setup=on_tray_setup)
+                except Exception as e:
+                    print(f"⚠️ [系统托盘] 托盘运行提示 (后台服务正常运行中): {e}", flush=True)
 
-            if not self.is_running:
-                break
+                if not self.is_running:
+                    break
 
-            time.sleep(1.5)
-            try:
-                self.tray_icon = pystray.Icon(
-                    name="CookieServiceSuite",
-                    icon=icon_image,
-                    title=initial_title[:125],
-                    menu=menu,
-                )
-            except Exception:
-                # 托盘不可用时，维持主线程等待，确保 FastAPI/Node/Gemini 等后台服务不中断
-                while self.is_running:
-                    time.sleep(1.0)
+                time.sleep(3.0)
+                try:
+                    self.tray_icon = pystray.Icon(
+                        name="CookieServiceSuite",
+                        icon=icon_image,
+                        title=initial_title[:125],
+                        menu=menu,
+                    )
+                except Exception:
+                    self.tray_icon = None
+
+        # 启动托盘独立线程
+        tray_thread = threading.Thread(target=_tray_worker, daemon=True, name="TrayThread")
+        tray_thread.start()
+
+        # 主线程常驻 Supervisor：守护主服务与各个子系统
+        try:
+            while self.is_running:
+                time.sleep(1.0)
+        except (KeyboardInterrupt, SystemExit):
+            self.on_exit()
 
 
 if __name__ == "__main__":

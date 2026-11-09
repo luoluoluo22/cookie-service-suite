@@ -52,12 +52,15 @@ class CookieBridge:
         resp.raise_for_status()
         return resp.json()
 
-    def auto_fetch_suno_cookies(self, force_visit: bool = False, timeout: int = 15) -> Dict[str, Any]:
+    def auto_fetch_suno_cookies(self, force_visit: bool = False, timeout: int = 25) -> Dict[str, Any]:
         """通知浏览器扩展自动访问 Suno 并提取登录态 Cookie (免手动 F12 抓包)"""
         resp = self.session.get(
             f"{self.bridge_url}/suno/auto_fetch",
-            params={"force": "true" if force_visit else "false"},
-            timeout=timeout
+            params={
+                "force": "true" if force_visit else "false",
+                "timeout": int(timeout * 1000)
+            },
+            timeout=timeout + 2
         )
         resp.raise_for_status()
         return resp.json()

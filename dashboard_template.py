@@ -327,6 +327,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               <img id="rendered-image" src="" alt="生成的图片预览" class="max-h-64 max-w-full rounded-lg border border-slate-800 shadow-lg object-contain">
             </div>
 
+            <!-- 可视化音频试听卡片 (Suno 音乐解密直出) -->
+            <div id="audio-preview-card" class="hidden bg-slate-900/90 border border-indigo-500/40 rounded-xl p-3 flex flex-col gap-2">
+              <div class="w-full flex items-center justify-between text-xs text-indigo-300">
+                <span class="font-semibold flex items-center gap-1.5"><i class="fa-solid fa-music animate-pulse"></i> <span id="audio-preview-title">Suno 在线试听播放器</span></span>
+                <a id="btn-download-audio" href="#" download="suno_music.m4a" class="px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300 hover:bg-indigo-500/30 text-[11px] font-mono flex items-center gap-1">
+                  <i class="fa-solid fa-download"></i> 保存音频 (M4A)
+                </a>
+              </div>
+              <audio id="rendered-audio" controls class="w-full h-9 rounded outline-none"></audio>
+            </div>
+
             <pre id="resp-output" class="flex-1 bg-slate-900 border border-slate-800 rounded-xl p-4 text-xs font-mono text-emerald-400 overflow-auto min-h-[260px] max-h-[380px]">点击左侧「发送请求」或下方接口列表中「立即测试」，结果将实时展示在此处...</pre>
           </div>
         </div>
@@ -623,8 +634,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       // 4. Suno AI 音乐创作 (6)
       { id: "suno_quota", category: "suno", method: "GET", url: "/api/suno/quota", name: "Suno AI 积分与可用曲目", desc: "查询 Suno 账号剩余积分及本月可用生成曲目数", body: null },
       { id: "suno_feed", category: "suno", method: "GET", url: "/api/suno/feed?page=1", name: "Suno AI 历史创作作品库", desc: "拉取已生成的音乐曲目、封面、歌词与音频直链", body: null },
-      { id: "suno_gen", category: "suno", method: "POST", url: "/api/suno/generate", name: "Suno AI 提交音乐生成任务", desc: "根据描述词生成两首完整人声/器乐歌曲 (支持自定义模式)", body: { prompt: "一段欢快阳光的夏日流行海滩音乐，带有原声吉他和轻快的鼓点", is_custom: false, model: "chirp-v3-5", wait: false } },
-      { id: "suno_status", category: "suno", method: "GET", url: "/api/suno/status?clip_ids=test", name: "Suno AI 任务状态轮询", desc: "查询音乐任务渲染进度与 MP3/视频播放直链", body: null },
+      { id: "suno_gen", category: "suno", method: "POST", url: "/api/suno/generate", name: "Suno AI 提交音乐生成任务", desc: "根据描述词生成两首完整人声/器乐歌曲 (支持自定义模式)", body: { prompt: "一段欢快阳光的夏日流行海滩音乐，带有原声吉他和轻快的鼓点", is_custom: false, model: "chirp-goose", wait: false } },
+      { id: "suno_audio", category: "suno", method: "GET", url: "/api/suno/audio/f42ad222-213f-4e8b-a7b1-dbc23455d1eb", name: "Suno AI 解密流式试听", desc: "自动解密 Suno 渐进流并直接在浏览器在线播放无损 M4A", body: null },
+      { id: "suno_status", category: "suno", method: "GET", url: "/api/suno/status?clip_ids=f42ad222-213f-4e8b-a7b1-dbc23455d1eb", name: "Suno AI 任务状态轮询", desc: "查询任务渲染进度与本地解密流式播放直链", body: null },
       { id: "suno_lyrics", category: "suno", method: "POST", url: "/api/suno/lyrics", name: "Suno AI 独立歌词创作", desc: "输入主题生成结构完整的双节押韵歌词", body: { prompt: "写一首关于秋天落叶与思念的流行歌词" } },
       { id: "suno_refresh", category: "suno", method: "POST", url: "/api/suno/refresh", name: "Suno AI 刷新鉴权凭证", desc: "强制刷新 Suno 会话凭证与 Clerk JWT 令牌", body: {} },
 
@@ -986,7 +998,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const renderedImg = document.getElementById("rendered-image");
       const btnDownload = document.getElementById("btn-download-img");
 
+      const audioCard = document.getElementById("audio-preview-card");
+      const renderedAudio = document.getElementById("rendered-audio");
+      const btnDownloadAudio = document.getElementById("btn-download-audio");
+      const audioTitle = document.getElementById("audio-preview-title");
+
       imgCard.classList.add("hidden");
+      if (audioCard) audioCard.classList.add("hidden");
       btn.disabled = true;
       btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> 正在调用...`;
       out.innerText = "请求发送中，等待响应...";
@@ -1006,6 +1024,24 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           statusSpan.className = "text-xs px-2 py-0.5 rounded font-mono bg-emerald-500/20 text-emerald-400";
         } else {
           statusSpan.className = "text-xs px-2 py-0.5 rounded font-mono bg-rose-500/20 text-rose-400";
+        }
+
+        const contentType = resp.headers.get("content-type") || "";
+        if (contentType.includes("audio") || contentType.includes("video")) {
+          if (audioCard && renderedAudio) {
+            renderedAudio.src = endpoint;
+            if (btnDownloadAudio) {
+              btnDownloadAudio.href = endpoint;
+              btnDownloadAudio.download = endpoint.split("/").pop() || "suno_audio.m4a";
+            }
+            if (audioTitle) {
+              audioTitle.innerText = "Suno 在线流式播放 (" + (endpoint.split("/").pop() || "Clip") + ")";
+            }
+            audioCard.classList.remove("hidden");
+            try { renderedAudio.play(); } catch(e){}
+          }
+          out.innerText = `[200 OK 音频流已就绪] Content-Type: ${contentType}\n媒体直链: ${window.location.origin}${endpoint}\n已在上方播放器中自动载入，支持拖拽与直接在线试听。`;
+          return;
         }
 
         const data = await resp.json();
@@ -1034,6 +1070,36 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             imgCard.classList.remove("hidden");
           }
         } catch (imgErr) {}
+
+        // 智能检测 Suno 音频链接并展现试听
+        try {
+          let foundAudio = null;
+          let songTitle = "";
+          if (Array.isArray(data)) {
+            for (const item of data) {
+              if (item && (item.local_audio_url || item.audio_url)) {
+                foundAudio = item.local_audio_url || item.audio_url;
+                songTitle = item.title || "";
+                break;
+              }
+            }
+          } else if (data && (data.local_audio_url || data.audio_url)) {
+            foundAudio = data.local_audio_url || data.audio_url;
+            songTitle = data.title || "";
+          }
+
+          if (foundAudio && audioCard && renderedAudio && !foundAudio.includes("forbidden")) {
+            renderedAudio.src = foundAudio;
+            if (btnDownloadAudio) {
+              btnDownloadAudio.href = foundAudio;
+              btnDownloadAudio.download = (songTitle ? songTitle + ".m4a" : "suno_audio.m4a");
+            }
+            if (audioTitle) {
+              audioTitle.innerText = songTitle ? `Suno 试听: ${songTitle}` : "Suno 在线音乐试听";
+            }
+            audioCard.classList.remove("hidden");
+          }
+        } catch (audioErr) {}
 
       } catch (err) {
         timeSpan.innerText = `失败`;

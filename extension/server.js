@@ -574,7 +574,33 @@ const server = http.createServer(async (req, res) => {
 
     try {
       const forceVisit = parsedUrl.searchParams.get('force') === 'true' || parsedUrl.searchParams.get('visit') === 'true';
-      const data = await dispatchToExtension('suno_auto_fetch', { forceVisit });
+      const timeout = parseInt(parsedUrl.searchParams.get('timeout')) || 25000;
+      const data = await dispatchToExtension('suno_auto_fetch', { forceVisit, timeout });
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(data, null, 2));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ success: false, error: err.message }));
+    }
+    return;
+  }
+
+
+  // 5.05 Suno 页面 DOM 自动化（由本地 Cookie Hub 扩展在登录页面内执行）
+  if (pathname === '/suno/execute' && req.method === 'POST') {
+    if (extensionSockets.size === 0) {
+      res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ success: false, error: '浏览器扩展未连接本地服务' }));
+      return;
+    }
+    try {
+      const body = await readRequestBody(req);
+      const json = JSON.parse(body || '{}');
+      const data = await dispatchToExtension('suno_execute', {
+        operation: json.operation || 'inspect',
+        payload: json.payload || {},
+        timeout: json.timeout || 30000
+      });
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify(data, null, 2));
     } catch (err) {
