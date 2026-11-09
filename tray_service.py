@@ -630,7 +630,8 @@ class TrayAppServer:
             try:
                 icon.notify(
                     "Cookie Service Suite 已在系统托盘常驻！\n"
-                    "右键托盘图标可查看各服务运行情况与开机自启设置。",
+                    "左键点击托盘图标即可打开管理控制台并在线测试 API 端点。\n"
+                    "右键可查看服务健康状态与开机自启设置。",
                     f"本地统一服务就绪 (端口 {SERVER_PORT})",
                 )
             except Exception:

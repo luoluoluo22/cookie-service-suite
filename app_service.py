@@ -32,6 +32,13 @@ from chatgpt_service import chatgpt_service, UnifiedChatGPTService, ChatGPTBridg
 from bilibili_service import BilibiliService
 from baidu_pan_service import BaiduPanService
 from suno_service import SunoService, suno_service
+from autostart import (
+    is_autostart_enabled,
+    enable_autostart,
+    disable_autostart,
+    toggle_autostart,
+    get_autostart_entry,
+)
 
 # 初始化 FastAPI 应用
 app = FastAPI(
@@ -149,11 +156,24 @@ def get_system_overview():
     except Exception:
         pass
 
+    autostart_ok = False
+    autostart_desc = None
+    try:
+        autostart_ok = is_autostart_enabled()
+        autostart_desc = get_autostart_entry()
+    except Exception:
+        pass
+
     return {
         "status": "online",
         "service_name": "Cookie Service Suite",
         "version": "2.0.0",
         "uptime_seconds": uptime_sec,
+        "autostart": {
+            "enabled": autostart_ok,
+            "status": "enabled" if autostart_ok else "disabled",
+            "entry": autostart_desc,
+        },
         "services": {
             "cookie_hub": {
                 "port": 18888,
@@ -180,6 +200,37 @@ def get_system_overview():
             },
         },
     }
+
+
+@app.get("/api/system/autostart", summary="获取 Windows 开机自启状态", tags=["系统管理"])
+def get_system_autostart():
+    """检测当前套件是否已在 Windows 注册表 Run 或开始菜单 Startup 注册开机自启。"""
+    try:
+        enabled = is_autostart_enabled()
+        return {
+            "enabled": enabled,
+            "status": "enabled" if enabled else "disabled",
+            "entry": get_autostart_entry(),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/system/autostart/toggle", summary="一键切换 Windows 开机自启动开启/关闭状态", tags=["系统管理"])
+def toggle_system_autostart():
+    """在开启 (双重保障: 注册表+开始菜单) 与关闭之间一键切换。"""
+    try:
+        ok, msg = toggle_autostart()
+        enabled = is_autostart_enabled()
+        return {
+            "success": ok,
+            "enabled": enabled,
+            "status": "enabled" if enabled else "disabled",
+            "message": msg,
+            "entry": get_autostart_entry(),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ==========================================
@@ -801,725 +852,7 @@ def openai_models():
 # ==========================================
 # 8. 现代化 Web 控制台 (Management Dashboard)
 # ==========================================
-DASHBOARD_HTML = """
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Cookie Service Suite | 本地服务与 API 管理控制台</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-  <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
-    .glass { background: rgba(30, 41, 59, 0.7); backdrop-filter: blur(12px); border: 1px solid rgba(255, 255, 255, 0.08); }
-    .glass-card { background: rgba(15, 23, 42, 0.65); backdrop-filter: blur(16px); border: 1px solid rgba(255, 255, 255, 0.07); }
-    pre::-webkit-scrollbar { height: 6px; width: 6px; }
-    pre::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
-  </style>
-</head>
-<body class="bg-slate-950 text-slate-100 min-h-screen">
-  
-  <!-- 顶部导航栏 -->
-  <header class="sticky top-0 z-50 glass border-b border-slate-800/80 px-6 py-4 flex items-center justify-between shadow-2xl">
-    <div class="flex items-center space-x-3">
-      <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-amber-500 to-cyan-400 flex items-center justify-center shadow-lg shadow-cyan-500/20">
-        <i class="fa-solid fa-cookie-bite text-xl text-slate-950"></i>
-      </div>
-      <div>
-        <h1 class="font-bold text-lg text-transparent bg-clip-text bg-gradient-to-r from-amber-200 via-sky-300 to-cyan-200">
-          Cookie Service Suite
-        </h1>
-        <p class="text-xs text-slate-400">本地服务总线 & 多账号统一管理中心</p>
-      </div>
-    </div>
-    <div class="flex items-center space-x-3">
-      <a href="/docs" target="_blank" class="px-3.5 py-1.5 rounded-lg text-xs font-medium bg-cyan-500/10 text-cyan-400 border border-cyan-500/30 hover:bg-cyan-500/20 transition flex items-center gap-1.5">
-        <i class="fa-solid fa-bolt"></i> Swagger 交互文档
-      </a>
-      <a href="/redoc" target="_blank" class="px-3.5 py-1.5 rounded-lg text-xs font-medium bg-slate-800 text-slate-300 border border-slate-700 hover:bg-slate-700 transition flex items-center gap-1.5">
-        <i class="fa-solid fa-book"></i> ReDoc 规范
-      </a>
-      <button onclick="refreshDashboard()" class="px-3.5 py-1.5 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition flex items-center gap-1.5">
-        <i class="fa-solid fa-arrow-rotate-right" id="refresh-icon"></i> 刷新数据
-      </button>
-    </div>
-  </header>
-
-  <!-- 主体内容容器 -->
-  <main class="max-w-7xl mx-auto px-6 py-8 space-y-8">
-
-    <!-- 1. 服务运行指标卡片 -->
-    <section class="grid grid-cols-1 md:grid-cols-4 gap-5">
-      <!-- Cookie Hub -->
-      <div class="glass-card rounded-2xl p-5 shadow-xl relative overflow-hidden group">
-        <div class="flex justify-between items-start">
-          <div>
-            <div class="text-xs uppercase tracking-wider text-slate-400 font-semibold mb-1">Cookie Hub 扩展桥</div>
-            <div class="text-2xl font-bold text-slate-100 flex items-center gap-2" id="hub-status-text">
-              <span class="inline-block w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse"></span> 正在连接
-            </div>
-          </div>
-          <div class="w-10 h-10 rounded-xl bg-cyan-500/10 text-cyan-400 flex items-center justify-center">
-            <i class="fa-solid fa-puzzle-piece text-lg"></i>
-          </div>
-        </div>
-        <div class="mt-4 text-xs text-slate-400 flex justify-between">
-          <span>端口: 18888</span>
-          <span id="hub-clients">客户端: 1</span>
-        </div>
-      </div>
-
-      <!-- Gemini 多账号池 -->
-      <div class="glass-card rounded-2xl p-5 shadow-xl relative overflow-hidden group">
-        <div class="flex justify-between items-start">
-          <div>
-            <div class="text-xs uppercase tracking-wider text-slate-400 font-semibold mb-1">Gemini 统一池</div>
-            <div class="text-2xl font-bold text-amber-300 flex items-center gap-2" id="gemini-status-text">
-              4 账号在线
-            </div>
-          </div>
-          <div class="w-10 h-10 rounded-xl bg-amber-500/10 text-amber-400 flex items-center justify-center">
-            <i class="fa-solid fa-brain text-lg"></i>
-          </div>
-        </div>
-        <div class="mt-4 text-xs text-slate-400 flex justify-between">
-          <span>LRU 自动负载均衡</span>
-          <span>端口: 18083</span>
-        </div>
-      </div>
-
-      <!-- OpenAI 兼容端点 -->
-      <div class="glass-card rounded-2xl p-5 shadow-xl relative overflow-hidden group">
-        <div class="flex justify-between items-start">
-          <div>
-            <div class="text-xs uppercase tracking-wider text-slate-400 font-semibold mb-1">OpenAI 兼容端点</div>
-            <div class="text-2xl font-bold text-emerald-300">/v1 开放中</div>
-          </div>
-          <div class="w-10 h-10 rounded-xl bg-emerald-500/10 text-emerald-400 flex items-center justify-center">
-            <i class="fa-solid fa-network-wired text-lg"></i>
-          </div>
-        </div>
-        <div class="mt-4 text-xs text-slate-400 flex justify-between">
-          <span>端口: 18800</span>
-          <span>支持 Chatbox/Cursor</span>
-        </div>
-      </div>
-
-      <!-- 系统运行时间 -->
-      <div class="glass-card rounded-2xl p-5 shadow-xl relative overflow-hidden group">
-        <div class="flex justify-between items-start">
-          <div>
-            <div class="text-xs uppercase tracking-wider text-slate-400 font-semibold mb-1">系统运行时长</div>
-            <div class="text-2xl font-bold text-indigo-300" id="uptime-text">0m</div>
-          </div>
-          <div class="w-10 h-10 rounded-xl bg-indigo-500/10 text-indigo-400 flex items-center justify-center">
-            <i class="fa-solid fa-clock text-lg"></i>
-          </div>
-        </div>
-        <div class="mt-4 text-xs text-slate-400 flex justify-between">
-          <span>托盘状态: 驻留托盘</span>
-          <span class="text-emerald-400">稳定自愈就绪</span>
-        </div>
-      </div>
-    </section>
-
-    <!-- 2. Gemini 4 账号槽位看板 -->
-    <section class="glass-card rounded-2xl p-6 shadow-xl">
-      <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-4">
-        <div>
-          <h2 class="text-lg font-bold text-slate-100 flex items-center gap-2">
-            <i class="fa-solid fa-users-gear text-amber-400"></i> Google Gemini 4 账号槽位看板
-          </h2>
-          <p class="text-xs text-slate-400">基于浏览器 /u/0 ~ /u/3 多登录体系，自动分发、保活与熔断切换</p>
-        </div>
-        <div class="flex items-center gap-2.5">
-          <button onclick="syncProfiles()" id="btn-sync-profiles" class="px-3.5 py-1.5 rounded-lg text-xs font-medium bg-indigo-500/10 text-indigo-400 border border-indigo-500/30 hover:bg-indigo-500/20 transition flex items-center gap-1.5" title="抓取各账号在 Google 的真实用户名与 Gmail 邮箱">
-            <i class="fa-solid fa-id-card"></i> 同步真实名称与邮箱
-          </button>
-          <button onclick="refreshAllCookies()" class="px-3.5 py-1.5 rounded-lg text-xs font-medium bg-amber-500/10 text-amber-400 border border-amber-500/30 hover:bg-amber-500/20 transition flex items-center gap-1.5">
-            <i class="fa-solid fa-arrows-rotate"></i> 从 Cookie Hub 刷新全部凭证
-          </button>
-        </div>
-      </div>
-
-      <div class="overflow-x-auto">
-        <table class="w-full text-left text-sm text-slate-300">
-          <thead class="bg-slate-900/60 text-xs uppercase text-slate-400 border-b border-slate-800">
-            <tr>
-              <th class="py-3 px-3">序号</th>
-              <th class="py-3 px-4">Google 账号真实名称与邮箱</th>
-              <th class="py-3 px-3">URL 前缀</th>
-              <th class="py-3 px-4">5小时计算额度 (滚动窗口)</th>
-              <th class="py-3 px-4">周累计额度 (每周上限)</th>
-              <th class="py-3 px-3">会话健康</th>
-              <th class="py-3 px-3 text-right">操作</th>
-            </tr>
-          </thead>
-          <tbody id="accounts-tbody" class="divide-y divide-slate-800/60">
-            <tr><td colspan="7" class="py-6 text-center text-slate-500">正在获取账号数据...</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </section>
-
-    <!-- 3. 在线 API 交互调试工作台 (Live Playground) -->
-    <section class="glass-card rounded-2xl p-6 shadow-xl grid grid-cols-1 lg:grid-cols-12 gap-6">
-      <div class="lg:col-span-6 space-y-4">
-        <div>
-          <h2 class="text-lg font-bold text-slate-100 flex items-center gap-2">
-            <i class="fa-solid fa-terminal text-cyan-400"></i> 在线 API 调试工作台
-          </h2>
-          <p class="text-xs text-slate-400">快速发起真实接口请求，支持自选模型与思考推理级别</p>
-        </div>
-
-        <div>
-          <label class="text-xs font-semibold text-slate-300 uppercase block mb-1.5">选择预设 API 模板</label>
-          <select id="api-selector" onchange="switchApiTemplate()" class="w-full bg-slate-900 border border-slate-700 rounded-xl px-3.5 py-2 text-sm text-slate-200 focus:outline-none focus:border-cyan-400">
-            <option value="gemini_chat">[POST] /api/gemini/chat (Gemini 4账号轮询对话)</option>
-            <option value="openai_chat">[POST] /v1/chat/completions (OpenAI 兼容对话)</option>
-            <option value="gemini_accounts">[GET] /api/gemini/accounts (查看4账号状态与额度)</option>
-            <option value="sync_profiles">[POST] /api/gemini/accounts/sync-profiles (同步各账号真实名称)</option>
-            <option value="hub_status">[GET] /api/hub/status (Cookie Hub 状态)</option>
-            <option value="hub_cookies">[GET] /api/hub/cookies?domain=google.com (提取实时Cookie)</option>
-            <option value="bili_user">[GET] /api/bilibili/user (B站个人资料与大会员)</option>
-            <option value="baidu_quota">[GET] /api/baidupan/quota (百度网盘总配额)</option>
-            <option value="chatgpt_status">[GET] /api/chatgpt/status (ChatGPT 逆向号池状态)</option>
-            <option value="chatgpt_models">[GET] /api/chatgpt/models (ChatGPT 逆向模型列表)</option>
-            <option value="chatgpt_accounts">[GET] /api/chatgpt/accounts (ChatGPT 号池账号总览)</option>
-            <option value="chatgpt_sync">[POST] /api/chatgpt/accounts/sync-browser (从浏览器一键同步Token)</option>
-            <option value="chatgpt_chat">[POST] /api/chatgpt/chat (ChatGPT 逆向智能问答)</option>
-            <option value="chatgpt_image">[POST] /api/chatgpt/image (ChatGPT 逆向文生图 gpt-image-2)</option>
-            <option value="openai_image">[POST] /v1/images/generations (OpenAI兼容图片生成)</option>
-            <option value="chatgpt_session">[GET] /api/chatgpt/session (ChatGPT 会话提取)</option>
-            <option value="suno_quota">[GET] /api/suno/quota (Suno 账户积分与可用曲目)</option>
-            <option value="suno_feed">[GET] /api/suno/feed (Suno 历史曲库作品)</option>
-            <option value="suno_gen">[POST] /api/suno/generate (Suno 音乐创作任务)</option>
-            <option value="suno_lyrics">[POST] /api/suno/lyrics (Suno 独立歌词创作)</option>
-          </select>
-        </div>
-
-        <!-- 模型与推理级别双控网格 -->
-        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3" id="model-controls-grid">
-          <!-- 模型选择下拉控件 -->
-          <div id="model-select-container">
-            <label class="text-xs font-semibold text-slate-300 uppercase block mb-1.5 flex items-center justify-between">
-              <span><i class="fa-solid fa-cube text-cyan-400 mr-1.5"></i> 选择模型 (Model)</span>
-            </label>
-            <select id="model-selector" onchange="onModelOrReasoningChange()" class="w-full bg-slate-900 border border-cyan-500/40 rounded-xl px-3 py-2 text-xs text-cyan-300 focus:outline-none focus:border-cyan-400 shadow-inner">
-              <option value="gemini-3.5-flash-lite">gemini-3.5-flash-lite (极速响应 · 推荐)</option>
-              <option value="gemini-3.1-pro">gemini-3.1-pro (强推理 · 复杂任务)</option>
-              <option value="gemini-3.6-flash">gemini-3.6-flash (多模态高通量 · 均衡)</option>
-              <option value="gemini-3.8-flash">gemini-3.8-flash (新版 3.8 Flash 架构)</option>
-              <option value="gemini-4-argon">gemini-4-argon (4 Argon 复杂推理)</option>
-              <option value="auto">auto (ChatGPT 逆向智能优选)</option>
-              <option value="gpt-5-6">gpt-5-6 (ChatGPT Web 逆向旗舰)</option>
-              <option value="gpt-image-2">gpt-image-2 (ChatGPT 逆向文生图专用)</option>
-              <option value="chatgpt-web">chatgpt-web (ChatGPT 网页原生)</option>
-              <option value="gpt-4o">gpt-4o (OpenAI 协议通道映射)</option>
-              <option value="gpt-3.5-turbo">gpt-3.5-turbo (OpenAI 兼容协议)</option>
-            </select>
-          </div>
-
-          <!-- 推理级别下拉控件 -->
-          <div id="reasoning-level-container">
-            <label class="text-xs font-semibold text-slate-300 uppercase block mb-1.5 flex items-center justify-between">
-              <span><i class="fa-solid fa-brain text-purple-400 mr-1.5"></i> 推理级别 (Reasoning)</span>
-              <span class="text-[10px] text-purple-300 font-mono">思考链</span>
-            </label>
-            <select id="reasoning-selector" onchange="onModelOrReasoningChange()" class="w-full bg-slate-900 border border-purple-500/40 rounded-xl px-3 py-2 text-xs text-purple-300 focus:outline-none focus:border-purple-400 shadow-inner">
-              <option value="off">🟢 关闭思考 / 快速模式 (Off · 直出)</option>
-              <option value="medium">🟡 中等推理 (Medium · 适度权衡)</option>
-              <option value="high">🟣 深度扩展思考 (High · 长思维链)</option>
-            </select>
-          </div>
-        </div>
-
-        <div class="flex gap-2 items-center">
-          <span id="req-method-badge" class="px-2.5 py-1 rounded-lg text-xs font-bold bg-amber-500/20 text-amber-300 border border-amber-500/30">POST</span>
-          <input type="text" id="req-endpoint" class="flex-1 bg-slate-900 border border-slate-700 rounded-xl px-3 py-1.5 text-xs font-mono text-slate-300 focus:outline-none focus:border-cyan-400" value="/api/gemini/chat" readonly>
-        </div>
-
-        <div id="req-body-container">
-          <label class="text-xs font-semibold text-slate-300 uppercase block mb-1.5 flex items-center justify-between">
-            <span>请求 Body (JSON)</span>
-            <span class="text-[10px] text-slate-400 font-normal">已自动联动模型与推理级别</span>
-          </label>
-          <textarea id="req-body" rows="6" class="w-full bg-slate-900 font-mono text-xs border border-slate-700 rounded-xl p-3 text-cyan-300 focus:outline-none focus:border-cyan-400"></textarea>
-        </div>
-
-        <button onclick="executeApiCall()" id="btn-send" class="w-full py-2.5 rounded-xl font-medium text-sm bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-slate-950 font-bold transition shadow-lg shadow-cyan-500/20 flex items-center justify-center gap-2">
-          <i class="fa-solid fa-paper-plane"></i> 发送请求 (Send Request)
-        </button>
-      </div>
-
-      <!-- 响应输出区 -->
-      <div class="lg:col-span-6 flex flex-col space-y-2">
-        <div class="flex items-center justify-between">
-          <span class="text-xs font-semibold text-slate-300 uppercase">响应结果 (Response)</span>
-          <div class="flex items-center gap-2">
-            <span id="resp-status" class="text-xs px-2 py-0.5 rounded font-mono hidden">200 OK</span>
-            <span id="resp-time" class="text-xs text-slate-400 font-mono">耗时: 0ms</span>
-          </div>
-        </div>
-        <pre id="resp-output" class="flex-1 bg-slate-900 border border-slate-800 rounded-xl p-4 text-xs font-mono text-emerald-400 overflow-auto min-h-[260px] max-h-[380px]">点击左侧「发送请求」发起调用，结果将展示在此处...</pre>
-      </div>
-    </section>
-
-    <!-- 4. 详细 API 接口列表与规范 -->
-    <section class="glass-card rounded-2xl p-6 shadow-xl space-y-4">
-      <div class="flex items-center justify-between">
-        <div>
-          <h2 class="text-lg font-bold text-slate-100 flex items-center gap-2">
-            <i class="fa-solid fa-list-check text-emerald-400"></i> 完整 API 接口清单
-          </h2>
-          <p class="text-xs text-slate-400">基于 OpenAPI 规范提供的企业级模块化接口定义</p>
-        </div>
-        <span class="text-xs text-slate-400">总计 16 个标准化端点</span>
-      </div>
-
-      <div class="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
-        <!-- Gemini 组 -->
-        <div class="bg-slate-900/60 p-4 rounded-xl border border-slate-800 space-y-2.5">
-          <div class="font-bold text-amber-300 text-sm flex items-center gap-1.5">
-            <i class="fa-solid fa-brain"></i> Google Gemini 多账号统一池
-          </div>
-          <div class="space-y-1.5 font-mono">
-            <div class="flex items-center gap-2"><span class="px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-300 font-bold">GET</span> <span>/api/gemini/accounts</span></div>
-            <div class="flex items-center gap-2"><span class="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold">POST</span> <span>/api/gemini/chat</span></div>
-            <div class="flex items-center gap-2"><span class="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold">POST</span> <span>/api/gemini/accounts/{id}/check</span></div>
-            <div class="flex items-center gap-2"><span class="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold">POST</span> <span>/api/gemini/accounts/{id}/rotate</span></div>
-            <div class="flex items-center gap-2"><span class="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold">POST</span> <span>/api/gemini/refresh</span></div>
-            <div class="flex items-center gap-2"><span class="px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-300 font-bold">GET</span> <span>/api/gemini/requests</span></div>
-          </div>
-        </div>
-
-        <!-- OpenAI 兼容与系统组 -->
-        <div class="bg-slate-900/60 p-4 rounded-xl border border-slate-800 space-y-2.5">
-          <div class="font-bold text-emerald-300 text-sm flex items-center gap-1.5">
-            <i class="fa-solid fa-network-wired"></i> OpenAI 兼容 & 系统接口
-          </div>
-          <div class="space-y-1.5 font-mono">
-            <div class="flex items-center gap-2"><span class="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold">POST</span> <span>/v1/chat/completions</span></div>
-            <div class="flex items-center gap-2"><span class="px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-300 font-bold">GET</span> <span>/v1/models</span></div>
-            <div class="flex items-center gap-2"><span class="px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-300 font-bold">GET</span> <span>/api/system/overview</span></div>
-            <div class="flex items-center gap-2"><span class="px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-300 font-bold">GET</span> <span>/api/hub/status</span></div>
-            <div class="flex items-center gap-2"><span class="px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-300 font-bold">GET</span> <span>/api/hub/cookies</span></div>
-          </div>
-        </div>
-
-        <!-- 外部 Web 业务组 -->
-        <div class="bg-slate-900/60 p-4 rounded-xl border border-slate-800 space-y-2.5 md:col-span-2">
-          <div class="font-bold text-cyan-300 text-sm flex items-center gap-1.5">
-            <i class="fa-solid fa-globe"></i> ChatGPT Web / Bilibili / 百度网盘 / Suno AI 音乐
-          </div>
-          <div class="grid grid-cols-1 md:grid-cols-4 gap-2 font-mono">
-            <div>
-              <div class="text-slate-400 font-semibold mb-1">ChatGPT Web 桥接:</div>
-              <div class="flex items-center gap-1.5"><span class="px-1 py-0.5 rounded bg-blue-500/20 text-blue-300 font-bold">GET</span> /api/chatgpt/session</div>
-              <div class="flex items-center gap-1.5"><span class="px-1 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold">POST</span> /api/chatgpt/chat</div>
-            </div>
-            <div>
-              <div class="text-slate-400 font-semibold mb-1">Bilibili 视频特权:</div>
-              <div class="flex items-center gap-1.5"><span class="px-1 py-0.5 rounded bg-blue-500/20 text-blue-300 font-bold">GET</span> /api/bilibili/user</div>
-              <div class="flex items-center gap-1.5"><span class="px-1 py-0.5 rounded bg-blue-500/20 text-blue-300 font-bold">GET</span> /api/bilibili/video</div>
-            </div>
-            <div>
-              <div class="text-slate-400 font-semibold mb-1">百度网盘免密:</div>
-              <div class="flex items-center gap-1.5"><span class="px-1 py-0.5 rounded bg-blue-500/20 text-blue-300 font-bold">GET</span> /api/baidupan/quota</div>
-              <div class="flex items-center gap-1.5"><span class="px-1 py-0.5 rounded bg-blue-500/20 text-blue-300 font-bold">GET</span> /api/baidupan/files</div>
-            </div>
-            <div>
-              <div class="text-slate-400 font-semibold mb-1">Suno AI 音乐生成:</div>
-              <div class="flex items-center gap-1.5"><span class="px-1 py-0.5 rounded bg-blue-500/20 text-blue-300 font-bold">GET</span> /api/suno/quota</div>
-              <div class="flex items-center gap-1.5"><span class="px-1 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold">POST</span> /api/suno/generate</div>
-            </div>
-          </div>
-        </div>
-      </div>
-    </section>
-
-  </main>
-
-  <script>
-    const TEMPLATES = {
-      gemini_chat: {
-        method: "POST",
-        url: "/api/gemini/chat",
-        body: JSON.stringify({ prompt: "请用一句话告诉我：量子纠缠是什么？", model: "gemini-3.5-flash-lite", reasoning_level: "off", timeout: 60 }, null, 2)
-      },
-      openai_chat: {
-        method: "POST",
-        url: "/v1/chat/completions",
-        body: JSON.stringify({ model: "gemini-3.5-flash-lite", messages: [{ role: "user", content: "请只回复两个字母：OK。" }], reasoning_level: "off" }, null, 2)
-      },
-      gemini_accounts: {
-        method: "GET",
-        url: "/api/gemini/accounts",
-        body: ""
-      },
-      sync_profiles: {
-        method: "POST",
-        url: "/api/gemini/accounts/sync-profiles",
-        body: "{}"
-      },
-      hub_status: {
-        method: "GET",
-        url: "/api/hub/status",
-        body: ""
-      },
-      hub_cookies: {
-        method: "GET",
-        url: "/api/hub/cookies?domain=google.com",
-        body: ""
-      },
-      bili_user: {
-        method: "GET",
-        url: "/api/bilibili/user",
-        body: ""
-      },
-      baidu_quota: {
-        method: "GET",
-        url: "/api/baidupan/quota",
-        body: ""
-      },
-      chatgpt_status: {
-        method: "GET",
-        url: "/api/chatgpt/status",
-        body: ""
-      },
-      chatgpt_models: {
-        method: "GET",
-        url: "/api/chatgpt/models",
-        body: ""
-      },
-      chatgpt_accounts: {
-        method: "GET",
-        url: "/api/chatgpt/accounts",
-        body: ""
-      },
-      chatgpt_sync: {
-        method: "POST",
-        url: "/api/chatgpt/accounts/sync-browser",
-        body: ""
-      },
-      chatgpt_chat: {
-        method: "POST",
-        url: "/api/chatgpt/chat",
-        body: JSON.stringify({
-          prompt: "请用幽默风趣的一句话自我介绍，并确认你已连接成功！",
-          model: "auto"
-        }, null, 2)
-      },
-      chatgpt_image: {
-        method: "POST",
-        url: "/api/chatgpt/image",
-        body: JSON.stringify({
-          prompt: "一只戴着宇航头盔的橙色猫咪在火星表面漫步，水彩插画风格，柔和光影",
-          model: "gpt-image-2",
-          n: 1,
-          response_format: "b64_json"
-        }, null, 2)
-      },
-      openai_image: {
-        method: "POST",
-        url: "/v1/images/generations",
-        body: JSON.stringify({
-          prompt: "一只赛博朋克风格的机械水母，发光透明触须，深海背景，8k超清",
-          model: "gpt-image-2",
-          n: 1
-        }, null, 2)
-      },
-      chatgpt_session: {
-        method: "GET",
-        url: "/api/chatgpt/session",
-        body: ""
-      },
-      suno_quota: {
-        method: "GET",
-        url: "/api/suno/quota",
-        body: ""
-      },
-      suno_feed: {
-        method: "GET",
-        url: "/api/suno/feed?page=1",
-        body: ""
-      },
-      suno_gen: {
-        method: "POST",
-        url: "/api/suno/generate",
-        body: JSON.stringify({
-          prompt: "一段欢快阳光的夏日流行海滩音乐，带有原声吉他和轻快的鼓点",
-          is_custom: false,
-          model: "chirp-v3-5",
-          wait: false
-        }, null, 2)
-      },
-      suno_lyrics: {
-        method: "POST",
-        url: "/api/suno/lyrics",
-        body: JSON.stringify({
-          prompt: "关于海风、阳光与夏天恋爱的流行歌词"
-        }, null, 2)
-      }
-    };
-
-    function onModelOrReasoningChange() {
-      const baseModel = document.getElementById("model-selector").value;
-      const reasoning = document.getElementById("reasoning-selector").value;
-      const bodyEl = document.getElementById("req-body");
-      if (!bodyEl || !bodyEl.value) return;
-
-      try {
-        const data = JSON.parse(bodyEl.value);
-        let targetModel = baseModel;
-        if (baseModel.startsWith("gemini")) {
-          let raw = baseModel.replace("-thinking-medium", "").replace("-thinking", "").replace("-thinking-lite", "");
-          if (reasoning === "high") {
-            if (raw === "gemini-4-argon") targetModel = "gemini-4-argon-thinking";
-            else if (raw === "gemini-3.8-flash" || raw === "gemini-3.7-flash") targetModel = "gemini-3.8-flash-thinking";
-            else targetModel = raw + "-thinking";
-          } else if (reasoning === "medium") {
-            if (raw === "gemini-4-argon") targetModel = "gemini-4-argon-thinking-medium";
-            else if (raw === "gemini-3.6-flash") targetModel = "gemini-3.6-flash-thinking";
-            else targetModel = raw;
-          } else {
-            targetModel = raw;
-          }
-        }
-
-        data.model = targetModel;
-        data.reasoning_level = reasoning;
-        bodyEl.value = JSON.stringify(data, null, 2);
-      } catch (e) {}
-    }
-
-    function switchApiTemplate() {
-      const key = document.getElementById("api-selector").value;
-      const t = TEMPLATES[key];
-      if (!t) return;
-      document.getElementById("req-method-badge").innerText = t.method;
-      document.getElementById("req-endpoint").value = t.url;
-      const container = document.getElementById("req-body-container");
-      const controlsGrid = document.getElementById("model-controls-grid");
-
-      if (t.method === "GET") {
-        container.style.display = "none";
-        if (controlsGrid) controlsGrid.style.display = "none";
-      } else {
-        container.style.display = "block";
-        document.getElementById("req-body").value = t.body;
-        // 仅对对话类请求展示模型与推理级别组合框
-        if (key === "gemini_chat" || key === "openai_chat") {
-          if (controlsGrid) controlsGrid.style.display = "grid";
-          try {
-            const data = JSON.parse(t.body);
-            if (data.model && document.getElementById("model-selector")) {
-              let m = data.model;
-              if (m.endsWith("-thinking")) m = m.replace("-thinking", "");
-              if (m.endsWith("-thinking-medium")) m = m.replace("-thinking-medium", "");
-              document.getElementById("model-selector").value = m;
-            }
-            if (data.reasoning_level && document.getElementById("reasoning-selector")) {
-              document.getElementById("reasoning-selector").value = data.reasoning_level;
-            }
-          } catch (e) {}
-        } else {
-          if (controlsGrid) controlsGrid.style.display = "none";
-        }
-      }
-    }
-
-    async function executeApiCall() {
-      const btn = document.getElementById("btn-send");
-      const method = document.getElementById("req-method-badge").innerText;
-      const endpoint = document.getElementById("req-endpoint").value;
-      const out = document.getElementById("resp-output");
-      const statusSpan = document.getElementById("resp-status");
-      const timeSpan = document.getElementById("resp-time");
-
-      btn.disabled = true;
-      btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> 正在调用...`;
-      out.innerText = "请求发送中，等待响应...";
-
-      const t0 = performance.now();
-      try {
-        const opts = { method: method, headers: { "Content-Type": "application/json" } };
-        if (method === "POST") {
-          opts.body = document.getElementById("req-body").value;
-        }
-        const resp = await fetch(endpoint, opts);
-        const took = Math.round(performance.now() - t0);
-        timeSpan.innerText = `耗时: ${took}ms`;
-        statusSpan.classList.remove("hidden");
-        statusSpan.innerText = `${resp.status} ${resp.statusText}`;
-        if (resp.ok) {
-          statusSpan.className = "text-xs px-2 py-0.5 rounded font-mono bg-emerald-500/20 text-emerald-400";
-        } else {
-          statusSpan.className = "text-xs px-2 py-0.5 rounded font-mono bg-rose-500/20 text-rose-400";
-        }
-        const data = await resp.json();
-        out.innerText = JSON.stringify(data, null, 2);
-      } catch (err) {
-        timeSpan.innerText = `失败`;
-        statusSpan.innerText = "Error";
-        statusSpan.className = "text-xs px-2 py-0.5 rounded font-mono bg-rose-500/20 text-rose-400";
-        out.innerText = "调用异常: " + err.message;
-      } finally {
-        btn.disabled = false;
-        btn.innerHTML = `<i class="fa-solid fa-paper-plane"></i> 发送请求 (Send Request)`;
-      }
-    }
-
-    async function refreshDashboard() {
-      const icon = document.getElementById("refresh-icon");
-      icon.classList.add("fa-spin");
-
-      try {
-        // 1. 系统概览
-        const sysRes = await fetch("/api/system/overview");
-        if (sysRes.ok) {
-          const sys = await sysRes.json();
-          document.getElementById("uptime-text").innerText = `${Math.round(sys.uptime_seconds / 60)}m`;
-          const hubOk = sys.services.cookie_hub.extension_connected;
-          document.getElementById("hub-status-text").innerHTML = hubOk
-            ? `<span class="inline-block w-2.5 h-2.5 rounded-full bg-emerald-400"></span> 扩展已连接`
-            : `<span class="inline-block w-2.5 h-2.5 rounded-full bg-rose-400"></span> 扩展未连接`;
-          document.getElementById("hub-clients").innerText = `客户端: ${sys.services.cookie_hub.clients}`;
-          document.getElementById("gemini-status-text").innerText = `${sys.services.gemini_pool.active_accounts} 账号就绪`;
-        }
-
-        // 2. 账号列表 (真实名称、邮箱与 5小时/周额度双指标展示)
-        const acctRes = await fetch("/api/gemini/accounts");
-        if (acctRes.ok) {
-          const data = await acctRes.json();
-          const tbody = document.getElementById("accounts-tbody");
-          tbody.innerHTML = "";
-          (data.accounts || []).forEach(a => {
-            const tr = document.createElement("tr");
-            tr.className = "hover:bg-slate-900/40 transition";
-            const lastUsed = a.last_used_at > 0 ? new Date(a.last_used_at * 1000).toLocaleTimeString() : "从未调用";
-            
-            // 头像与初始字符
-            const displayName = a.name ? a.name : (a.label || `账号槽位 u/${a.auth_user}`);
-            const displayEmail = a.email ? a.email : '未解析邮箱';
-            const initialChar = (displayName || displayEmail || 'G').trim().charAt(0).toUpperCase();
-
-            // 5小时与周额度渲染
-            const q5hUsed = a.quota_5h_used !== undefined ? a.quota_5h_used : 0;
-            const q5hLimit = a.quota_5h_limit || 50;
-            const q5hRemaining = a.quota_5h_remaining !== undefined ? a.quota_5h_remaining : (q5hLimit - q5hUsed);
-            const q5hReset = a.quota_5h_reset_str || "滚动重置就绪";
-
-            const qWeekUsed = a.quota_weekly_used !== undefined ? a.quota_weekly_used : 0;
-            const qWeekLimit = a.quota_weekly_limit || 500;
-            const qStatus = a.quota_status || "充裕 🟢";
-
-            tr.innerHTML = `
-              <td class="py-3 px-3 font-mono text-cyan-400 font-bold">#${a.id}</td>
-              <td class="py-3 px-4">
-                <div class="flex items-center gap-2.5">
-                  <div class="w-8 h-8 rounded-full bg-gradient-to-tr from-amber-500 to-indigo-600 flex items-center justify-center text-xs font-bold text-white shadow-md shadow-indigo-500/20 shrink-0">
-                    ${initialChar}
-                  </div>
-                  <div>
-                    <div class="font-semibold text-slate-100 flex items-center gap-1.5">
-                      <span>${displayName}</span>
-                      <span class="text-[10px] px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300 font-mono">u/${a.auth_user}</span>
-                    </div>
-                    <div class="text-xs text-slate-400 font-mono flex items-center gap-1.5 mt-0.5">
-                      <i class="fa-regular fa-envelope text-[11px] text-cyan-400"></i> ${displayEmail}
-                    </div>
-                  </div>
-                </div>
-              </td>
-              <td class="py-3 px-3 text-xs font-mono text-slate-400">u/${a.auth_user}</td>
-              <td class="py-3 px-4">
-                <div class="space-y-1">
-                  <div class="flex items-center gap-1.5">
-                    <span class="px-2 py-0.5 rounded text-xs font-bold bg-amber-500/20 text-amber-300 border border-amber-500/30">已用: ${q5hUsed}/${q5hLimit}</span>
-                    <span class="text-[11px] text-slate-400 font-mono">余 ${q5hRemaining}</span>
-                  </div>
-                  <div class="text-[11px] text-slate-400 font-mono flex items-center gap-1">
-                    <i class="fa-regular fa-clock text-slate-500 text-[10px]"></i> ${q5hReset}
-                  </div>
-                </div>
-              </td>
-              <td class="py-3 px-4">
-                <div class="space-y-1">
-                  <div class="flex items-center gap-1.5">
-                    <span class="px-2 py-0.5 rounded text-xs font-bold bg-sky-500/20 text-sky-300 border border-sky-500/30">周累计: ${qWeekUsed}/${qWeekLimit}</span>
-                  </div>
-                  <div class="text-[11px] font-mono text-emerald-400 flex items-center gap-1">
-                    <span class="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400"></span> ${qStatus}
-                  </div>
-                </div>
-              </td>
-              <td class="py-3 px-3"><span class="px-2 py-0.5 rounded text-xs font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">可用 (LRU)</span></td>
-              <td class="py-3 px-3 text-right space-x-1">
-                <button onclick="checkAccount(${a.id})" class="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-slate-300 border border-slate-700 transition">检测</button>
-                <button onclick="rotateAccount(${a.id})" class="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-amber-400 border border-slate-700 transition">保活</button>
-              </td>
-            `;
-            tbody.appendChild(tr);
-          });
-        }
-      } catch (e) {
-        console.error("刷新失败:", e);
-      } finally {
-        icon.classList.remove("fa-spin");
-      }
-    }
-
-    async function syncProfiles() {
-      const btn = document.getElementById("btn-sync-profiles");
-      btn.disabled = true;
-      btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> 正在提取 Google 用户名与邮箱...`;
-      try {
-        const res = await fetch("/api/gemini/accounts/sync-profiles", { method: "POST" });
-        const data = await res.json();
-        alert(data.message || "账号真实用户名与邮箱已同步！");
-        await refreshDashboard();
-      } catch (err) {
-        alert("同步异常: " + err.message);
-      } finally {
-        btn.disabled = false;
-        btn.innerHTML = `<i class="fa-solid fa-id-card"></i> 同步真实名称与邮箱`;
-      }
-    }
-
-    async function checkAccount(id) {
-      alert("正在向 Google 验证账号 #" + id + " 凭证，请稍候...");
-      const res = await fetch(`/api/gemini/accounts/${id}/check`, { method: "POST" });
-      const data = await res.json();
-      alert("检测结论: " + JSON.stringify(data));
-      refreshDashboard();
-    }
-
-    async function rotateAccount(id) {
-      alert("正在为账号 #" + id + " 申请令牌保活，请稍候...");
-      const res = await fetch(`/api/gemini/accounts/${id}/rotate`, { method: "POST" });
-      const data = await res.json();
-      alert("保活结果: " + JSON.stringify(data));
-      refreshDashboard();
-    }
-
-    async function refreshAllCookies() {
-      if (!confirm("确认从当前浏览器 Cookie Hub 重新提取 Google 全量会话凭证？")) return;
-      const res = await fetch("/api/gemini/refresh", { method: "POST" });
-      const data = await res.json();
-      alert("更新成功！" + data.message);
-      refreshDashboard();
-    }
-
-    // 初始化
-    switchApiTemplate();
-    refreshDashboard();
-    setInterval(refreshDashboard, 15000); // 15秒自动刷新一次
-  </script>
-</body>
-</html>
-"""
+from dashboard_template import DASHBOARD_HTML
 
 
 @app.get("/", response_class=HTMLResponse, summary="Web 管理控制台", tags=["系统管理"])
