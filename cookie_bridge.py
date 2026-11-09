@@ -31,7 +31,7 @@ class CookieBridge:
         resp = self.session.get(
             f"{self.bridge_url}/cookies",
             params={"domain": domain, "format": "header"},
-            timeout=5
+            timeout=15
         )
         resp.raise_for_status()
         return resp.text.strip()
@@ -41,14 +41,14 @@ class CookieBridge:
         resp = self.session.get(
             f"{self.bridge_url}/cookies",
             params={"domain": domain, "format": "json"},
-            timeout=5
+            timeout=15
         )
         resp.raise_for_status()
         return resp.json()
 
     def get_active_tab_cookies(self) -> Dict[str, Any]:
         """获取浏览器当前前台活动标签页的完整 Cookie"""
-        resp = self.session.get(f"{self.bridge_url}/active", timeout=5)
+        resp = self.session.get(f"{self.bridge_url}/active", timeout=15)
         resp.raise_for_status()
         return resp.json()
 

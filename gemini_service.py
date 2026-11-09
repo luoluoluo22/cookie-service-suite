@@ -171,7 +171,7 @@ class MultiAccountGeminiPool:
         """从 Cookie Hub 提取组装 Google 必要会话鉴权串。"""
         url = f"{self.bridge.bridge_url}/cookies?domain=google.com"
         try:
-            with _LOCAL_OPENER.open(url, timeout=5) as resp:
+            with _LOCAL_OPENER.open(url, timeout=15) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 cookies = data.get("cookies", [])
         except Exception as e:

@@ -305,6 +305,7 @@ def gemini_chat(req: ChatRequest):
             prompt=req.prompt, model=req.model, reasoning_level=reasoning, timeout=req.timeout
         )
     except Exception as first_err:
+        print(f"⚠️ [Gemini Chat] 首次调度异常: {first_err}，尝试通过 Cookie Hub 自动刷新凭证自愈...", flush=True)
         # 自动故障自愈：从 Cookie Hub 刷新凭证后重试一次
         try:
             gemini_pool.refresh_pool_cookies()
@@ -312,7 +313,8 @@ def gemini_chat(req: ChatRequest):
                 prompt=req.prompt, model=req.model, reasoning_level=reasoning, timeout=req.timeout
             )
         except Exception as retry_err:
-            raise HTTPException(status_code=502, detail=f"Gemini 调度调用失败 (自愈重试后仍失败): {str(retry_err)}")
+            detail_msg = f"Gemini 调度调用失败: {first_err} (自愈重试亦未成功: {retry_err})"
+            raise HTTPException(status_code=502, detail=detail_msg)
 
     return {
         "success": True,
