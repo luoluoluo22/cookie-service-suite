@@ -300,17 +300,26 @@ def gemini_chat(req: ChatRequest):
         gemini_pool.start()
 
     reasoning = req.reasoning_level or "off"
+    model_name = (req.model or "gemini-3.5-flash-lite").lower().strip()
+    # 动态适配充足安全超时时间：根据模型复杂度智能调整下限，避免因客户端超时过短切断连接
+    if any(m in model_name for m in ["3.8", "3.6", "4-", "pro", "thinking"]):
+        min_timeout = 600
+    else:
+        min_timeout = 180
+    effective_timeout = max(req.timeout or min_timeout, min_timeout)
+
     try:
         res = gemini_pool.ask_with_details(
-            prompt=req.prompt, model=req.model, reasoning_level=reasoning, timeout=req.timeout
+            prompt=req.prompt, model=req.model, reasoning_level=reasoning, timeout=effective_timeout
         )
     except Exception as first_err:
-        print(f"⚠️ [Gemini Chat] 首次调度异常: {first_err}，尝试通过 Cookie Hub 自动刷新凭证自愈...", flush=True)
-        # 自动故障自愈：从 Cookie Hub 刷新凭证后重试一次
+        print(f"⚠️ [Gemini Chat] 首次调度异常: {first_err}，尝试自愈（重置代理熔断 + 从 Cookie Hub 刷新凭证）后重试...", flush=True)
+        # 自动故障自愈：重置代理熔断计数 + 刷新最新 Cookie 凭证后重试一次
         try:
+            gemini_pool.reset_proxies()
             gemini_pool.refresh_pool_cookies()
             res = gemini_pool.ask_with_details(
-                prompt=req.prompt, model=req.model, reasoning_level=reasoning, timeout=req.timeout
+                prompt=req.prompt, model=req.model, reasoning_level=reasoning, timeout=effective_timeout
             )
         except Exception as retry_err:
             detail_msg = f"Gemini 调度调用失败: {first_err} (自愈重试亦未成功: {retry_err})"

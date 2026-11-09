@@ -607,7 +607,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     // 36 个 API 端点完整定义 (按平台精细化归属)
     const ALL_ENDPOINTS = [
       // 1. Google Gemini (7)
-      { id: "gemini_chat", category: "gemini", method: "POST", url: "/api/gemini/chat", name: "Gemini 智能对话", desc: "4账号 LRU 自动轮换，支持模型切换与思考链推理级别", body: { prompt: "请用一句话告诉我：量子纠缠是什么？", model: "gemini-3.5-flash-lite", reasoning_level: "off", timeout: 60 } },
+      { id: "gemini_chat", category: "gemini", method: "POST", url: "/api/gemini/chat", name: "Gemini 智能对话", desc: "4账号 LRU 自动轮换，支持模型切换与思考链推理级别", body: { prompt: "请用一句话告诉我：量子纠缠是什么？", model: "gemini-3.5-flash-lite", reasoning_level: "off", timeout: 300 } },
       { id: "gemini_accounts", category: "gemini", method: "GET", url: "/api/gemini/accounts", name: "Gemini 4账号状态与额度", desc: "查看 4 个 Google 账号状态、5小时与每周计算配额、健康度", body: null },
       { id: "gemini_sync_profiles", category: "gemini", method: "POST", url: "/api/gemini/accounts/sync-profiles", name: "同步 Google 真实昵称邮箱", desc: "向 Google 上游拉取各 authuser 对应的真实用户显示昵称与 Gmail 邮箱", body: {} },
       { id: "gemini_check", category: "gemini", method: "POST", url: "/api/gemini/accounts/1/check", name: "检测账号凭证健康度", desc: "向 Google 上游验证指定账号 (如 #1) 会话有效性并更新健康状态", body: {} },

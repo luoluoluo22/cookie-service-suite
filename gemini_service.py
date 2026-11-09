@@ -276,6 +276,10 @@ class MultiAccountGeminiPool:
             "default_model": "gemini-3.5-flash-lite",
             "proxy": self.proxy,
             "log_requests": True,
+            "request_timeout_sec": 600,
+            "proxy_cooldown_min": 1,
+            "retry_attempts": 3,
+            "retry_delay_sec": 2,
         }
         with open(self.config_path, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=2)
@@ -655,8 +659,36 @@ class MultiAccountGeminiPool:
         with _LOCAL_OPENER.open(req, timeout=15) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
+    def reset_proxies(self) -> bool:
+        """重置所有代理的熔断与失败计数器，确保不会因偶发超时被锁定。"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.execute("UPDATE proxies SET fail_count=0, last_error=''")
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+        if self.is_running():
+            try:
+                url = f"http://127.0.0.1:{self.port}/admin/api/proxies/1/reset"
+                req = urllib.request.Request(
+                    url,
+                    data=b"{}",
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": "Bearer admin_gemini_pool",
+                    },
+                )
+                with _LOCAL_OPENER.open(req, timeout=5) as resp:
+                    pass
+            except Exception:
+                pass
+        return True
+
     def refresh_pool_cookies(self) -> str:
         """从前台 Cookie Hub 重新拉取最新凭证并更新多账号数据库。"""
+        self.reset_proxies()
         cookie_str = self._extract_cookie_header()
         conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
@@ -664,6 +696,7 @@ class MultiAccountGeminiPool:
             "UPDATE accounts SET cookie=?, status='enabled', fail_count=0 WHERE status!='deleted'",
             (cookie_str,),
         )
+        cur.execute("UPDATE proxies SET fail_count=0, last_error=''")
         conn.commit()
         conn.close()
         return cookie_str
