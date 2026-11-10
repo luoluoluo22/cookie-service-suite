@@ -289,6 +289,28 @@ def sync_gemini_profiles():
         raise HTTPException(status_code=500, detail=f"同步昵称邮箱失败: {str(e)}")
 
 
+def is_upstream_refusal(text: Optional[str]) -> bool:
+    """检测 Google Gemini 网页端返回的是否为通用拒绝文案而非真正成稿。"""
+    if not text:
+        return False
+    blob = text.strip().lower()
+    if len(blob) > 200:
+        return False
+    refusal_keywords = [
+        "我无法提供这方面的帮助，因为我只是一个语言模型",
+        "我只是一个语言模型，理解不了这个问题",
+        "我无法提供这方面的帮助",
+        "我只是一个语言模型",
+        "cannot fulfill this request",
+        "can't fulfill this request",
+        "i am unable to help with that as i am only a language model",
+        "i'm unable to help with that as i am only a language model",
+        "cannot help with that as i am only a language model",
+        "can't help with that as i am only a language model",
+    ]
+    return any(k in blob for k in refusal_keywords)
+
+
 @app.post("/api/gemini/chat", summary="向 Gemini 发起提问 (自动 LRU 负载均衡轮换)", tags=["Gemini 多账号调度"])
 def gemini_chat(req: ChatRequest):
     """
@@ -312,8 +334,13 @@ def gemini_chat(req: ChatRequest):
         res = gemini_pool.ask_with_details(
             prompt=req.prompt, model=req.model, reasoning_level=reasoning, timeout=effective_timeout
         )
+        # 拦截上游软拒绝（如"我无法提供这方面的帮助，因为我只是一个语言模型"），自动触发轮换换号重试
+        if is_upstream_refusal(res.get("reply")):
+            refusal_text = res.get("reply")
+            print(f"⚠️ [Gemini Chat] 账号 {res.get('account_label')} 返回通用拒绝文案: '{refusal_text}'，自动切换下一个账号重试...", flush=True)
+            raise RuntimeError(f"Google 上游会话软拒绝: {refusal_text}")
     except Exception as first_err:
-        print(f"⚠️ [Gemini Chat] 首次调度异常: {first_err}，尝试自愈（重置代理熔断 + 从 Cookie Hub 刷新凭证）后重试...", flush=True)
+        print(f"⚠️ [Gemini Chat] 调度异常: {first_err}，尝试自愈并轮换至下一账号重试...", flush=True)
         # 自动故障自愈：重置代理熔断计数 + 刷新最新 Cookie 凭证后重试一次
         try:
             gemini_pool.reset_proxies()
@@ -321,6 +348,12 @@ def gemini_chat(req: ChatRequest):
             res = gemini_pool.ask_with_details(
                 prompt=req.prompt, model=req.model, reasoning_level=reasoning, timeout=effective_timeout
             )
+            # 若重试仍然返回通用拒绝，再次尝试轮换
+            if is_upstream_refusal(res.get("reply")):
+                print(f"⚠️ [Gemini Chat] 账号 {res.get('account_label')} 依然返回拒绝，发起备用轮转...", flush=True)
+                res = gemini_pool.ask_with_details(
+                    prompt=req.prompt, model=req.model, reasoning_level=reasoning, timeout=effective_timeout
+                )
         except Exception as retry_err:
             detail_msg = f"Gemini 调度调用失败: {first_err} (自愈重试亦未成功: {retry_err})"
             raise HTTPException(status_code=502, detail=detail_msg)
