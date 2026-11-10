@@ -7,8 +7,9 @@
   "impersonate": "chrome_146",
   "default_model": "gemini-3.5-flash-lite",
   "proxy": "http://127.0.0.1:7897",
+  "web_channel": false,
   "log_requests": true,
-  "request_timeout_sec": 600,
+  "request_timeout_sec": 120,
   "proxy_cooldown_min": 1,
   "retry_attempts": 3,
   "retry_delay_sec": 2

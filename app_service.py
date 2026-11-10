@@ -81,7 +81,7 @@ START_TIME = datetime.datetime.now()
 # ==========================================
 class ChatRequest(BaseModel):
     prompt: str = Field(..., description="提问正文或指令内容", example="量子纠缠的基本原理是什么？")
-    model: Optional[str] = Field("gemini-3.8-flash", description="模型名称 (gemini-3.8-flash, gemini-3.6-flash, gemini-4-argon 等)", example="gemini-3.8-flash")
+    model: Optional[str] = Field("gemini-3.5-flash-lite", description="模型名称 (gemini-3.5-flash-lite, gemini-3.6-flash, gemini-3.1-pro 等)", example="gemini-3.5-flash-lite")
     reasoning_level: Optional[str] = Field("off", description="推理级别: 'off'(关闭思考/极速), 'medium'(中等推理), 'high'(深度扩展思考)", example="off")
     stream: Optional[bool] = Field(True, description="是否启用实时流式输出 (SSE)，默认为 True (首字秒出)", example=True)
     timeout: Optional[int] = Field(300, description="请求超时时间 (秒)，默认 300 秒", example=300)
@@ -111,7 +111,7 @@ class OpenAIMessage(BaseModel):
 
 
 class OpenAIChatRequest(BaseModel):
-    model: Optional[str] = Field("gemini-3.8-flash", example="gemini-3.8-flash")
+    model: Optional[str] = Field("gemini-3.5-flash-lite", example="gemini-3.5-flash-lite")
     messages: List[OpenAIMessage] = Field(..., description="对话历史消息列表")
     reasoning_effort: Optional[str] = Field(None, description="OpenAI 兼容推理强度: 'low', 'medium', 'high'", example="medium")
     reasoning_level: Optional[str] = Field(None, description="推理级别: 'off', 'medium', 'high'", example="off")
@@ -323,13 +323,29 @@ def gemini_chat(req: ChatRequest):
         gemini_pool.start()
 
     reasoning = req.reasoning_level or "off"
-    model_name = (req.model or "gemini-3.5-flash-lite").lower().strip()
+    model_name = (req.model or "gemini-3.8-flash").lower().strip()
     # 动态适配充足安全超时时间：根据模型复杂度智能调整下限，避免因客户端超时过短切断连接
     if any(m in model_name for m in ["3.8", "3.6", "4-", "pro", "thinking"]):
         min_timeout = 600
     else:
         min_timeout = 180
     effective_timeout = max(req.timeout or min_timeout, min_timeout)
+
+    # 1. 默认优先走实时流式输出 (SSE)：首字毫秒级直出，体验与真实网页端一致
+    if req.stream:
+        return StreamingResponse(
+            gemini_pool.stream_chat(
+                prompt=req.prompt, model=req.model, reasoning_level=reasoning, timeout=effective_timeout
+            ),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            }
+        )
+
+    # 2. 非流式聚合调用
 
     try:
         res = gemini_pool.ask_with_details(
@@ -498,8 +514,29 @@ def sync_chatgpt_browser_token():
 
 @app.post("/api/chatgpt/chat", summary="向 ChatGPT 发起智能对话 (支持逆向与桥接双引擎)", tags=["ChatGPT 逆向与号池"])
 def chatgpt_ask(req: ChatRequest):
-    """优先使用无头逆向引擎直连，若未就绪则自动降级到浏览器同源扩展。"""
+    """优先使用无头逆向引擎直连，若未就绪则自动降级到浏览器同源扩展。支持流式与非流式。"""
     try:
+        if req.stream:
+            def _chatgpt_sse_gen():
+                messages = [{"role": "user", "content": req.prompt}]
+                try:
+                    for chunk in chatgpt_client.chat(messages, model=req.model or "auto", stream=True):
+                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                except Exception as e:
+                    err_data = {"error": {"message": str(e), "type": "chatgpt_error"}}
+                    yield f"data: {json.dumps(err_data, ensure_ascii=False)}\n\n"
+
+            return StreamingResponse(
+                _chatgpt_sse_gen(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                }
+            )
+
         reply = chatgpt_client.ask(req.prompt, model=req.model or "auto")
         return {"success": True, "reply": reply}
     except Exception as e:
@@ -746,8 +783,23 @@ def openai_chat_completions(req: OpenAIChatRequest):
         if not gemini_pool.is_running():
             gemini_pool.start()
 
-        target_model = req.model if req.model and "gemini" in req.model else "gemini-3.5-flash-lite"
+        target_model = req.model if req.model and "gemini" in req.model else "gemini-3.8-flash"
         reasoning = req.reasoning_effort or req.reasoning_level or "off"
+        messages_payload = [{"role": m.role, "content": m.content} for m in req.messages]
+
+        if req.stream:
+            return StreamingResponse(
+                gemini_pool.stream_chat_messages(
+                    messages=messages_payload, model=target_model, reasoning_level=reasoning
+                ),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                }
+            )
+
         try:
             res = gemini_pool.ask_with_details(
                 prompt=last_user_msg, model=target_model, reasoning_level=reasoning

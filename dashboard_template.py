@@ -283,6 +283,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               </div>
             </div>
 
+            <!-- 流式实时输出控制开关 -->
+            <div id="stream-toggle-container" class="flex items-center justify-between px-3.5 py-2.5 rounded-xl bg-slate-900/90 border border-slate-800 text-xs shadow-inner">
+              <span class="flex items-center gap-2 text-slate-300 font-medium">
+                <i class="fa-solid fa-bolt text-amber-400"></i> 流式响应 (Streaming)
+                <span class="text-[10px] px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 font-mono">默认开启 · 秒出首字</span>
+              </span>
+              <label class="relative inline-flex items-center cursor-pointer">
+                <input type="checkbox" id="stream-toggle" onchange="onStreamToggleChange()" class="sr-only peer" checked>
+                <div class="w-9 h-5 bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-cyan-500"></div>
+                <span id="stream-toggle-text" class="ml-2 text-xs font-mono text-cyan-300">实时打字 (SSE)</span>
+              </label>
+            </div>
+
             <div class="flex gap-2 items-center">
               <span id="req-method-badge" class="px-2.5 py-1 rounded-lg text-xs font-bold bg-amber-500/20 text-amber-300 border border-amber-500/30 font-mono">POST</span>
               <input type="text" id="req-endpoint" class="flex-1 bg-slate-900 border border-slate-700 rounded-xl px-3 py-1.5 text-xs font-mono text-slate-300 focus:outline-none focus:border-cyan-400" value="/api/gemini/chat">
@@ -607,7 +620,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     // 36 个 API 端点完整定义 (按平台精细化归属)
     const ALL_ENDPOINTS = [
       // 1. Google Gemini (7)
-      { id: "gemini_chat", category: "gemini", method: "POST", url: "/api/gemini/chat", name: "Gemini 智能对话", desc: "4账号 LRU 自动轮换，支持模型切换与思考链推理级别", body: { prompt: "请用一句话告诉我：量子纠缠是什么？", model: "gemini-3.5-flash-lite", reasoning_level: "off", timeout: 300 } },
+      { id: "gemini_chat", category: "gemini", method: "POST", url: "/api/gemini/chat", name: "Gemini 智能对话", desc: "4账号 LRU 自动轮换，支持模型切换与思考链推理级别", body: { prompt: "请用一句话告诉我：量子纠缠是什么？", model: "gemini-3.5-flash-lite", reasoning_level: "off", stream: true, timeout: 300 } },
       { id: "gemini_accounts", category: "gemini", method: "GET", url: "/api/gemini/accounts", name: "Gemini 4账号状态与额度", desc: "查看 4 个 Google 账号状态、5小时与每周计算配额、健康度", body: null },
       { id: "gemini_sync_profiles", category: "gemini", method: "POST", url: "/api/gemini/accounts/sync-profiles", name: "同步 Google 真实昵称邮箱", desc: "向 Google 上游拉取各 authuser 对应的真实用户显示昵称与 Gmail 邮箱", body: {} },
       { id: "gemini_check", category: "gemini", method: "POST", url: "/api/gemini/accounts/1/check", name: "检测账号凭证健康度", desc: "向 Google 上游验证指定账号 (如 #1) 会话有效性并更新健康状态", body: {} },
@@ -616,12 +629,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       { id: "gemini_requests", category: "gemini", method: "GET", url: "/api/gemini/requests?limit=10", name: "请求调度轨迹历史", desc: "查看最近请求调度轨迹与各账号响应延迟历史", body: null },
 
       // 2. OpenAI 兼容规范 (3)
-      { id: "openai_chat", category: "openai", method: "POST", url: "/v1/chat/completions", name: "OpenAI 兼容聊天接口", desc: "无缝对接 NextChat、Chatbox、Cursor，底层分流 Gemini 与 ChatGPT", body: { model: "gemini-3.5-flash-lite", messages: [{ role: "user", content: "请只回复两个字母：OK。" }], reasoning_level: "off" } },
+      { id: "openai_chat", category: "openai", method: "POST", url: "/v1/chat/completions", name: "OpenAI 兼容聊天接口", desc: "无缝对接 NextChat、Chatbox、Cursor，底层分流 Gemini 与 ChatGPT", body: { model: "gemini-3.5-flash-lite", messages: [{ role: "user", content: "请用一句话告诉我：量子纠缠是什么？" }], reasoning_level: "off", stream: true } },
       { id: "openai_image", category: "openai", method: "POST", url: "/v1/images/generations", name: "OpenAI 兼容生图接口", desc: "标准 POST /v1/images/generations，底层路由至 gpt-image-2 / DALL-E 3", body: { prompt: "一只可爱的赛博朋克发光小猫，超高清，8k壁纸", model: "gpt-image-2", n: 1, response_format: "b64_json" } },
       { id: "openai_models", category: "openai", method: "GET", url: "/v1/models", name: "OpenAI 兼容模型列表", desc: "动态聚合逆向模型、页面模拟与谷歌号池所有可用模型", body: null },
 
       // 3. ChatGPT 逆向与号池 (9)
-      { id: "chatgpt_chat", category: "chatgpt", method: "POST", url: "/api/chatgpt/chat", name: "ChatGPT 智能问答", desc: "支持逆向引擎直连与浏览器同源扩展双通道", body: { prompt: "请用幽默风趣的一句话自我介绍！", model: "auto" } },
+      { id: "chatgpt_chat", category: "chatgpt", method: "POST", url: "/api/chatgpt/chat", name: "ChatGPT 智能问答", desc: "支持逆向引擎直连与浏览器同源扩展双通道", body: { prompt: "请用幽默风趣的一句话自我介绍！", model: "auto", stream: true } },
       { id: "chatgpt_image", category: "chatgpt", method: "POST", url: "/api/chatgpt/image", name: "ChatGPT 逆向图片/GIF生成", desc: "基于官方逆向生成高质量图片或代码解释器生成的动图", body: { prompt: "一只戴着宇航头盔的橙色猫咪在火星漫步，水彩插画", model: "gpt-image-2", n: 1, response_format: "b64_json" } },
       { id: "chatgpt_status", category: "chatgpt", method: "GET", url: "/api/chatgpt/status", name: "ChatGPT 服务状态", desc: "检测逆向端口 (18084)、健康度与浏览器桥接状态", body: null },
       { id: "chatgpt_models", category: "chatgpt", method: "GET", url: "/api/chatgpt/models", name: "ChatGPT 可用模型列表", desc: "拉取逆向暴露或支持的模型 (auto, gpt-6, gpt-image-2 等)", body: null },
@@ -937,8 +950,26 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
         if (ep.id === "gemini_chat" || ep.id === "openai_chat" || ep.id === "chatgpt_chat") {
           if (controlsGrid) controlsGrid.style.display = "grid";
+          const streamContainer = document.getElementById("stream-toggle-container");
+          if (streamContainer) streamContainer.style.display = "flex";
+          const streamToggle = document.getElementById("stream-toggle");
+          if (streamToggle) {
+            try {
+              const parsed = JSON.parse(bodyStr);
+              if (parsed && typeof parsed.stream === "boolean") {
+                streamToggle.checked = parsed.stream;
+                const toggleText = document.getElementById("stream-toggle-text");
+                if (toggleText) {
+                  toggleText.innerText = parsed.stream ? "实时打字 (SSE)" : "非流式聚合";
+                  toggleText.className = parsed.stream ? "ml-2 text-xs font-mono text-cyan-300" : "ml-2 text-xs font-mono text-slate-400";
+                }
+              }
+            } catch(e) {}
+          }
         } else {
           if (controlsGrid) controlsGrid.style.display = "none";
+          const streamContainer = document.getElementById("stream-toggle-container");
+          if (streamContainer) streamContainer.style.display = "none";
         }
       }
 
@@ -978,9 +1009,32 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
 
         data.model = targetModel;
-        data.reasoning_level = reasoning;
+        if (data.reasoning_level !== undefined) {
+          data.reasoning_level = reasoning;
+        }
+        const streamToggle = document.getElementById("stream-toggle");
+        if (streamToggle && data.stream !== undefined) {
+          data.stream = streamToggle.checked;
+        }
         bodyEl.value = JSON.stringify(data, null, 2);
       } catch (e) {}
+    }
+
+    function onStreamToggleChange() {
+      const isStream = document.getElementById("stream-toggle").checked;
+      const toggleText = document.getElementById("stream-toggle-text");
+      if (toggleText) {
+        toggleText.innerText = isStream ? "实时打字 (SSE)" : "非流式聚合";
+        toggleText.className = isStream ? "ml-2 text-xs font-mono text-cyan-300" : "ml-2 text-xs font-mono text-slate-400";
+      }
+      const bodyEl = document.getElementById("req-body");
+      if (bodyEl && bodyEl.value) {
+        try {
+          const data = JSON.parse(bodyEl.value);
+          data.stream = isStream;
+          bodyEl.value = JSON.stringify(data, null, 2);
+        } catch (e) {}
+      }
     }
 
     function switchApiTemplate() {
@@ -1028,6 +1082,72 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
 
         const contentType = resp.headers.get("content-type") || "";
+
+        // 1. 支持实时流式 (SSE) 渲染，首字秒级打字机输出
+        if (contentType.includes("text/event-stream") && resp.body) {
+          statusSpan.classList.remove("hidden");
+          statusSpan.innerText = `${resp.status} Streaming`;
+          statusSpan.className = "text-xs px-2 py-0.5 rounded font-mono bg-cyan-500/20 text-cyan-400 animate-pulse";
+          out.innerText = "";
+          
+          const reader = resp.body.getReader();
+          const decoder = new TextDecoder("utf-8");
+          let streamDone = false;
+          let fullText = "";
+          let firstTokenTime = null;
+          let buffer = "";
+
+          while (!streamDone) {
+            const { value, done } = await reader.read();
+            streamDone = done;
+            if (value) {
+              if (firstTokenTime === null) {
+                firstTokenTime = Math.round(performance.now() - t0);
+                timeSpan.innerText = `首字: ${firstTokenTime}ms | 正在流式打字...`;
+              }
+              buffer += decoder.decode(value, { stream: true });
+              const lines = buffer.split("\n");
+              buffer = lines.pop(); // 保留最后一个未闭合的行
+              
+              for (const line of lines) {
+                const trimmed = line.trim();
+                if (!trimmed || trimmed.startsWith("event:")) continue;
+                if (trimmed.startsWith("data: ")) {
+                  const payload = trimmed.substring(6).trim();
+                  if (payload === "[DONE]") {
+                    continue;
+                  }
+                  try {
+                    const parsed = JSON.parse(payload);
+                    const delta = parsed.choices?.[0]?.delta?.content || 
+                                  parsed.choices?.[0]?.delta?.reasoning_content ||
+                                  parsed.delta || parsed.text || parsed.reply || "";
+                    if (delta) {
+                      fullText += delta;
+                      out.innerText = fullText;
+                      out.scrollTop = out.scrollHeight;
+                    }
+                  } catch(e) {
+                    fullText += payload + "\n";
+                    out.innerText = fullText;
+                    out.scrollTop = out.scrollHeight;
+                  }
+                } else if (trimmed) {
+                  fullText += trimmed + "\n";
+                  out.innerText = fullText;
+                  out.scrollTop = out.scrollHeight;
+                }
+              }
+            }
+          }
+          
+          const totalTook = Math.round(performance.now() - t0);
+          timeSpan.innerText = `首字: ${firstTokenTime || 0}ms | 总耗时: ${totalTook}ms`;
+          statusSpan.innerText = "200 OK (流式完成)";
+          statusSpan.className = "text-xs px-2 py-0.5 rounded font-mono bg-emerald-500/20 text-emerald-400";
+          return;
+        }
+
         if (contentType.includes("audio") || contentType.includes("video")) {
           if (audioCard && renderedAudio) {
             renderedAudio.src = endpoint;

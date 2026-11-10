@@ -275,8 +275,9 @@ class MultiAccountGeminiPool:
             "impersonate": "chrome_146",
             "default_model": "gemini-3.5-flash-lite",
             "proxy": self.proxy,
+            "web_channel": False,
             "log_requests": True,
-            "request_timeout_sec": 600,
+            "request_timeout_sec": 120,
             "proxy_cooldown_min": 1,
             "retry_attempts": 3,
             "retry_delay_sec": 2,
@@ -661,9 +662,17 @@ class MultiAccountGeminiPool:
         )
         try:
             resp = _LOCAL_OPENER.open(req, timeout=timeout)
-            for raw_line in resp:
-                line = raw_line.decode("utf-8", errors="replace")
-                yield line
+            buffer = b""
+            while True:
+                chunk = resp.read1(4096)
+                if not chunk:
+                    break
+                buffer += chunk
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    yield line.decode("utf-8", errors="replace") + "\n"
+            if buffer:
+                yield buffer.decode("utf-8", errors="replace") + "\n"
             resp.close()
         except Exception as e:
             err_data = {"error": {"message": str(e), "type": "gemini_stream_error"}}
@@ -699,8 +708,17 @@ class MultiAccountGeminiPool:
         )
         try:
             resp = _LOCAL_OPENER.open(req, timeout=timeout)
-            for raw_line in resp:
-                yield raw_line.decode("utf-8", errors="replace")
+            buffer = b""
+            while True:
+                chunk = resp.read1(4096)
+                if not chunk:
+                    break
+                buffer += chunk
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    yield line.decode("utf-8", errors="replace") + "\n"
+            if buffer:
+                yield buffer.decode("utf-8", errors="replace") + "\n"
             resp.close()
         except Exception as e:
             err_data = {"error": {"message": str(e), "type": "gemini_stream_error"}}
