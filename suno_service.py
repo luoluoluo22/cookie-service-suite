@@ -34,8 +34,8 @@ from cookie_bridge import CookieBridge
 DEFAULT_BRIDGE_URL = "http://127.0.0.1:18888"
 STUDIO_API_URL = "https://studio-api.prod.suno.com"
 CLERK_CLIENT_URL = "https://clerk.suno.com/v1/client?_clerk_js_version=5.15.0"
-CLERK_TOKEN_URL_TMPL = "https://clerk.suno.com/v1/client/sessions/{sid}/tokens/api?_clerk_js_version=5.15.0"
-CLERK_TOKEN_ALT_URL_TMPL = "https://clerk.suno.com/v1/client/sessions/{sid}/tokens?_clerk_js_version=5.15.0"
+CLERK_TOKEN_URL_TMPL = "https://clerk.suno.com/v1/client/sessions/{sid}/tokens?_clerk_js_version=5.15.0"
+CLERK_TOKEN_ALT_URL_TMPL = "https://clerk.suno.com/v1/client/sessions/{sid}/tokens/api?_clerk_js_version=5.15.0"
 
 DEFAULT_PROXY = "http://127.0.0.1:7897"
 DEFAULT_IMPERSONATE = "edge101"
@@ -261,72 +261,99 @@ class SunoService:
     def _exchange_jwt_from_clerk(self) -> str:
         """
         使用 Cookie 向 Clerk 换取用于调用 Suno Studio API 的短效 JWT 访问令牌
+        具备失败自动唤醒与前台浏览器凭证强刷重试机制
         """
-        cookies = self.get_raw_cookies()
-        headers = dict(COMMON_HEADERS)
-        headers["Cookie"] = cookies
+        for exchange_attempt in range(2):
+            cookies = self.get_raw_cookies(force_fetch=(exchange_attempt > 0))
+            headers = dict(COMMON_HEADERS)
+            headers["Cookie"] = cookies
 
-        # 1. 向 Clerk 请求当前活跃 Session
-        resp = self.session.get(
-            CLERK_CLIENT_URL,
-            headers=headers,
-            timeout=20,
-        )
+            # 1. 向 Clerk 请求当前活跃 Session
+            try:
+                resp = self.session.get(
+                    CLERK_CLIENT_URL,
+                    headers=headers,
+                    timeout=20,
+                )
+            except Exception as e:
+                if exchange_attempt == 0:
+                    time.sleep(1)
+                    continue
+                raise
 
-        if resp.status_code != 200:
-            raise RuntimeError(
-                f"Clerk 接口响应异常 (HTTP {resp.status_code}): {resp.text[:300]}"
-            )
+            if resp.status_code != 200:
+                if exchange_attempt == 0:
+                    # 尝试通知浏览器扩展重新唤醒 suno.com 提取最新 Cookie
+                    try:
+                        self.get_raw_cookies(force_fetch=True, auto_visit=True)
+                        continue
+                    except Exception:
+                        pass
+                raise RuntimeError(
+                    f"Clerk 接口响应异常 (HTTP {resp.status_code}): {resp.text[:300]}"
+                )
 
-        try:
-            data = resp.json()
-        except Exception as e:
-            raise RuntimeError(f"Clerk 返回内容非合法 JSON: {resp.text[:300]}") from e
+            try:
+                data = resp.json()
+            except Exception as e:
+                raise RuntimeError(f"Clerk 返回内容非合法 JSON: {resp.text[:300]}") from e
 
-        res_obj = data.get("response", {})
-        sid = res_obj.get("last_active_session_id")
+            res_obj = data.get("response", {})
+            sid = res_obj.get("last_active_session_id")
 
-        if not sid:
-            # 尝试从 sessions 数组中获取首个活跃会话
-            sessions = res_obj.get("sessions", [])
-            for s in sessions:
-                if s.get("status") == "active":
-                    sid = s.get("id")
-                    break
-            if not sid and sessions:
-                sid = sessions[0].get("id")
+            if not sid:
+                # 尝试从 sessions 数组中获取首个活跃会话
+                sessions = res_obj.get("sessions", [])
+                for s in sessions:
+                    if s.get("status") == "active":
+                        sid = s.get("id")
+                        break
+                if not sid and sessions:
+                    sid = sessions[0].get("id")
 
-        if not sid:
-            raise RuntimeError(
-                "未能从 Clerk 解析到活跃会话 (last_active_session_id)！\n"
-                "请检查浏览器中的 Suno 账号是否处于有效登录状态，或尝试在 suno.com 刷新页面。"
-            )
+            if not sid:
+                if exchange_attempt == 0:
+                    try:
+                        self.get_raw_cookies(force_fetch=True, auto_visit=True)
+                        continue
+                    except Exception:
+                        pass
+                raise RuntimeError(
+                    "未能从 Clerk 解析到活跃会话 (last_active_session_id)！\n"
+                    "请检查浏览器中的 Suno 账号是否处于有效登录状态，或尝试在 suno.com 刷新页面。"
+                )
 
-        self.last_sid = sid
+            self.last_sid = sid
 
-        # 2. 向 Clerk 换取 JWT Token
-        token_url = CLERK_TOKEN_URL_TMPL.format(sid=sid)
-        token_resp = self.session.post(token_url, headers=headers, timeout=20)
+            # 2. 向 Clerk 换取 JWT Token
+            token_url = CLERK_TOKEN_URL_TMPL.format(sid=sid)
+            token_resp = self.session.post(token_url, headers=headers, timeout=20)
 
-        # 兼容性重试备用 Token 端点
-        if token_resp.status_code != 200:
-            alt_url = CLERK_TOKEN_ALT_URL_TMPL.format(sid=sid)
-            token_resp = self.session.post(alt_url, headers=headers, timeout=20)
+            # 兼容性重试备用 Token 端点
+            if token_resp.status_code != 200:
+                alt_url = CLERK_TOKEN_ALT_URL_TMPL.format(sid=sid)
+                token_resp = self.session.post(alt_url, headers=headers, timeout=20)
 
-        if token_resp.status_code != 200:
-            raise RuntimeError(
-                f"Clerk JWT Token 兑换失败 (HTTP {token_resp.status_code}): {token_resp.text[:300]}"
-            )
+            if token_resp.status_code != 200:
+                if exchange_attempt == 0:
+                    try:
+                        self.get_raw_cookies(force_fetch=True, auto_visit=True)
+                        continue
+                    except Exception:
+                        pass
+                raise RuntimeError(
+                    f"Clerk JWT Token 兑换失败 (HTTP {token_resp.status_code}): {token_resp.text[:300]}"
+                )
 
-        token_data = token_resp.json()
-        jwt = token_data.get("jwt")
-        if not jwt:
-            raise RuntimeError(f"Clerk 响应未包含 jwt 字段: {token_resp.text}")
+            token_data = token_resp.json()
+            jwt = token_data.get("jwt")
+            if not jwt:
+                raise RuntimeError(f"Clerk 响应未包含 jwt 字段: {token_resp.text}")
 
-        self.jwt_token = jwt
-        # JWT 有效期通常为 60 秒，设定 45 秒本地缓存安全时间
-        self.jwt_expires_at = time.time() + 45
-        return jwt
+            self.jwt_token = jwt
+            # JWT 有效期通常为 60 秒，设定 45 秒本地缓存安全时间
+            self.jwt_expires_at = time.time() + 45
+            return jwt
 
     def ensure_jwt(self, force_refresh: bool = False) -> str:
         """
@@ -389,8 +416,12 @@ class SunoService:
                 time.sleep(1)
                 continue
 
-            # 若遇到 401 Unauthorized，则强制刷新 JWT 令牌并重试一次
+            # 若遇到 401 Unauthorized，则强制刷新 Cookie 与 JWT 令牌并重试一次
             if resp.status_code == 401 and retry == 0:
+                try:
+                    self.get_raw_cookies(force_fetch=True, auto_visit=True)
+                except Exception:
+                    pass
                 jwt = self.ensure_jwt(force_refresh=True)
                 headers["Authorization"] = f"Bearer {jwt}"
                 continue

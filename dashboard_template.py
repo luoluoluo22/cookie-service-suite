@@ -512,12 +512,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
         <!-- 分类标签过滤器 -->
         <div class="flex flex-wrap items-center gap-2 border-b border-slate-800 pb-3" id="category-tabs">
-          <button onclick="setCategoryFilter('all')" class="category-tab px-3 py-1.5 rounded-lg text-xs font-medium border transition tab-active" data-cat="all">全部 (36)</button>
+          <button onclick="setCategoryFilter('all')" class="category-tab px-3 py-1.5 rounded-lg text-xs font-medium border transition tab-active" data-cat="all">全部 (37)</button>
           <button onclick="setCategoryFilter('gemini')" class="category-tab px-3 py-1.5 rounded-lg text-xs font-medium border border-slate-700 bg-slate-900 text-slate-400 hover:text-slate-200 transition" data-cat="gemini">Google Gemini (7)</button>
           <button onclick="setCategoryFilter('openai')" class="category-tab px-3 py-1.5 rounded-lg text-xs font-medium border border-slate-700 bg-slate-900 text-slate-400 hover:text-slate-200 transition" data-cat="openai">OpenAI 兼容 (3)</button>
           <button onclick="setCategoryFilter('chatgpt')" class="category-tab px-3 py-1.5 rounded-lg text-xs font-medium border border-slate-700 bg-slate-900 text-slate-400 hover:text-slate-200 transition" data-cat="chatgpt">ChatGPT 逆向 (9)</button>
           <button onclick="setCategoryFilter('system')" class="category-tab px-3 py-1.5 rounded-lg text-xs font-medium border border-slate-700 bg-slate-900 text-slate-400 hover:text-slate-200 transition" data-cat="system">Cookie Hub & 系统 (6)</button>
-          <button onclick="setCategoryFilter('ecosystem')" class="category-tab px-3 py-1.5 rounded-lg text-xs font-medium border border-slate-700 bg-slate-900 text-slate-400 hover:text-slate-200 transition" data-cat="ecosystem">生态扩展 (B站/网盘/Suno) (11)</button>
+          <button onclick="setCategoryFilter('ecosystem')" class="category-tab px-3 py-1.5 rounded-lg text-xs font-medium border border-slate-700 bg-slate-900 text-slate-400 hover:text-slate-200 transition" data-cat="ecosystem">生态扩展 (B站/网盘/Suno) (12)</button>
         </div>
 
         <!-- 动态端点卡片网格 -->
@@ -593,7 +593,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <script>
         // 平台分类导航定义 (上图标 + 下名称 + 独立分类)
     const PLATFORM_CATEGORIES = [
-      { key: "all", name: "全部平台", shortName: "全部", icon: "/assets/icons/all.svg", fallbackIcon: "fa-solid fa-shapes text-sky-400", count: 36 },
+      { key: "all", name: "全部平台", shortName: "全部", icon: "/assets/icons/all.svg", fallbackIcon: "fa-solid fa-shapes text-sky-400", count: 37 },
       { key: "gemini", name: "Google Gemini", shortName: "Gemini", icon: "/assets/icons/gemini.svg", fallbackIcon: "fa-solid fa-sparkles text-purple-400", count: 7 },
       { key: "gpt", name: "ChatGPT / OpenAI", shortName: "GPT / 逆向", icon: "/assets/icons/chatgpt.png", fallbackIcon: "fa-solid fa-robot text-emerald-400", count: 12 },
       { key: "suno", name: "Suno AI 音乐", shortName: "Suno AI", icon: "/assets/icons/suno.png", fallbackIcon: "fa-solid fa-music text-amber-400", count: 6 },
@@ -640,10 +640,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       { id: "suno_lyrics", category: "suno", method: "POST", url: "/api/suno/lyrics", name: "Suno AI 独立歌词创作", desc: "输入主题生成结构完整的双节押韵歌词", body: { prompt: "写一首关于秋天落叶与思念的流行歌词" } },
       { id: "suno_refresh", category: "suno", method: "POST", url: "/api/suno/refresh", name: "Suno AI 刷新鉴权凭证", desc: "强制刷新 Suno 会话凭证与 Clerk JWT 令牌", body: {} },
 
-      // 5. 百度网盘 存储与文件 (3)
+      // 5. 百度网盘 存储与文件 (4)
       { id: "baidu_quota", category: "baidu", method: "GET", url: "/api/baidupan/quota", name: "百度网盘 存储容量与配额", desc: "获取已用空间、总空间与 VIP 配额详情", body: null },
       { id: "baidu_user", category: "baidu", method: "GET", url: "/api/baidupan/user", name: "百度网盘 用户账号资料", desc: "获取百度网盘用户名、头像与 VIP 等级", body: null },
       { id: "baidu_files", category: "baidu", method: "GET", url: "/api/baidupan/files?dir_path=/", name: "百度网盘 目录文件遍历", desc: "遍历网盘根目录 / 或指定子目录下的文件清单", body: null },
+      { id: "baidu_refresh", category: "baidu", method: "POST", url: "/api/baidupan/refresh", name: "百度网盘 刷新鉴权凭证", desc: "从浏览器 Cookie Hub 强制同步最新百度网盘登录凭证", body: {} },
 
       // 6. 哔哩哔哩 个人与视频 (2)
       { id: "bili_user", category: "bilibili", method: "GET", url: "/api/bilibili/user", name: "B站 登录用户信息与资产", desc: "查看当前 B 站登录用户资料、硬币、B币与大会员有效期", body: null },
@@ -822,7 +823,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                ep.method.toLowerCase().includes(searchKeyword);
       });
 
-      document.getElementById("endpoints-count-badge").innerText = `展示 ${filtered.length} / 共 36 个端点`;
+      document.getElementById("endpoints-count-badge").innerText = `展示 ${filtered.length} / 共 37 个端点`;
 
       if (filtered.length === 0) {
         grid.innerHTML = `<div class="col-span-full py-8 text-center text-slate-500 text-xs">未找到匹配的 API 端点</div>`;

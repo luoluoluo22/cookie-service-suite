@@ -15,10 +15,39 @@ Cookie Service Suite - 统一服务启动与调度入口
 import sys
 import os
 
-if sys.platform == "win32":
+# 确保在 pythonw 静默无控制台环境下，sys.stdout / sys.stderr / sys.stdin 健全可用，
+# 防止 uvicorn (DefaultFormatter 调用 isatty) 及 logging 抛出 AttributeError: 'NoneType' object has no attribute 'isatty'
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOGS_DIR = os.path.join(BASE_DIR, "logs")
+os.makedirs(LOGS_DIR, exist_ok=True)
+STDOUT_LOG = os.path.join(LOGS_DIR, "stdout.log")
+STDERR_LOG = os.path.join(LOGS_DIR, "stderr.log")
+
+if sys.stdout is None:
+    try:
+        sys.stdout = open(STDOUT_LOG, "a", encoding="utf-8", buffering=1)
+    except Exception:
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+elif sys.platform == "win32":
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+if sys.stderr is None:
+    try:
+        sys.stderr = open(STDERR_LOG, "a", encoding="utf-8", buffering=1)
+    except Exception:
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")
+elif sys.platform == "win32":
+    try:
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+if sys.stdin is None:
+    try:
+        sys.stdin = open(os.devnull, "r", encoding="utf-8")
     except Exception:
         pass
 
@@ -79,5 +108,13 @@ if "--no-tray" in sys.argv:
 else:
     from tray_service import TrayAppServer
     auto_open = "--no-browser" not in sys.argv
-    server = TrayAppServer()
-    server.run(auto_open_browser=auto_open)
+    try:
+        server = TrayAppServer()
+        server.run(auto_open_browser=auto_open)
+    except Exception as e:
+        import traceback
+        import datetime
+        with open(os.path.join(LOGS_DIR, "crash.log"), "a", encoding="utf-8") as f:
+            f.write(f"\n[CRASH] {datetime.datetime.now()}: {e}\n")
+            traceback.print_exc(file=f)
+        raise

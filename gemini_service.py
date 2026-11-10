@@ -631,6 +631,82 @@ class MultiAccountGeminiPool:
             "reasoning_level": reasoning_level,
         }
 
+    def stream_chat(
+        self,
+        prompt: str,
+        model: str = "gemini-3.8-flash",
+        reasoning_level: str = "off",
+        timeout: int = 180,
+    ):
+        """
+        通过统一池化通道发起实时流式提问 (SSE)，逐行 yield SSE 事件。
+        首字延迟 (TTFB) 仅需 1~2 秒。
+        """
+        if not self.is_running():
+            self.start()
+
+        target_model = resolve_model_reasoning(model, reasoning_level)
+        req_data = {
+            "model": target_model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": True,
+        }
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/v1/chat/completions",
+            data=json.dumps(req_data).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+            },
+        )
+        try:
+            resp = _LOCAL_OPENER.open(req, timeout=timeout)
+            for raw_line in resp:
+                line = raw_line.decode("utf-8", errors="replace")
+                yield line
+            resp.close()
+        except Exception as e:
+            err_data = {"error": {"message": str(e), "type": "gemini_stream_error"}}
+            yield f"data: {json.dumps(err_data, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+
+    def stream_chat_messages(
+        self,
+        messages: List[Dict[str, str]],
+        model: str = "gemini-3.8-flash",
+        reasoning_level: str = "off",
+        timeout: int = 180,
+    ):
+        """
+        向 Go 核心池发送 messages 列表的实时流式提问 (SSE)。
+        """
+        if not self.is_running():
+            self.start()
+
+        target_model = resolve_model_reasoning(model, reasoning_level)
+        req_data = {
+            "model": target_model,
+            "messages": messages,
+            "stream": True,
+        }
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/v1/chat/completions",
+            data=json.dumps(req_data).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+            },
+        )
+        try:
+            resp = _LOCAL_OPENER.open(req, timeout=timeout)
+            for raw_line in resp:
+                yield raw_line.decode("utf-8", errors="replace")
+            resp.close()
+        except Exception as e:
+            err_data = {"error": {"message": str(e), "type": "gemini_stream_error"}}
+            yield f"data: {json.dumps(err_data, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+
     def check_account(self, account_id: int) -> Dict[str, Any]:
         """调用管理接口检测单个账号的会话凭证健康状态。"""
         url = f"http://127.0.0.1:{self.port}/admin/api/cookies/{account_id}/check"

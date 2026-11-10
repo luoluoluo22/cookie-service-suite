@@ -25,25 +25,57 @@ import ctypes
 import traceback
 from typing import Optional, Dict, Any, List, Tuple
 
+# 确保在 pythonw 静默无控制台环境下，sys.stdout / sys.stderr / sys.stdin 健全可用，
+# 防止 uvicorn (DefaultFormatter 调用 isatty) 及 logging 抛出 AttributeError: 'NoneType' object has no attribute 'isatty'
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOGS_DIR = os.path.join(BASE_DIR, "logs")
+os.makedirs(LOGS_DIR, exist_ok=True)
+STDOUT_LOG = os.path.join(LOGS_DIR, "stdout.log")
+STDERR_LOG = os.path.join(LOGS_DIR, "stderr.log")
+
+if sys.stdout is None:
+    try:
+        sys.stdout = open(STDOUT_LOG, "a", encoding="utf-8", buffering=1)
+    except Exception:
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+elif sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+if sys.stderr is None:
+    try:
+        sys.stderr = open(STDERR_LOG, "a", encoding="utf-8", buffering=1)
+    except Exception:
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")
+elif sys.platform == "win32":
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+if sys.stdin is None:
+    try:
+        sys.stdin = open(os.devnull, "r", encoding="utf-8")
+    except Exception:
+        pass
+
 def _global_exception_handler(exc_type, exc_value, exc_traceback):
     if issubclass(exc_type, KeyboardInterrupt):
         sys.__excepthook__(exc_type, exc_value, exc_traceback)
         return
-    print("🔥 [CRITICAL UNCAUGHT EXCEPTION]:", file=sys.stderr, flush=True)
-    traceback.print_exception(exc_type, exc_value, exc_traceback, file=sys.stderr)
-    sys.stderr.flush()
+    try:
+        if sys.stderr:
+            print("🔥 [CRITICAL UNCAUGHT EXCEPTION]:", file=sys.stderr, flush=True)
+            traceback.print_exception(exc_type, exc_value, exc_traceback, file=sys.stderr)
+            sys.stderr.flush()
+    except Exception:
+        pass
 
 sys.excepthook = _global_exception_handler
 if hasattr(threading, "excepthook"):
     threading.excepthook = lambda args: _global_exception_handler(args.exc_type, args.exc_value, args.exc_traceback)
-
-# 编码与网络环境配置
-if sys.platform == "win32":
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
 
 os.environ["NO_PROXY"] = "127.0.0.1,localhost,::1"
 _LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -199,12 +231,16 @@ class TrayAppServer:
             port=SERVER_PORT,
             log_level="warning",
             access_log=False,
+            use_colors=False,
         )
         self.uvicorn_server = uvicorn.Server(config)
 
         def _run():
-            print(f"🚀 [API 服务] 正在监听: http://{SERVER_HOST}:{SERVER_PORT}", flush=True)
-            self.uvicorn_server.run()
+            try:
+                print(f"🚀 [API 服务] 正在监听: http://{SERVER_HOST}:{SERVER_PORT}", flush=True)
+                self.uvicorn_server.run()
+            except Exception as e:
+                print(f"❌ [API 服务] 运行异常退出: {e}", flush=True)
 
         self.server_thread = threading.Thread(target=_run, daemon=True)
         self.server_thread.start()
@@ -377,10 +413,15 @@ class TrayAppServer:
                 pass
 
     def _status_monitor_loop(self):
-        """后台常驻状态轮询线程 (每 3 秒检测一次)"""
+        """后台常驻状态轮询线程 (每 3 秒检测一次，支持 API 掉线自愈恢复)"""
         while self.is_running:
             try:
                 self._update_service_status()
+                # 若主 API 服务未就绪且未在启动中，自动执行自愈拉起
+                if not self.status_cache["api_ok"]:
+                    if self.uvicorn_server is None or not getattr(self.uvicorn_server, "started", False):
+                        print("⚠️ [系统守护] 检测到本地 API 服务离线，正在自动执行自愈拉起...", flush=True)
+                        self.start_api_server()
             except Exception:
                 pass
             time.sleep(3.0)

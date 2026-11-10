@@ -81,8 +81,9 @@ START_TIME = datetime.datetime.now()
 # ==========================================
 class ChatRequest(BaseModel):
     prompt: str = Field(..., description="提问正文或指令内容", example="量子纠缠的基本原理是什么？")
-    model: Optional[str] = Field("gemini-3.5-flash-lite", description="模型名称 (gemini-3.5-flash-lite, gemini-3.1-pro 等)", example="gemini-3.5-flash-lite")
+    model: Optional[str] = Field("gemini-3.8-flash", description="模型名称 (gemini-3.8-flash, gemini-3.6-flash, gemini-4-argon 等)", example="gemini-3.8-flash")
     reasoning_level: Optional[str] = Field("off", description="推理级别: 'off'(关闭思考/极速), 'medium'(中等推理), 'high'(深度扩展思考)", example="off")
+    stream: Optional[bool] = Field(True, description="是否启用实时流式输出 (SSE)，默认为 True (首字秒出)", example=True)
     timeout: Optional[int] = Field(300, description="请求超时时间 (秒)，默认 300 秒", example=300)
 
 
@@ -110,11 +111,11 @@ class OpenAIMessage(BaseModel):
 
 
 class OpenAIChatRequest(BaseModel):
-    model: Optional[str] = Field("gemini-3.5-flash-lite", example="gemini-3.5-flash-lite")
+    model: Optional[str] = Field("gemini-3.8-flash", example="gemini-3.8-flash")
     messages: List[OpenAIMessage] = Field(..., description="对话历史消息列表")
     reasoning_effort: Optional[str] = Field(None, description="OpenAI 兼容推理强度: 'low', 'medium', 'high'", example="medium")
     reasoning_level: Optional[str] = Field(None, description="推理级别: 'off', 'medium', 'high'", example="off")
-    stream: Optional[bool] = Field(False, description="是否启用流式输出")
+    stream: Optional[bool] = Field(True, description="是否启用流式输出，默认为 True (首字秒级直出)")
     temperature: Optional[float] = Field(0.7, example=0.7)
 
 
@@ -563,6 +564,14 @@ def list_baidupan_files(dir_path: str = Query("/", description="网盘目录路�
         return baidu_service.list_files(dir_path=dir_path)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"遍历网盘文件失败: {str(e)}")
+
+
+@app.post("/api/baidupan/refresh", summary="强制从浏览器刷新百度网盘凭证", tags=["百度网盘服务"])
+def refresh_baidupan_auth():
+    try:
+        return baidu_service.refresh_auth()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"刷新网盘凭证失败: {str(e)}")
 
 
 # ==========================================
