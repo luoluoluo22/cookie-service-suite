@@ -243,7 +243,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 <span id="api-template-badge" class="text-[10px] px-2 py-0.5 rounded-full bg-cyan-500/10 text-cyan-300 border border-cyan-500/20 font-mono">Gemini · 7 个模板</span>
               </div>
               <select id="api-selector" onchange="switchApiTemplate()" class="w-full bg-slate-900 border border-slate-700 rounded-xl px-3.5 py-2 text-xs text-slate-200 focus:outline-none focus:border-cyan-400 shadow-sm transition">
-                <!-- 动态由 populateApiSelector 填充 -->
+                <option value="gemini_chat" selected>[POST] /api/gemini/chat (Gemini 智能对话)</option>
+                <option value="gemini_accounts">[GET] /api/gemini/accounts (Gemini 4账号状态与额度)</option>
+                <option value="gemini_sync_profiles">[POST] /api/gemini/accounts/sync-profiles (同步 Google 真实昵称邮箱)</option>
+                <option value="gemini_check">[POST] /api/gemini/accounts/1/check (检测账号凭证健康度)</option>
+                <option value="gemini_rotate">[POST] /api/gemini/accounts/1/rotate (触发账号令牌保活续期)</option>
+                <option value="gemini_refresh">[POST] /api/gemini/refresh (从 Cookie Hub 刷新凭证)</option>
+                <option value="gemini_requests">[GET] /api/gemini/requests?limit=10 (请求调度轨迹历史)</option>
               </select>
             </div>
 
@@ -299,6 +305,26 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <div class="flex gap-2 items-center">
               <span id="req-method-badge" class="px-2.5 py-1 rounded-lg text-xs font-bold bg-amber-500/20 text-amber-300 border border-amber-500/30 font-mono">POST</span>
               <input type="text" id="req-endpoint" class="flex-1 bg-slate-900 border border-slate-700 rounded-xl px-3 py-1.5 text-xs font-mono text-slate-300 focus:outline-none focus:border-cyan-400" value="/api/gemini/chat">
+            </div>
+
+            <!-- AI 预设 / 提示词快捷预设 -->
+            <div id="ai-preset-container" class="space-y-1.5">
+              <div class="flex items-center justify-between">
+                <label class="text-xs font-semibold text-slate-300 uppercase flex items-center gap-1.5">
+                  <i class="fa-solid fa-wand-magic-sparkles text-amber-400"></i>
+                  <span>选择 AI 预设 / 快捷提示词</span>
+                </label>
+                <span class="text-[10px] text-amber-300/80 font-mono">一键载入常用场景</span>
+              </div>
+              <select id="ai-preset-selector" onchange="applyAiPreset()" class="w-full bg-slate-900 border border-amber-500/40 rounded-xl px-3 py-2 text-xs text-amber-300 focus:outline-none focus:border-amber-400 shadow-inner transition">
+                <option value="quantum" selected>⚡ 物理科普: 请用一句话告诉我：量子纠缠是什么？</option>
+                <option value="python_async">💻 编程开发: 用 Python 编写一个高性能并发异步下载器，带连接池、超时自愈重试与流式进度展示</option>
+                <option value="translation">🌐 专业翻译: 请将以下技术段落进行中英专业学术级双向互译，保持术语严谨准确并给出对照解析</option>
+                <option value="raft_paxos">🧠 深度思考: 详细对比分布式架构下 Raft 与 Paxos 一致性算法的优缺点、选型考量与极端脑裂恢复</option>
+                <option value="marketing">✍️ 爆款文案: 为一款主打轻量敏捷与多账号智能分流的开发者工具撰写一段小红书/推特爆款推介文案</option>
+                <option value="cyberpunk_cat">🎨 赛博艺术: 一只可爱的赛博朋克霓虹发光机械猫咪在雨夜漫步，8K超高清，虚幻5电影级光影质感</option>
+                <option value="suno_music">🎵 音乐创作: 一段欢快阳光的夏日流行海滩音乐，带有原声吉他和轻快的鼓点</option>
+              </select>
             </div>
 
             <div id="req-body-container">
@@ -596,6 +622,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           </div>
         </div>
       </section>
+
+      <!-- 全局浮动通知提示 (Toast) -->
+      <div id="live-toast" class="hidden fixed bottom-5 right-5 z-50 bg-slate-900 border border-cyan-500/40 text-cyan-300 text-xs px-4 py-2.5 rounded-xl shadow-2xl shadow-cyan-500/20 flex items-center gap-2 transition duration-300"></div>
 
     </main>
   </div>
@@ -939,12 +968,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       document.getElementById("req-endpoint").value = ep.url;
       const bodyContainer = document.getElementById("req-body-container");
       const controlsGrid = document.getElementById("model-controls-grid");
+      const presetContainer = document.getElementById("ai-preset-container");
 
       if (ep.method === "GET") {
         bodyContainer.style.display = "none";
         if (controlsGrid) controlsGrid.style.display = "none";
+        if (presetContainer) presetContainer.style.display = "none";
       } else {
         bodyContainer.style.display = "block";
+        if (presetContainer) presetContainer.style.display = "block";
         const bodyStr = ep.body ? JSON.stringify(ep.body, null, 2) : "{}";
         document.getElementById("req-body").value = bodyStr;
 
@@ -1042,6 +1074,49 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       loadEndpoint(key, false);
     }
 
+    const AI_PRESETS_MAP = {
+      quantum: "请用一句话告诉我：量子纠缠是什么？",
+      python_async: "用 Python 编写一个高性能并发异步下载器，带连接池、超时自愈重试与流式进度展示",
+      translation: "请将以下技术段落进行中英专业学术级双向互译，保持术语严谨准确并给出语法对照解析：\\n\\n'Modern distributed consensus systems rely on replicated state machines to guarantee safety under network partitions.'",
+      raft_paxos: "详细对比分布式架构下 Raft 与 Paxos 一致性算法的优缺点、工程选型考量与极端网络分区脑裂下的自愈恢复机制",
+      marketing: "为一款主打轻量敏捷与 Google 多账号智能 LRU 自动分流的 Cookie Service Suite 开发者工具撰写一段极具吸引力的小红书/推特爆款推介文案，突出秒出首字与稳定自愈特性",
+      cyberpunk_cat: "一只可爱的赛博朋克霓虹发光机械猫咪在雨夜未来街道漫步，8K超高清，虚幻5电影级光影质感",
+      suno_music: "一段欢快阳光的夏日流行海滩音乐，带有原声吉他和轻快的鼓点"
+    };
+
+    function applyAiPreset() {
+      const selector = document.getElementById("ai-preset-selector");
+      if (!selector) return;
+      const key = selector.value;
+      const text = AI_PRESETS_MAP[key];
+      if (!text) return;
+
+      const bodyEl = document.getElementById("req-body");
+      if (!bodyEl || !bodyEl.value) return;
+
+      try {
+        const data = JSON.parse(bodyEl.value);
+        if (data.prompt !== undefined) {
+          data.prompt = text;
+        } else if (data.messages && Array.isArray(data.messages)) {
+          data.messages = [{ role: "user", content: text }];
+        }
+
+        if (key === "raft_paxos") {
+          const reasoningEl = document.getElementById("reasoning-selector");
+          if (reasoningEl && reasoningEl.value === "off") {
+            reasoningEl.value = "medium";
+            if (data.reasoning_level !== undefined) data.reasoning_level = "medium";
+          }
+        }
+
+        bodyEl.value = JSON.stringify(data, null, 2);
+        showToast("已成功应用 AI 预设提示词！");
+      } catch (e) {
+        console.error("更新预设提示词失败:", e);
+      }
+    }
+
     async function executeApiCall() {
       const btn = document.getElementById("btn-send");
       const method = document.getElementById("req-method-badge").innerText;
@@ -1106,7 +1181,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 timeSpan.innerText = `首字: ${firstTokenTime}ms | 正在流式打字...`;
               }
               buffer += decoder.decode(value, { stream: true });
-              const lines = buffer.split("\n");
+              const lines = buffer.split("\\n");
               buffer = lines.pop(); // 保留最后一个未闭合的行
               
               for (const line of lines) {
@@ -1128,12 +1203,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                       out.scrollTop = out.scrollHeight;
                     }
                   } catch(e) {
-                    fullText += payload + "\n";
+                    fullText += payload + "\\n";
                     out.innerText = fullText;
                     out.scrollTop = out.scrollHeight;
                   }
                 } else if (trimmed) {
-                  fullText += trimmed + "\n";
+                  fullText += trimmed + "\\n";
                   out.innerText = fullText;
                   out.scrollTop = out.scrollHeight;
                 }
