@@ -677,17 +677,25 @@ class MultiAccountGeminiPool:
 
         try:
             buffer = b""
-            while True:
+            stream_done = False
+            while not stream_done:
                 chunk = resp.read1(4096)
                 if not chunk:
                     break
                 buffer += chunk
                 while b"\n" in buffer:
                     line, buffer = buffer.split(b"\n", 1)
-                    yield line.decode("utf-8", errors="replace") + "\n"
-            if buffer:
+                    decoded_line = line.decode("utf-8", errors="replace")
+                    yield decoded_line + "\n"
+                    if decoded_line.strip() == "data: [DONE]":
+                        stream_done = True
+                        break
+            if buffer and not stream_done:
                 yield buffer.decode("utf-8", errors="replace") + "\n"
-            resp.close()
+            try:
+                resp.close()
+            except Exception:
+                pass
         except Exception as e:
             err_data = {"error": {"message": str(e), "type": "gemini_stream_error"}}
             yield f"data: {json.dumps(err_data, ensure_ascii=False)}\n\n"
@@ -737,17 +745,25 @@ class MultiAccountGeminiPool:
 
         try:
             buffer = b""
-            while True:
+            stream_done = False
+            while not stream_done:
                 chunk = resp.read1(4096)
                 if not chunk:
                     break
                 buffer += chunk
                 while b"\n" in buffer:
                     line, buffer = buffer.split(b"\n", 1)
-                    yield line.decode("utf-8", errors="replace") + "\n"
-            if buffer:
+                    decoded_line = line.decode("utf-8", errors="replace")
+                    yield decoded_line + "\n"
+                    if decoded_line.strip() == "data: [DONE]":
+                        stream_done = True
+                        break
+            if buffer and not stream_done:
                 yield buffer.decode("utf-8", errors="replace") + "\n"
-            resp.close()
+            try:
+                resp.close()
+            except Exception:
+                pass
         except Exception as e:
             err_data = {"error": {"message": str(e), "type": "gemini_stream_error"}}
             yield f"data: {json.dumps(err_data, ensure_ascii=False)}\n\n"

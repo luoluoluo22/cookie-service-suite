@@ -635,9 +635,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <script>
         // 平台分类导航定义 (上图标 + 下名称 + 独立分类)
     const PLATFORM_CATEGORIES = [
-      { key: "all", name: "全部平台", shortName: "全部", icon: "/assets/icons/all.svg", fallbackIcon: "fa-solid fa-shapes text-sky-400", count: 37 },
+      { key: "all", name: "全部平台", shortName: "全部", icon: "/assets/icons/all.svg", fallbackIcon: "fa-solid fa-shapes text-sky-400", count: 43 },
       { key: "gemini", name: "Google Gemini", shortName: "Gemini", icon: "/assets/icons/gemini.svg", fallbackIcon: "fa-solid fa-sparkles text-purple-400", count: 7 },
       { key: "gpt", name: "ChatGPT / OpenAI", shortName: "GPT / 逆向", icon: "/assets/icons/chatgpt.png", fallbackIcon: "fa-solid fa-robot text-emerald-400", count: 12 },
+      { key: "minimax", name: "MiniMax 语音", shortName: "MiniMax", icon: "/assets/icons/minimax.png", fallbackIcon: "fa-solid fa-microphone-lines text-rose-400", count: 6 },
       { key: "suno", name: "Suno AI 音乐", shortName: "Suno AI", icon: "/assets/icons/suno.png", fallbackIcon: "fa-solid fa-music text-amber-400", count: 6 },
       { key: "baidu", name: "百度网盘", shortName: "百度网盘", icon: "/assets/icons/baidupan.png", fallbackIcon: "fa-solid fa-cloud text-blue-400", count: 3 },
       { key: "bilibili", name: "哔哩哔哩", shortName: "哔哩哔哩", icon: "/assets/icons/bilibili.png", fallbackIcon: "fa-solid fa-tv text-pink-400", count: 2 },
@@ -681,6 +682,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       { id: "suno_status", category: "suno", method: "GET", url: "/api/suno/status?clip_ids=f42ad222-213f-4e8b-a7b1-dbc23455d1eb", name: "Suno AI 任务状态轮询", desc: "查询任务渲染进度与本地解密流式播放直链", body: null },
       { id: "suno_lyrics", category: "suno", method: "POST", url: "/api/suno/lyrics", name: "Suno AI 独立歌词创作", desc: "输入主题生成结构完整的双节押韵歌词", body: { prompt: "写一首关于秋天落叶与思念的流行歌词" } },
       { id: "suno_refresh", category: "suno", method: "POST", url: "/api/suno/refresh", name: "Suno AI 刷新鉴权凭证", desc: "强制刷新 Suno 会话凭证与 Clerk JWT 令牌", body: {} },
+
+      // 4.5. MiniMax / 海螺语音 TTS (6)
+      { id: "minimax_speech", category: "minimax", method: "POST", url: "/api/minimax/speech", name: "MiniMax 语音合成", desc: "高保真拟真声音合成，支持语速/音量/音高调节并直出音频试听", body: { text: "你好！这是来自 MiniMax 海螺语音超自然 TTS 的实时合成试听。", voice_id: "226869000163456", speed: 1.0, vol: 1.0, pitch: 0.0, format: "mp3" } },
+      { id: "openai_speech", category: "minimax", method: "POST", url: "/v1/audio/speech", name: "OpenAI 兼容语音合成接口", desc: "标准 POST /v1/audio/speech，支持 alloy, nova, onyx, shimmer, fable, echo 音色", body: { model: "speech-01-hd", input: "Today is a beautiful day to build something remarkable.", voice: "alloy", speed: 1.0, response_format: "mp3" } },
+      { id: "minimax_voices", category: "minimax", method: "GET", url: "/api/minimax/voices", name: "MiniMax 可选音色列表", desc: "获取沉稳高管、甜美亲切、知性主播、磁性大叔等全量音色", body: null },
+      { id: "minimax_quota", category: "minimax", method: "GET", url: "/api/minimax/quota", name: "MiniMax 配额与字符余量", desc: "查询 MiniMax / 海螺语音平台当前账户剩余可用字符与积分", body: null },
+      { id: "minimax_status", category: "minimax", method: "GET", url: "/api/minimax/status", name: "MiniMax 会话状态与Token", desc: "检查本地缓存 Token、设备指纹与扩展桥接就绪状态", body: null },
+      { id: "minimax_auto_fetch", category: "minimax", method: "POST", url: "/api/minimax/auto_fetch?force=true", name: "从浏览器刷新 MiniMax 凭证", desc: "通知 Cookie Hub 扩展后台访问并自动提取最新 Token", body: {} },
 
       // 5. 百度网盘 存储与文件 (4)
       { id: "baidu_quota", category: "baidu", method: "GET", url: "/api/baidupan/quota", name: "百度网盘 存储容量与配额", desc: "获取已用空间、总空间与 VIP 配额详情", body: null },
@@ -1117,6 +1126,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
+    // 人性化耗时显示：超过60s切换为min，默认显示s（保留合适小数），人类阅读更直观
+    function formatHumanDuration(ms) {
+      if (ms === null || ms === undefined || isNaN(ms)) return "0s";
+      const sec = ms / 1000;
+      if (sec < 60) {
+        return sec < 1 ? (sec.toFixed(2) + "s") : (sec.toFixed(1) + "s");
+      }
+      return (sec / 60).toFixed(1) + "min";
+    }
+
     async function executeApiCall() {
       const btn = document.getElementById("btn-send");
       const method = document.getElementById("req-method-badge").innerText;
@@ -1147,7 +1166,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
         const resp = await fetch(endpoint, opts);
         const took = Math.round(performance.now() - t0);
-        timeSpan.innerText = `耗时: ${took}ms`;
+        timeSpan.innerText = `耗时: ${formatHumanDuration(took)}`;
         statusSpan.classList.remove("hidden");
         statusSpan.innerText = `${resp.status} ${resp.statusText}`;
         if (resp.ok) {
@@ -1179,7 +1198,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             if (value) {
               if (firstTokenTime === null) {
                 firstTokenTime = Math.round(performance.now() - t0);
-                timeSpan.innerText = `首字: ${firstTokenTime}ms | 正在流式打字...`;
+                timeSpan.innerText = `首字: ${formatHumanDuration(firstTokenTime)} | 正在流式打字...`;
               }
               buffer += decoder.decode(value, { stream: true });
               const lines = buffer.split(String.fromCharCode(10));
@@ -1191,7 +1210,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 if (trimmed.startsWith("data:")) {
                   const payload = trimmed.substring(5).trim();
                   if (payload === "[DONE]") {
-                    continue;
+                    streamDone = true;
+                    try { await reader.cancel(); } catch(e) {}
+                    break;
                   }
                   try {
                     const parsed = JSON.parse(payload);
@@ -1260,7 +1281,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           }
           
           const totalTook = Math.round(performance.now() - t0);
-          timeSpan.innerText = `首字: ${firstTokenTime || 0}ms | 总耗时: ${totalTook}ms`;
+          timeSpan.innerText = `首字: ${formatHumanDuration(firstTokenTime || 0)} | 总耗时: ${formatHumanDuration(totalTook)}`;
 
           if (streamError) {
             statusSpan.innerText = "Error (流式异常)";
