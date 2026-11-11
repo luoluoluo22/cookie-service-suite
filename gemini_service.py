@@ -660,8 +660,22 @@ class MultiAccountGeminiPool:
                 "Authorization": f"Bearer {self.api_key}",
             },
         )
+        resp = None
         try:
             resp = _LOCAL_OPENER.open(req, timeout=timeout)
+        except Exception as first_err:
+            print(f"⚠️ [Gemini Stream] 连接 Go 核心池异常: {first_err}，尝试自愈刷新凭证并重试...", flush=True)
+            try:
+                self.reset_proxies()
+                self.refresh_pool_cookies()
+                resp = _LOCAL_OPENER.open(req, timeout=timeout)
+            except Exception as retry_err:
+                err_data = {"error": {"message": f"Gemini 调度流式失败 (自愈后仍失败): {retry_err}", "type": "gemini_stream_error"}}
+                yield f"data: {json.dumps(err_data, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+
+        try:
             buffer = b""
             while True:
                 chunk = resp.read1(4096)
@@ -706,8 +720,22 @@ class MultiAccountGeminiPool:
                 "Authorization": f"Bearer {self.api_key}",
             },
         )
+        resp = None
         try:
             resp = _LOCAL_OPENER.open(req, timeout=timeout)
+        except Exception as first_err:
+            print(f"⚠️ [Gemini Stream] 连接 Go 核心池异常: {first_err}，尝试自愈刷新凭证并重试...", flush=True)
+            try:
+                self.reset_proxies()
+                self.refresh_pool_cookies()
+                resp = _LOCAL_OPENER.open(req, timeout=timeout)
+            except Exception as retry_err:
+                err_data = {"error": {"message": f"Gemini 调度流式失败 (自愈后仍失败): {retry_err}", "type": "gemini_stream_error"}}
+                yield f"data: {json.dumps(err_data, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+
+        try:
             buffer = b""
             while True:
                 chunk = resp.read1(4096)

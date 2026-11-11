@@ -1171,6 +1171,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           let fullText = "";
           let firstTokenTime = null;
           let buffer = "";
+          let streamError = null;
 
           while (!streamDone) {
             const { value, done } = await reader.read();
@@ -1181,36 +1182,78 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 timeSpan.innerText = `首字: ${firstTokenTime}ms | 正在流式打字...`;
               }
               buffer += decoder.decode(value, { stream: true });
-              const lines = buffer.split("\\n");
+              const lines = buffer.split(String.fromCharCode(10));
               buffer = lines.pop(); // 保留最后一个未闭合的行
               
               for (const line of lines) {
                 const trimmed = line.trim();
                 if (!trimmed || trimmed.startsWith("event:")) continue;
-                if (trimmed.startsWith("data: ")) {
-                  const payload = trimmed.substring(6).trim();
+                if (trimmed.startsWith("data:")) {
+                  const payload = trimmed.substring(5).trim();
                   if (payload === "[DONE]") {
                     continue;
                   }
                   try {
                     const parsed = JSON.parse(payload);
+                    if (parsed.error) {
+                      const errMsg = typeof parsed.error === "string" ? parsed.error : (parsed.error.message || JSON.stringify(parsed.error));
+                      streamError = errMsg;
+                      fullText += String.fromCharCode(10) + "❌ [流式异常 / 上游错误]: " + errMsg + String.fromCharCode(10);
+                      out.innerText = fullText;
+                      out.scrollTop = out.scrollHeight;
+                      continue;
+                    }
                     const delta = parsed.choices?.[0]?.delta?.content || 
                                   parsed.choices?.[0]?.delta?.reasoning_content ||
+                                  parsed.choices?.[0]?.text ||
+                                  parsed.choices?.[0]?.message?.content ||
                                   parsed.delta || parsed.text || parsed.reply || "";
                     if (delta) {
                       fullText += delta;
                       out.innerText = fullText;
                       out.scrollTop = out.scrollHeight;
+                    } else if (parsed.choices?.[0]?.delta && Object.keys(parsed.choices[0].delta).length === 0) {
+                      // 忽略正常的流结束块
+                    } else if (!parsed.choices) {
+                      fullText += payload + String.fromCharCode(10);
+                      out.innerText = fullText;
+                      out.scrollTop = out.scrollHeight;
                     }
                   } catch(e) {
-                    fullText += payload + "\\n";
+                    fullText += payload + String.fromCharCode(10);
                     out.innerText = fullText;
                     out.scrollTop = out.scrollHeight;
                   }
                 } else if (trimmed) {
-                  fullText += trimmed + "\\n";
+                  fullText += trimmed + String.fromCharCode(10);
                   out.innerText = fullText;
                   out.scrollTop = out.scrollHeight;
+                }
+              }
+            }
+          }
+
+          // 处理缓冲区残留的未换行行数据
+          if (buffer && buffer.trim()) {
+            const trimmed = buffer.trim();
+            if (trimmed.startsWith("data:")) {
+              const payload = trimmed.substring(5).trim();
+              if (payload && payload !== "[DONE]") {
+                try {
+                  const parsed = JSON.parse(payload);
+                  if (parsed.error) {
+                    const errMsg = typeof parsed.error === "string" ? parsed.error : (parsed.error.message || JSON.stringify(parsed.error));
+                    streamError = errMsg;
+                    fullText += String.fromCharCode(10) + "❌ [流式异常 / 上游错误]: " + errMsg + String.fromCharCode(10);
+                  } else {
+                    const delta = parsed.choices?.[0]?.delta?.content || 
+                                  parsed.choices?.[0]?.delta?.reasoning_content ||
+                                  parsed.delta || parsed.text || parsed.reply || "";
+                    if (delta) fullText += delta;
+                    else if (!parsed.choices) fullText += payload;
+                  }
+                } catch(e) {
+                  fullText += payload;
                 }
               }
             }
@@ -1218,8 +1261,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           
           const totalTook = Math.round(performance.now() - t0);
           timeSpan.innerText = `首字: ${firstTokenTime || 0}ms | 总耗时: ${totalTook}ms`;
-          statusSpan.innerText = "200 OK (流式完成)";
-          statusSpan.className = "text-xs px-2 py-0.5 rounded font-mono bg-emerald-500/20 text-emerald-400";
+
+          if (streamError) {
+            statusSpan.innerText = "Error (流式异常)";
+            statusSpan.className = "text-xs px-2 py-0.5 rounded font-mono bg-rose-500/20 text-rose-400";
+            out.innerText = fullText || ("❌ [流式异常]: " + streamError);
+          } else if (!fullText.trim()) {
+            out.innerText = "⚠️ 上游流式已结束，但未解析出文本内容。\\n建议：\\n1. 请检查上方模型与入参配置；\\n2. 点击上方【从 Cookie Hub 刷新凭证】更新最新会话。";
+            statusSpan.innerText = "200 (空响应)";
+            statusSpan.className = "text-xs px-2 py-0.5 rounded font-mono bg-amber-500/20 text-amber-400";
+          } else {
+            out.innerText = fullText;
+            statusSpan.innerText = "200 OK (流式完成)";
+            statusSpan.className = "text-xs px-2 py-0.5 rounded font-mono bg-emerald-500/20 text-emerald-400";
+          }
           return;
         }
 
