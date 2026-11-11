@@ -35,6 +35,7 @@ from bilibili_service import BilibiliService
 from baidu_pan_service import BaiduPanService
 from suno_service import SunoService, suno_service
 from login_status import collect_login_status, failure_payload, gemini_failure_should_retry
+from minimax_service import MinimaxAudioService, minimax_service, PRESET_VOICES, OPENAI_VOICE_MAP
 from autostart import (
     is_autostart_enabled,
     enable_autostart,
@@ -83,6 +84,7 @@ chatgpt_client = chatgpt_service
 bili_service = BilibiliService()
 baidu_service = BaiduPanService()
 suno_client = suno_service
+minimax_client = minimax_service
 
 START_TIME = datetime.datetime.now()
 
@@ -143,6 +145,23 @@ class SunoGenerateRequest(BaseModel):
 
 class SunoLyricsRequest(BaseModel):
     prompt: str = Field(..., description="歌词创作主题或提示词", example="写一首关于秋天落叶与远方思念的流行歌词")
+
+
+class OpenAISpeechRequest(BaseModel):
+    model: Optional[str] = Field("speech-01-hd", description="模型名称 (speech-01-hd, speech-02-hd, tts-1, tts-1-hd 等)", example="speech-01-hd")
+    input: str = Field(..., description="要合成语音的文本内容", example="你好，这是通过 MiniMax 海螺语音实时生成的语音。")
+    voice: Optional[str] = Field("alloy", description="音色名称或 ID (支持 alloy, nova, onyx, shimmer, fable, echo 或特定 voice_id)", example="alloy")
+    response_format: Optional[str] = Field("mp3", description="音频格式 (mp3, wav 等)", example="mp3")
+    speed: Optional[float] = Field(1.0, description="语速 (0.5 - 2.0)", ge=0.5, le=2.0)
+
+
+class MinimaxSpeechRequest(BaseModel):
+    text: str = Field(..., description="合成文本内容", example="欢迎使用 MiniMax 语音合成服务")
+    voice_id: Optional[str] = Field("226869000163456", description="音色 ID 或别名")
+    speed: Optional[float] = Field(1.0, description="语速 (0.5 - 2.0)", ge=0.5, le=2.0)
+    vol: Optional[float] = Field(1.0, description="音量 (0.1 - 2.0)")
+    pitch: Optional[float] = Field(0.0, description="语调音高 (-12 - 12)")
+    format: Optional[str] = Field("mp3", description="音频格式 (mp3, wav)")
 
 
 # ==========================================
@@ -257,6 +276,11 @@ def get_system_overview():
             "chatgpt_bridge": {
                 "status": "ready" if hub_ok else "waiting_hub",
                 "method": "in_page_hook_sse",
+            },
+            "minimax_audio": {
+                "status": "ready" if bool(minimax_client.token) else ("connected" if hub_ok else "idle"),
+                "token_ready": bool(minimax_client.token),
+                "voices_count": len(PRESET_VOICES),
             },
         },
     }
@@ -485,6 +509,19 @@ def get_gemini_recent_requests(limit: int = Query(20, description="返回条数�
         return {"requests": gemini_pool.list_recent_requests(limit=limit)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/gemini/pace-status", summary="获取当前 Gemini 调用频率与并发状态", tags=["Gemini 多账号调度"])
+def get_gemini_pace_status():
+    """获取当前 Gemini 并发与频率控制状态 (是否允许调用、倒计时秒数、上次错误原因)。"""
+    return gemini_pool.pace_status()
+
+
+@app.post("/api/gemini/reset-pace", summary="强制复位 Gemini 频率与并发保护锁", tags=["Gemini 多账号调度"])
+def reset_gemini_pace():
+    """管理员或用户一键强制解锁并发保护，立即恢复可调用状态。"""
+    gemini_pool.reset_pace()
+    return {"success": True, "message": "Gemini 调用锁与冷却状态已成功强制复位！"}
 
 
 # ==========================================
@@ -815,6 +852,62 @@ def get_suno_audio(clip_id: str = Path(..., description="Suno 歌曲 Clip ID")):
 
 
 # ==========================================
+# 6.8. MiniMax / 海螺语音服务 (/api/minimax/*)
+# ==========================================
+@app.get("/api/minimax/status", summary="获取 MiniMax 登录态与会话就绪状态", tags=["MiniMax 语音合成"])
+def get_minimax_status():
+    is_ready = bool(minimax_client.token)
+    return {
+        "status": "ready" if is_ready else "not_configured",
+        "token_ready": is_ready,
+        "uuid": minimax_client.uuid,
+        "device_id": minimax_client.device_id,
+        "cached_time": minimax_client.last_fetch_time,
+        "preset_voices_count": len(PRESET_VOICES)
+    }
+
+
+@app.get("/api/minimax/voices", summary="获取 MiniMax 预置及可用音色列表", tags=["MiniMax 语音合成"])
+def get_minimax_voices():
+    return {"success": True, "voices": minimax_client.get_voices()}
+
+
+@app.get("/api/minimax/quota", summary="获取 MiniMax 账户剩余字符配额与积分", tags=["MiniMax 语音合成"])
+def get_minimax_quota():
+    return minimax_client.get_quota()
+
+
+@app.post("/api/minimax/speech", summary="MiniMax 高级语音合成", tags=["MiniMax 语音合成"])
+def post_minimax_speech(req: MinimaxSpeechRequest):
+    import io
+    try:
+        audio_bytes = minimax_client.synthesize(
+            text=req.text,
+            voice=req.voice_id or "226869000163456",
+            speed=req.speed or 1.0,
+            vol=req.vol or 1.0,
+            pitch=req.pitch or 0.0,
+            format=req.format or "mp3"
+        )
+        return StreamingResponse(
+            io.BytesIO(audio_bytes),
+            media_type="audio/mpeg",
+            headers={
+                "Content-Disposition": f'attachment; filename="minimax_{int(time.time())}.mp3"',
+                "Content-Length": str(len(audio_bytes))
+            }
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"MiniMax 语音合成失败: {str(e)}")
+
+
+@app.post("/api/minimax/auto_fetch", summary="通知浏览器扩展唤醒并自动拉取 MiniMax 登录态", tags=["MiniMax 语音合成"])
+def post_minimax_auto_fetch(force: bool = Query(True, description="是否强制后台打开页面以唤醒会话")):
+    res = minimax_client.auto_refresh_auth(force_visit=force, timeout=20)
+    return res
+
+
+# ==========================================
 # 7. 标准 OpenAI 兼容 API 路由 (/v1/*)
 # ==========================================
 @app.post("/v1/chat/completions", summary="OpenAI 兼容聊天接口", tags=["OpenAI 兼容接口"])
@@ -968,8 +1061,40 @@ def openai_image_generations(body: OpenAIImageGenerationRequest):
         raise HTTPException(status_code=502, detail=f"ChatGPT 图片生成失败: {str(e)}")
 
 
+@app.post("/v1/audio/speech", summary="OpenAI 兼容语音合成接口", tags=["OpenAI 兼容接口"])
+def openai_audio_speech(body: OpenAISpeechRequest):
+    """
+    提供标准 OpenAI POST /v1/audio/speech 接口，
+    底层自动路由到 MiniMax / 海螺语音平台原生 WebSocket 与模型进行超自然高保真语音渲染。
+    返回标准 audio/mpeg 二进制音频流。
+    """
+    import io
+    try:
+        audio_bytes = minimax_client.synthesize(
+            text=body.input,
+            voice=body.voice or "alloy",
+            speed=body.speed or 1.0,
+            format=body.response_format or "mp3"
+        )
+        return StreamingResponse(
+            io.BytesIO(audio_bytes),
+            media_type="audio/mpeg",
+            headers={
+                "Content-Disposition": f'attachment; filename="speech_{int(time.time())}.mp3"',
+                "Content-Length": str(len(audio_bytes))
+            }
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"语音合成失败: {str(e)}")
+
+
 # 模型元数据中文描述字典 (区分日常聊天 Chat 与工作台 Work 专有模型)
 REVERSE_MODEL_DESCRIPTIONS = {
+    # --- 语音合成模型 (MiniMax TTS: OpenAI 兼容) ---
+    "speech-01-hd": "[超自然语音/TTS] MiniMax 海螺语音 HD 高保真自然拟真模型",
+    "speech-02-hd": "[超自然语音/TTS] MiniMax 旗舰超自然语音合成模型",
+    "tts-1": "[语音合成/TTS] OpenAI 兼容快速语音合成 (由 MiniMax 驱动)",
+    "tts-1-hd": "[语音合成/TTS] OpenAI 兼容高保真语音合成 (由 MiniMax 驱动)",
     # --- 日常聊天专有模型 (Chat Mode: is_work_mode_model = false) ---
     "auto": "[日常聊天/Auto] ChatGPT 智能自动优选模型",
     "gpt-6-thinking": "[思考/旧标识] 当前免费账号的模型列表里没有这个 slug，请改用 gpt-6-t-mini",

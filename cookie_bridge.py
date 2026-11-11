@@ -65,6 +65,47 @@ class CookieBridge:
         resp.raise_for_status()
         return resp.json()
 
+    def auto_fetch_minimax_cookies(self, force_visit: bool = False, timeout: int = 25) -> Dict[str, Any]:
+        """通知浏览器扩展自动检索 MiniMax / 海螺语音并提取 Token 与 Cookie"""
+        resp = self.session.get(
+            f"{self.bridge_url}/minimax/auto_fetch",
+            params={
+                "force": "true" if force_visit else "false",
+                "timeout": int(timeout * 1000)
+            },
+            timeout=timeout + 3
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def generate_minimax_speech_via_bridge(
+        self,
+        text: str,
+        voice_id: str = "355256451461319",
+        speed: float = 1.0,
+        vol: float = 1.0,
+        pitch: float = 0.0,
+        format: str = "mp3",
+        timeout: int = 40
+    ) -> Dict[str, Any]:
+        """通知浏览器扩展在 MiniMax 真实网页 Context 中驱动原生 WebSocket 合成语音"""
+        payload = {
+            "text": text,
+            "voice_id": voice_id,
+            "speed": speed,
+            "vol": vol,
+            "pitch": pitch,
+            "format": format,
+            "timeout": timeout * 1000
+        }
+        resp = self.session.post(
+            f"{self.bridge_url}/minimax/t2a",
+            json=payload,
+            timeout=timeout + 5
+        )
+        resp.raise_for_status()
+        return resp.json()
+
     def export_netscape_file(self, domain: str, output_path: str) -> str:
         """导出标准 Netscape 格式 cookies.txt (供 yt-dlp / curl -b / wget 使用)"""
         resp = self.session.get(

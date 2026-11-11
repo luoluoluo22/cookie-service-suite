@@ -135,6 +135,20 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (pathname === '/tab/open') {
+    try {
+      const url = parsedUrl.searchParams.get('url') || 'https://www.minimax.io/audio';
+      const active = parsedUrl.searchParams.get('active') === 'true';
+      const data = await dispatchToExtension('open_tab', { url, active });
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(data, null, 2));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
   if (pathname === '/chatgpt/set_tab') {
     try {
       const tabId = parsedUrl.searchParams.get('tabId');
@@ -238,11 +252,26 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // 2.88 ChatGPT Inspect Tab (/chatgpt/inspect)
+  // 2.87 ChatGPT Inspect Tab (/chatgpt/inspect)
   if (pathname === '/chatgpt/inspect') {
     try {
       const tabId = parsedUrl.searchParams.get('tabId') || currentBridgeTabId;
       const data = await dispatchToExtension('chatgpt_inspect_tab', { tabId: tabId ? Number(tabId) : null });
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(data, null, 2));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  // 2.88 Generic Tab Eval (/tab/eval)
+  if (pathname === '/tab/eval') {
+    try {
+      const tabId = Number(parsedUrl.searchParams.get('tabId') || currentBridgeTabId);
+      const code = parsedUrl.searchParams.get('code') || 'document.title';
+      const data = await dispatchToExtension('tab_eval', { tabId, code }, 15000);
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify(data, null, 2));
     } catch (err) {
@@ -651,6 +680,99 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // 6. MiniMax Auto-Fetch & Session Token Extraction (/minimax/auto_fetch or /minimax/cookies)
+  if (pathname === '/minimax/auto_fetch' || pathname === '/minimax/cookies') {
+    if (extensionSockets.size === 0) {
+      res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({
+        success: false,
+        error: '浏览器扩展未连接本地服务，请在浏览器中确认 Cookie Hub 扩展已加载并启用。'
+      }));
+      return;
+    }
+
+    try {
+      const data = await dispatchToExtension('get_cookies', { domain: 'minimax.io' }, 10000);
+      if (data && data.success) {
+        const uniqueCookies = data.cookies || [];
+        const kv = data.kv || {};
+        let bestToken = '';
+        const validTokenCookie = uniqueCookies.find(c => c.name === '_token' && c.value);
+        if (validTokenCookie) bestToken = validTokenCookie.value;
+        if (!bestToken && kv['_token']) bestToken = kv['_token'];
+
+        const result = {
+          success: true,
+          hasAuth: Boolean(bestToken),
+          token: bestToken,
+          uuid: kv['UNIQUE_USER_ID'] || kv['_gc_usr_id_cs0_d0_sec0_part0'] || '680c5f04-70b2-4787-adf4-bde5066b7b29',
+          deviceId: kv['USER_HARD_WARE_INFO'] || kv['_sid'] || 'bf80fdaee5abd70e278e9d9c50af9fe8',
+          header: data.header,
+          kv: kv,
+          cookies: uniqueCookies,
+          count: uniqueCookies.length
+        };
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify(result, null, 2));
+        return;
+      }
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ success: false, error: '获取 MiniMax Cookie 失败' }));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ success: false, error: err.message }));
+    }
+    return;
+  }
+
+  // 6.5 MiniMax In-Page WebSocket TTS Generation (/minimax/t2a or /minimax/speech)
+  if ((pathname === '/minimax/t2a' || pathname === '/minimax/speech') && req.method === 'POST') {
+    if (extensionSockets.size === 0) {
+      res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ success: false, error: '浏览器扩展未连接本地服务' }));
+      return;
+    }
+
+    try {
+      const body = await readRequestBody(req);
+      const json = JSON.parse(body || '{}');
+      const data = await dispatchToExtension('minimax_t2a', { payload: json, timeout: 60000 }, 60000);
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(data, null, 2));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ success: false, error: err.message }));
+    }
+    return;
+  }
+
+  // 6.6 MiniMax Save Audio (/minimax/save_audio)
+  if (pathname === '/minimax/save_audio' && req.method === 'POST') {
+    try {
+      const audioId = req.headers['x-minimax-audio-id'] || `audio_${Date.now()}`;
+      const format = req.headers['x-minimax-format'] || 'mp3';
+      const chunks = [];
+      req.on('data', chunk => chunks.push(chunk));
+      req.on('end', () => {
+        const buffer = Buffer.concat(chunks);
+        const downloadDir = path.join(__dirname, '..', 'downloads', 'minimax');
+        if (!fs.existsSync(downloadDir)) {
+          fs.mkdirSync(downloadDir, { recursive: true });
+        }
+        const fileName = `${audioId}.${format}`;
+        const filePath = path.join(downloadDir, fileName);
+        fs.writeFileSync(filePath, buffer);
+        console.log(`[Bridge Server] 🎙️ 保存 MiniMax 语音: ${fileName} (${(buffer.length / 1024).toFixed(1)} KB)`);
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ success: true, audioId, path: filePath, size: buffer.length }));
+      });
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ success: false, error: err.message }));
+    }
+    return;
+  }
+
   // Fallback 404
   res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify({ error: 'Endpoint not found' }));
@@ -702,10 +824,13 @@ wss.on('connection', (ws) => {
       }
 
       if (msg.id && pendingRequests.has(msg.id)) {
+        console.log(`[Bridge Server] ⬅️ 收到请求响应: action=${msg.action || ''}, id=${msg.id}`);
         const { resolve, timer } = pendingRequests.get(msg.id);
         clearTimeout(timer);
         pendingRequests.delete(msg.id);
         resolve(msg);
+      } else if (msg.id) {
+        console.log(`[Bridge Server] ⚠️ 未知或超时的请求响应: id=${msg.id}, action=${msg.action}`);
       }
     } catch (e) {
       console.error('[Bridge Server] 解析扩展消息失败:', e);
@@ -735,7 +860,7 @@ setInterval(() => {
 }, 20000);
 
 // Helper: Dispatch request to connected extension and await reply
-function dispatchToExtension(action, payload) {
+function dispatchToExtension(action, payload = {}, customTimeout = null) {
   return new Promise((resolve, reject) => {
     if (extensionSockets.size === 0) {
       return reject(new Error('无在线的扩展客户端连接'));
@@ -754,7 +879,7 @@ function dispatchToExtension(action, payload) {
     }
 
     const reqId = 'req_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
-    const timeoutMs = (action === 'chatgpt_send_message' || payload.timeout) ? (payload.timeout || 120000) : 8000;
+    const timeoutMs = customTimeout || payload.timeout || (action === 'chatgpt_send_message' ? 120000 : 45000);
 
     const timer = setTimeout(() => {
       pendingRequests.delete(reqId);
@@ -762,6 +887,8 @@ function dispatchToExtension(action, payload) {
     }, timeoutMs);
 
     pendingRequests.set(reqId, { resolve, reject, timer });
+
+    console.log(`[Bridge Server] ➡️ 派发请求: action=${action}, id=${reqId}, timeout=${timeoutMs}ms`);
 
     targetWs.send(JSON.stringify({
       id: reqId,

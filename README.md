@@ -34,6 +34,7 @@
 | :--- | :--- | :--- | :--- | :--- |
 | **OpenAI ChatGPT Web** | 浏览器原生桥接<br>`Bearer AccessToken`<br>`__Secure-next-auth`<br>**SSE Stream Hook** | 1. 登录会话与用户提取 (`/chatgpt/session`)<br>2. 账号可用模型列表 (`/chatgpt/models`)<br>3. 标准兼容对话 (`/v1/chat/completions`)<br>4. 实时流式响应 (`stream: true`) | 🟢 **100% 通过** | 彻底绕过 Cloudflare Turnstile 403 拦截，提取账号 `7501243@qq.com` 会话与实时模型库；通过页面主环境 (`MAIN` world) 挂载 `window.fetch` 流式拦截器，毫秒级逐字提取 SSE 数据块 (`text/event-stream`)，兼具 DOM 兜底保底，实现长文本无截断完整输出。 |
 | **Suno AI 音乐创作** | Clerk 动态 Token 换取<br>`__client`<br>`Bearer JWT`<br>`curl_cffi` 真实指纹伪装 | 1. 账户总积分与曲目配额 (`/api/suno/quota`)<br>2. 历史曲库与音频直链 (`/api/suno/feed`)<br>3. 灵感/歌词模式生成 (`/api/suno/generate`)<br>4. 本地 MP3 流式自动下载 | 🟢 **集成完毕** | 依托本地 Cookie Hub 自动提取 `suno.com` 与 `clerk.suno.com` 凭证，免手动 F12 抓包；基于 `curl_cffi` 原生模拟浏览器 TLS 指纹突破 Cloudflare 风控；实现从提示词输入到自动轮询、两组变体曲目渲染完成、MP3 流式下载入库的全闭环。 |
+| **MiniMax 海螺语音 TTS** | 原生 WebSocket 桥接<br>`_token`<br>`yy` MD5 算法逆向<br>OpenAI 兼容接口 | 1. 标准语音合成 (`/v1/audio/speech`)<br>2. 专用高级语音生成 (`/api/minimax/speech`)<br>3. 预置与线上音色库 (`/api/minimax/voices`)<br>4. 账户字符配额查询 (`/api/minimax/quota`) | 🟢 **集成完毕** | 针对 `https://www.minimax.io/audio` 平台，通过扩展在真实页面 Context 驱动原生 WebSocket 通信（免逆向抗风控），同时支持本地逆向计算 `yy` 签名直连；完美兼容 OpenAI `/v1/audio/speech` 规范；支持沉稳高管、甜美亲切、知性主播、磁性大叔、英文优雅女声等预置优质音色并实时输出 MP3 流。 |
 | **百度网盘 (Baidu Pan)** | `BDUSS`<br>`STOKEN`<br>`PANPSC` | 1. 账号与会员鉴权<br>2. 网盘总配额/剩余容量<br>3. 目录与文件实时遍历 | 🟢 **100% 通过** | 自动提取 `BDUSS`，成功查询容量配额 **2055.0 GB**（已用 1913.86 GB，剩余 141.14 GB），成功遍历根目录下 19 项文件与文件夹。 |
 | **Bilibili (哔哩哔哩)** | `SESSDATA`<br>`bili_jct`<br>`DedeUserID` | 1. 个人中心与资产查询<br>2. 高清分P与Dash流解析<br>3. `yt-dlp` 高清下载 | 🟢 **100% 通过** | 自动提取 `SESSDATA`，成功识别账号等级 Lv.5、大会员特权与硬币，解锁 1080P+ / 4K 高码率视频流。 |
 | **yt-dlp 联动下载** | Netscape 格式 cookies.txt | B 站 1080P+ / 4K 原画视频解析提取 | 🟢 **100% 通过** | 本地服务自动导出标准 Netscape 格式，yt-dlp 无感绕过画质限制并自动下载。 |
@@ -49,6 +50,8 @@ cookie-service-suite/
 │   ├── background.js     # 后台通信 Worker (保持本地 WebSocket 连接)
 │   ├── server.js         # 本地 Bridge 守护服务 (监听 127.0.0.1:18888)
 │   ├── chatgpt_bridge.js # ChatGPT 同源注入桥接脚本
+│   ├── suno_hook.js      # Suno 音频嗅探与解密复用拦截器
+│   ├── minimax_hook.js   # MiniMax 原生 WebSocket 语音合成驱动拦截器
 │   ├── popup.html/js/css # 开发者弹窗界面 (支持一键复制 Header/JSON/Netscape)
 │   └── reload.js         # 命令行一键重载扩展工具
 ├── app_service.py        # 统一本地 RESTful API 服务与可视化管理控制台 (FastAPI)
@@ -65,6 +68,8 @@ cookie-service-suite/
 ├── suno_cli.py           # Suno 独立免服务客户端：免启动后台服务，直接查配额与生成下载
 ├── suno_cli.bat          # Windows 一键执行批处理脚本
 ├── run_suno_cli.py       # Suno 音乐生成命令行工具：与套件服务联动
+├── minimax_service.py    # MiniMax 海螺语音客户端：双通道 WebSocket 语音合成与配额管理
+├── run_minimax_cli.py    # MiniMax 语音合成命令行工具：状态查询、音色试听与音频下载
 ├── baidu_pan_service.py  # 百度网盘业务实现：账号鉴权、配额计算、文件列表遍历
 ├── run_baidu_cli.py      # 百度网盘命令行工具：查看配额、用户信息、列出文件
 ├── bilibili_service.py   # Bilibili 业务封装：用户信息、Dash 直链提取、yt-dlp 联动

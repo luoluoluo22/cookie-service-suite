@@ -37,10 +37,10 @@ class GeminiService:
     def __init__(
         self,
         bridge_url: str = "http://127.0.0.1:18888",
-        proxy: Optional[str] = "http://127.0.0.1:7890",
+        proxy: Optional[str] = None,
     ):
         self.bridge = CookieBridge(bridge_url=bridge_url)
-        self.proxy = proxy
+        self.proxy = proxy or os.environ.get("HTTP_PROXY") or os.environ.get("ALL_PROXY") or "http://127.0.0.1:7897"
         self.client = None
         self._loop = None
 
@@ -93,44 +93,117 @@ class GeminiService:
 class GeminiPace:
     """限制打到 Google 的频率。冷却期内直接拒绝，不再发出上游请求。"""
 
-    def __init__(self) -> None:
+    def __init__(self, max_inflight_timeout: float = 60.0) -> None:
         self._lock = threading.Lock()
         self.last_finished_at = 0.0
         self.blocked_until = 0.0
         self.inflight = False
+        self.inflight_started_at = 0.0
+        self.max_inflight_timeout = max_inflight_timeout
+        self.last_failure_reason = ""
+        self.last_failure_at = 0.0
+
+    def get_status(self) -> Dict[str, Any]:
+        now = time.time()
+        with self._lock:
+            # 挂起超时自动解除
+            if self.inflight and (now - self.inflight_started_at > self.max_inflight_timeout):
+                self.inflight = False
+                self.last_finished_at = now
+                if not self.last_failure_reason:
+                    self.last_failure_reason = f"上一轮调用挂起超时 ({int(self.max_inflight_timeout)}s 未返回，已自动解除锁定)"
+
+            remain_seconds = 0
+            state = "idle"
+            if self.inflight:
+                state = "inflight"
+                elapsed = now - self.inflight_started_at
+                remain_seconds = max(1, int(self.max_inflight_timeout - elapsed))
+            elif now < self.blocked_until:
+                state = "blocked"
+                remain_seconds = max(1, int(self.blocked_until - now))
+            elif self.last_finished_at and (now - self.last_finished_at < GEMINI_MIN_INTERVAL_SECONDS):
+                state = "cooling"
+                remain_seconds = max(1, int(self.last_finished_at + GEMINI_MIN_INTERVAL_SECONDS - now))
+
+            return {
+                "state": state,
+                "can_call": (state == "idle"),
+                "inflight": self.inflight,
+                "inflight_seconds": int(now - self.inflight_started_at) if self.inflight else 0,
+                "retry_after": remain_seconds,
+                "last_finished_at": self.last_finished_at,
+                "blocked_until": self.blocked_until,
+                "last_failure_reason": self.last_failure_reason,
+                "last_failure_at": self.last_failure_at,
+            }
+
+    def reset(self) -> None:
+        """强制复位所有锁与冷却状态"""
+        with self._lock:
+            self.inflight = False
+            self.inflight_started_at = 0.0
+            self.blocked_until = 0.0
+            self.last_finished_at = 0.0
 
     def _wait_message(self, remain: int, blocked: bool) -> str:
         remain = max(1, int(remain))
+        fail_hint = f" 【上次失败原因: {self.last_failure_reason}】" if self.last_failure_reason else ""
         if blocked:
             reason = "上一次请求被 Google 风控页拦住了，服务端已暂停 Gemini 调用。"
         else:
-            reason = f"两次 Gemini 调用至少间隔 {GEMINI_MIN_INTERVAL_SECONDS} 秒，从上一轮结束开始计算。"
+            reason = f"两次 Gemini 调用需至少间隔 {GEMINI_MIN_INTERVAL_SECONDS} 秒（从上一轮结束起算）。"
         return (
-            f"{reason}请等待 {remain} 秒后再试，这期间不要重复点击。"
-            "账号仍是登录状态，立刻重试会让 Google 风控更重。"
+            f"{reason}请等待倒计时 {remain} 秒后再试，这期间请勿重复点击。"
+            f"账号仍是登录状态。{fail_hint}"
         )
 
     def acquire(self) -> None:
         now = time.time()
         with self._lock:
+            # 1. 检查上一轮调用是否已超时失联，若超时则自动强制解除
+            if self.inflight and (now - self.inflight_started_at > self.max_inflight_timeout):
+                self.inflight = False
+                self.last_finished_at = now
+                if not self.last_failure_reason:
+                    self.last_failure_reason = f"上一轮调用挂起超时 ({int(self.max_inflight_timeout)}s)，已自动解除锁定"
+
+            # 2. 仍在调用中
             if self.inflight:
+                elapsed = max(1, int(now - self.inflight_started_at))
+                remain = max(1, int(self.max_inflight_timeout - elapsed))
+                fail_hint = f" 【上次失败原因: {self.last_failure_reason}】" if self.last_failure_reason else ""
                 raise RuntimeError(
-                    "上一次 Gemini 调用还没结束。请等待这次调用结束后再试，不要重复点击。"
-                    "账号仍是登录状态，并发连点会让 Google 风控更重。"
+                    f"上一次 Gemini 调用还没结束（当前已进行 {elapsed} 秒，最长超时还剩 {remain} 秒）。"
+                    f"请等待倒计时 {remain} 秒后再试，不要重复连点。账号仍是登录状态。{fail_hint}"
                 )
+
+            # 3. 风控冷却
             if now < self.blocked_until:
-                raise RuntimeError(self._wait_message(self.blocked_until - now, True))
+                remain = self.blocked_until - now
+                raise RuntimeError(self._wait_message(remain, True))
+
+            # 4. 最小间隔冷却
             if self.last_finished_at and now - self.last_finished_at < GEMINI_MIN_INTERVAL_SECONDS:
                 remain = self.last_finished_at + GEMINI_MIN_INTERVAL_SECONDS - now
                 raise RuntimeError(self._wait_message(remain, False))
+
             self.inflight = True
+            self.inflight_started_at = now
 
     def release(self, message: str = "") -> None:
         with self._lock:
             self.inflight = False
-            self.last_finished_at = time.time()
-            if message and gemini_failure_kind(message) == "blocked":
-                self.blocked_until = max(self.blocked_until, time.time() + GEMINI_BLOCK_SECONDS)
+            self.inflight_started_at = 0.0
+            now = time.time()
+            self.last_finished_at = now
+            if message:
+                self.last_failure_reason = str(message)
+                self.last_failure_at = now
+                if gemini_failure_kind(message) == "blocked":
+                    self.blocked_until = max(self.blocked_until, now + GEMINI_BLOCK_SECONDS)
+            else:
+                self.last_failure_reason = ""
 
 
 def describe_upstream_error(exc: Exception) -> str:
@@ -217,13 +290,13 @@ class MultiAccountGeminiPool:
         self,
         bridge_url: str = "http://127.0.0.1:18888",
         port: int = 18083,
-        proxy: str = "http://127.0.0.1:7890",
+        proxy: Optional[str] = None,
         account_count: int = 4,
         api_key: str = "sk-gemini-cookie-suite",
     ):
         self.bridge = CookieBridge(bridge_url=bridge_url)
         self.port = port
-        self.proxy = proxy
+        self.proxy = proxy or os.environ.get("HTTP_PROXY") or os.environ.get("ALL_PROXY") or "http://127.0.0.1:7897"
         self.account_count = account_count
         self.api_key = api_key
         
@@ -729,37 +802,37 @@ class MultiAccountGeminiPool:
             yield "data: [DONE]\n\n"
             return
 
-        target_model = resolve_model_reasoning(model, reasoning_level)
-        req_data = {
-            "model": target_model,
-            "messages": [{"role": "user", "content": prompt}],
-            "stream": True,
-        }
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{self.port}/v1/chat/completions",
-            data=json.dumps(req_data).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}",
-            },
-        )
-        resp = None
         described = ""
         try:
-            resp = _LOCAL_OPENER.open(req, timeout=timeout)
-        except Exception as first_err:
-            print(f"⚠️ [Gemini Stream] 连接 Go 核心池异常: {first_err}，尝试自愈刷新凭证并重试...", flush=True)
+            target_model = resolve_model_reasoning(model, reasoning_level)
+            req_data = {
+                "model": target_model,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": True,
+            }
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{self.port}/v1/chat/completions",
+                data=json.dumps(req_data).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.api_key}",
+                },
+            )
+            resp = None
             try:
-                self.reset_proxies()
-                self.refresh_pool_cookies()
                 resp = _LOCAL_OPENER.open(req, timeout=timeout)
-            except Exception as retry_err:
-                err_data = {"error": {"message": f"Gemini 调度流式失败 (自愈后仍失败): {retry_err}", "type": "gemini_stream_error"}}
-                yield f"data: {json.dumps(err_data, ensure_ascii=False)}\n\n"
-                yield "data: [DONE]\n\n"
-                return
+            except Exception as first_err:
+                print(f"⚠️ [Gemini Stream] 连接 Go 核心池异常: {first_err}，尝试自愈刷新凭证并重试...", flush=True)
+                try:
+                    self.reset_proxies()
+                    self.refresh_pool_cookies()
+                    resp = _LOCAL_OPENER.open(req, timeout=timeout)
+                except Exception as retry_err:
+                    described = describe_upstream_error(retry_err)
+                    yield self._stream_error_event(RuntimeError(f"Gemini 调度流式失败: {described}"))
+                    yield "data: [DONE]\n\n"
+                    return
 
-        try:
             buffer = b""
             stream_done = False
             while not stream_done:
@@ -789,8 +862,14 @@ class MultiAccountGeminiPool:
 
     def _stream_error_event(self, exc: Exception) -> str:
         from login_status import failure_payload
-        payload = failure_payload(describe_upstream_error(exc), "gemini")
+        pace_status = self._pace.get_status()
+        err_text = describe_upstream_error(exc)
+        payload = failure_payload(err_text, "gemini")
         payload["type"] = "gemini_stream_error"
+        if pace_status.get("retry_after"):
+            payload["retry_after"] = pace_status["retry_after"]
+        if pace_status.get("last_failure_reason"):
+            payload["last_failure_reason"] = pace_status["last_failure_reason"]
         return f"data: {json.dumps({'error': payload}, ensure_ascii=False)}\n\n"
 
     def stream_chat_messages(
@@ -812,37 +891,37 @@ class MultiAccountGeminiPool:
             yield "data: [DONE]\n\n"
             return
 
-        target_model = resolve_model_reasoning(model, reasoning_level)
-        req_data = {
-            "model": target_model,
-            "messages": messages,
-            "stream": True,
-        }
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{self.port}/v1/chat/completions",
-            data=json.dumps(req_data).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}",
-            },
-        )
-        resp = None
         described = ""
         try:
-            resp = _LOCAL_OPENER.open(req, timeout=timeout)
-        except Exception as first_err:
-            print(f"⚠️ [Gemini Stream] 连接 Go 核心池异常: {first_err}，尝试自愈刷新凭证并重试...", flush=True)
+            target_model = resolve_model_reasoning(model, reasoning_level)
+            req_data = {
+                "model": target_model,
+                "messages": messages,
+                "stream": True,
+            }
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{self.port}/v1/chat/completions",
+                data=json.dumps(req_data).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.api_key}",
+                },
+            )
+            resp = None
             try:
-                self.reset_proxies()
-                self.refresh_pool_cookies()
                 resp = _LOCAL_OPENER.open(req, timeout=timeout)
-            except Exception as retry_err:
-                err_data = {"error": {"message": f"Gemini 调度流式失败 (自愈后仍失败): {retry_err}", "type": "gemini_stream_error"}}
-                yield f"data: {json.dumps(err_data, ensure_ascii=False)}\n\n"
-                yield "data: [DONE]\n\n"
-                return
+            except Exception as first_err:
+                print(f"⚠️ [Gemini Stream] 连接 Go 核心池异常: {first_err}，尝试自愈刷新凭证并重试...", flush=True)
+                try:
+                    self.reset_proxies()
+                    self.refresh_pool_cookies()
+                    resp = _LOCAL_OPENER.open(req, timeout=timeout)
+                except Exception as retry_err:
+                    described = describe_upstream_error(retry_err)
+                    yield self._stream_error_event(RuntimeError(f"Gemini 调度流式失败: {described}"))
+                    yield "data: [DONE]\n\n"
+                    return
 
-        try:
             buffer = b""
             stream_done = False
             while not stream_done:
@@ -869,6 +948,14 @@ class MultiAccountGeminiPool:
             yield "data: [DONE]\n\n"
         finally:
             self._pace.release(described)
+
+    def pace_status(self) -> Dict[str, Any]:
+        """获取当前 Gemini 并发与频率控制状态。"""
+        return self._pace.get_status()
+
+    def reset_pace(self) -> None:
+        """强制解除 Gemini 频率与并发保护锁。"""
+        self._pace.reset()
 
     def check_account(self, account_id: int) -> Dict[str, Any]:
         """调用管理接口检测单个账号的会话凭证健康状态。"""

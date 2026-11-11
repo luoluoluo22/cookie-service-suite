@@ -216,10 +216,21 @@ def failure_payload(message: str, service_id: str) -> dict:
     quiet = service_id == "gemini" and gemini_failure_kind(text) in {"pace", "blocked", "unbound"}
     if guide and guide not in text and not quiet:
         text = f"{text} {guide}".strip()
-    return {
+    res = {
         "message": text,
         "type": f"{service_id}_error",
         "login_required": login_required,
         "needs_login": status.get("needs_login") or [],
         "guide": guide,
     }
+    import re
+    m = re.search(r"(?:倒计时|等待|还剩)\s*(\d+)\s*秒", text)
+    if m:
+        try:
+            res["retry_after"] = int(m.group(1))
+        except Exception:
+            pass
+    m_fail = re.search(r"【上次失败原因:\s*(.+?)】", text)
+    if m_fail:
+        res["last_failure_reason"] = m_fail.group(1).strip()
+    return res

@@ -14,3 +14,13 @@ foreach ($target in @(@("api.pid","python"),@("bridge.pid","node"))) {
     Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
   }
 }
+
+# Fallback: check listening ports 18800 and 18888
+foreach ($port in @(18800, 18888)) {
+  $conns = Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue
+  foreach ($conn in $conns) {
+    if ($conn.OwningProcess) {
+      Stop-Process -Id $conn.OwningProcess -Force -ErrorAction SilentlyContinue
+    }
+  }
+}

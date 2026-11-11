@@ -35,6 +35,17 @@
       "js": ["suno_hook.js"],
       "run_at": "document_start",
       "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://*.minimax.io/*",
+        "https://*.minimaxi.com/*",
+        "https://*.hailuo.ai/*",
+        "https://*.hailuoai.com/*"
+      ],
+      "js": ["minimax_hook.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
     }
   ],
   "action": {

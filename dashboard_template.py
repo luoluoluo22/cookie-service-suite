@@ -1138,7 +1138,60 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       return (sec / 60).toFixed(1) + "min";
     }
 
+    let cooldownTimerId = null;
+
+    async function forceResetCooldown() {
+      if (cooldownTimerId) {
+        clearInterval(cooldownTimerId);
+        cooldownTimerId = null;
+      }
+      try {
+        const res = await fetch("/api/gemini/reset-pace", { method: "POST" });
+        const d = await res.json();
+        showToast(d.message || "✅ 已强制解除 Gemini 频率与并发保护锁！");
+      } catch (e) {
+        showToast("⚠️ 解除请求发送失败: " + e.message);
+      }
+      const btn = document.getElementById("btn-send");
+      btn.disabled = false;
+      btn.innerHTML = `<i class="fa-solid fa-paper-plane"></i> 发送请求 (Send Request)`;
+      const statusSpan = document.getElementById("resp-status");
+      statusSpan.innerText = "已手动解锁";
+      statusSpan.className = "text-xs px-2 py-0.5 rounded font-mono bg-emerald-500/20 text-emerald-400";
+    }
+
+    function startCooldownTimer(seconds, failReason) {
+      if (cooldownTimerId) clearInterval(cooldownTimerId);
+      const btn = document.getElementById("btn-send");
+      const statusSpan = document.getElementById("resp-status");
+      let remain = Math.max(1, parseInt(seconds) || 12);
+
+      btn.disabled = false; // 保持可点击以供用户随时强制解锁
+
+      function tick() {
+        if (remain <= 0) {
+          clearInterval(cooldownTimerId);
+          cooldownTimerId = null;
+          btn.innerHTML = `<i class="fa-solid fa-paper-plane"></i> 发送请求 (Send Request)`;
+          statusSpan.innerText = "✅ 倒计时结束，可重新调用";
+          statusSpan.className = "text-xs px-2 py-0.5 rounded font-mono bg-emerald-500/20 text-emerald-400";
+          return;
+        }
+        btn.innerHTML = `<i class="fa-solid fa-hourglass-half fa-spin"></i> 冷却倒计时: ${remain}s (点击强制解锁)`;
+        statusSpan.innerText = `⏳ 等待 ${remain}s`;
+        statusSpan.className = "text-xs px-2 py-0.5 rounded font-mono bg-amber-500/20 text-amber-300 animate-pulse";
+        remain--;
+      }
+
+      tick();
+      cooldownTimerId = setInterval(tick, 1000);
+    }
+
     async function executeApiCall() {
+      if (cooldownTimerId) {
+        await forceResetCooldown();
+        return;
+      }
       const btn = document.getElementById("btn-send");
       const method = document.getElementById("req-method-badge").innerText;
       const endpoint = document.getElementById("req-endpoint").value;
@@ -1153,6 +1206,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const renderedAudio = document.getElementById("rendered-audio");
       const btnDownloadAudio = document.getElementById("btn-download-audio");
       const audioTitle = document.getElementById("audio-preview-title");
+
+      let detectedCooldownSeconds = 0;
+      let detectedFailReason = "";
 
       imgCard.classList.add("hidden");
       if (audioCard) audioCard.classList.add("hidden");
@@ -1223,14 +1279,34 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                       const errObj = typeof parsed.error === "string" ? null : parsed.error;
                       const errMsg = typeof parsed.error === "string" ? parsed.error : (parsed.error.message || JSON.stringify(parsed.error));
                       const needs = ((errObj && errObj.needs_login) || []).map(item => item && item.name).filter(Boolean);
+                      let retryAfter = errObj && errObj.retry_after;
+                      let lastFailReason = errObj && errObj.last_failure_reason;
+                      if (!retryAfter) {
+                        const m = errMsg.match(/(?:倒计时|等待|还剩)\\s*(\\d+)\\s*秒/);
+                        if (m) retryAfter = parseInt(m[1]);
+                      }
+                      if (!lastFailReason) {
+                        const mFail = errMsg.match(/【上次失败原因:\\s*(.+?)】/);
+                        if (mFail) lastFailReason = mFail[1];
+                      }
+                      if (retryAfter) {
+                        detectedCooldownSeconds = retryAfter;
+                        detectedFailReason = lastFailReason || "";
+                      }
                       streamError = errMsg;
                       streamFailed = true;
-                      fullText += String.fromCharCode(10) + "❌ [流式异常 / 上游错误]: " + errMsg;
+                      fullText += String.fromCharCode(10) + "❌ [流式异常 / 频率限制]: " + errMsg;
+                      if (lastFailReason && !errMsg.includes(lastFailReason)) {
+                        fullText += String.fromCharCode(10) + "🔍 [上次失败原因]: " + lastFailReason;
+                      }
+                      if (retryAfter) {
+                        fullText += String.fromCharCode(10) + `⏳ [保护倒计时]: 需等待 ${retryAfter} 秒，按钮已启动实时倒计时，亦可点击按钮强制解锁。`;
+                      }
                       if (needs.length) fullText += " 请登录：" + needs.join("、") + "。";
                       fullText += String.fromCharCode(10);
                       out.innerText = fullText;
                       out.scrollTop = out.scrollHeight;
-                      statusSpan.innerText = "失败";
+                      statusSpan.innerText = retryAfter ? `等待 ${retryAfter}s` : "失败";
                       statusSpan.className = "text-xs px-2 py-0.5 rounded font-mono bg-rose-500/20 text-rose-400";
                       continue;
                     }
@@ -1311,13 +1387,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
         if (contentType.includes("audio") || contentType.includes("video")) {
           if (audioCard && renderedAudio) {
-            renderedAudio.src = endpoint;
+            let audioSrc = endpoint;
+            if (method.toUpperCase() === "POST") {
+              const blob = await resp.blob();
+              audioSrc = URL.createObjectURL(blob);
+            }
+            renderedAudio.src = audioSrc;
+            const isMiniMax = endpoint.includes("minimax") || endpoint.includes("speech");
+            const ext = isMiniMax ? "mp3" : "m4a";
             if (btnDownloadAudio) {
-              btnDownloadAudio.href = endpoint;
-              btnDownloadAudio.download = endpoint.split("/").pop() || "suno_audio.m4a";
+              btnDownloadAudio.href = audioSrc;
+              btnDownloadAudio.download = isMiniMax ? `minimax_${Date.now()}.${ext}` : (endpoint.split("/").pop() || `suno_audio.${ext}`);
             }
             if (audioTitle) {
-              audioTitle.innerText = "Suno 在线流式播放 (" + (endpoint.split("/").pop() || "Clip") + ")";
+              audioTitle.innerText = isMiniMax ? "MiniMax 在线语音试听 (高保真 TTS)" : "Suno 在线流式播放 (" + (endpoint.split("/").pop() || "Clip") + ")";
             }
             audioCard.classList.remove("hidden");
             try { renderedAudio.play(); } catch(e){}
@@ -1328,10 +1411,32 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
         const data = await resp.json();
         const detail = data && data.detail && typeof data.detail === "object" ? data.detail : null;
+        let retryAfter = detail && detail.retry_after;
+        let lastFailReason = detail && detail.last_failure_reason;
+        const rawMsg = (detail && detail.message) || (typeof data.detail === "string" ? data.detail : (data && data.error && data.error.message) || "");
+        if (!retryAfter && rawMsg) {
+          const m = rawMsg.match(/(?:倒计时|等待|还剩)\\s*(\\d+)\\s*秒/);
+          if (m) retryAfter = parseInt(m[1]);
+        }
+        if (!lastFailReason && rawMsg) {
+          const mFail = rawMsg.match(/【上次失败原因:\\s*(.+?)】/);
+          if (mFail) lastFailReason = mFail[1];
+        }
+        if (retryAfter) {
+          detectedCooldownSeconds = retryAfter;
+          detectedFailReason = lastFailReason || "";
+        }
         if (detail && (detail.message || (detail.needs_login || []).length)) {
           const needs = (detail.needs_login || []).map(item => item.name).filter(Boolean);
           const head = [detail.message || "", needs.length ? ("请登录：" + needs.join("、") + "。") : ""].filter(Boolean).join(" ");
-          out.innerText = head + "\\n\\n" + JSON.stringify(data, null, 2);
+          let showText = head;
+          if (lastFailReason && !head.includes(lastFailReason)) {
+            showText += "\n🔍 [上次失败原因]: " + lastFailReason;
+          }
+          if (retryAfter) {
+            showText += `\n⏳ [保护倒计时]: 需等待 ${retryAfter} 秒，按钮已启动倒计时（可点击按钮立即强制解锁）。`;
+          }
+          out.innerText = showText + "\n\n" + JSON.stringify(data, null, 2);
         } else {
           out.innerText = JSON.stringify(data, null, 2);
         }
@@ -1396,8 +1501,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         statusSpan.className = "text-xs px-2 py-0.5 rounded font-mono bg-rose-500/20 text-rose-400";
         out.innerText = "调用异常: " + err.message;
       } finally {
-        btn.disabled = false;
-        btn.innerHTML = `<i class="fa-solid fa-paper-plane"></i> 发送请求 (Send Request)`;
+        if (detectedCooldownSeconds > 0) {
+          startCooldownTimer(detectedCooldownSeconds, detectedFailReason);
+        } else if (!cooldownTimerId) {
+          btn.disabled = false;
+          btn.innerHTML = `<i class="fa-solid fa-paper-plane"></i> 发送请求 (Send Request)`;
+        }
       }
     }
 

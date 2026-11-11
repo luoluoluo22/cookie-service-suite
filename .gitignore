@@ -17,6 +17,11 @@ bili_netscape_test.txt
 *suno_cookie*
 .baidu_cookie*
 *baidu_cookie*
+.minimax_cookie*
+*minimax_cookie*
+.minimax_token*
+*minimax_token*
+runtime_state/
 downloads/
 *.db
 *.sqlite
