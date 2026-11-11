@@ -20,8 +20,8 @@ from typing import Optional, Dict, Any, List
 from pydantic import BaseModel, Field
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query, Path
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, FileResponse
+from fastapi import FastAPI, HTTPException, Query, Path, Request
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, FileResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -34,6 +34,7 @@ from chatgpt_service import chatgpt_service, UnifiedChatGPTService, ChatGPTBridg
 from bilibili_service import BilibiliService
 from baidu_pan_service import BaiduPanService
 from suno_service import SunoService, suno_service
+from login_status import collect_login_status, failure_payload, gemini_failure_should_retry
 from autostart import (
     is_autostart_enabled,
     enable_autostart,
@@ -54,7 +55,7 @@ app = FastAPI(
 # 允许跨域（前端控制台与本地工具调用）
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://127.0.0.1:18800", "http://localhost:18800", "http://127.0.0.1:18888", "http://localhost:18888"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -64,6 +65,16 @@ app.add_middleware(
 ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 if os.path.exists(ASSETS_DIR):
     app.mount("/assets", StaticFiles(directory=ASSETS_DIR), name="assets")
+
+# Reject DNS rebinding and cross-site browser requests before reaching sensitive Cookie/Token APIs.
+@app.middleware("http")
+async def restrict_local_api_origins(request: Request, call_next):
+    host = request.headers.get("host", "").split(":")[0].lower()
+    origin = request.headers.get("origin")
+    allowed_origins = {"http://127.0.0.1:18800", "http://localhost:18800", "http://127.0.0.1:18888", "http://localhost:18888"}
+    if host not in ("127.0.0.1", "localhost") or (origin is not None and origin not in allowed_origins):
+        return PlainTextResponse("Forbidden local API access", status_code=403)
+    return await call_next(request)
 
 # 单例业务客户端
 bridge_hub = CookieBridge()
@@ -137,6 +148,47 @@ class SunoLyricsRequest(BaseModel):
 # ==========================================
 # 1. 核心系统概览与状态接口
 # ==========================================
+def _service_error(status_code: int, message: str, service_id: str) -> None:
+    raise HTTPException(status_code=status_code, detail=failure_payload(message, service_id))
+
+
+def _gemini_stop(message: str) -> None:
+    from login_status import gemini_failure_kind
+
+    kind = gemini_failure_kind(message)
+    _service_error(429 if kind in {"pace", "blocked"} else 502, message, "gemini")
+
+
+@app.get("/api/system/logins", summary="检查各站点是否已在浏览器登录", tags=["系统管理"])
+def get_login_status():
+    """通过 Cookie Hub 判断 Gemini、ChatGPT、百度网盘、Suno、哔哩哔哩哪些还没登录。"""
+    status = collect_login_status()
+    hint = chatgpt_client.public_account()
+    if not hint and chatgpt_client.reverse.is_running():
+        try:
+            usable = [
+                account for account in chatgpt_client.reverse.list_accounts()
+                if account.get("status") not in ("异常", "禁用")
+            ]
+            if usable:
+                plan = str(usable[0].get("type") or "free")
+                hint = {"plan": plan, "plan_label": chatgpt_client.plan_label(plan)}
+        except Exception:
+            hint = {}
+    if hint:
+        for item in status.get("services") or []:
+            if item.get("id") == "chatgpt" and item.get("logged_in"):
+                item["plan"] = hint.get("plan")
+                item["plan_label"] = hint.get("plan_label")
+                item["hint"] = f"浏览器已登录 ChatGPT，当前是{hint.get('plan_label')}账号。"
+                if str(hint.get("plan") or "").lower() == "free":
+                    item["free_models"] = {
+                        "thinking": {"id": "gpt-6-t-mini", "label": "思考（Thinking mini / 6 Thinking）"},
+                        "instant": {"id": "gpt-6", "label": "不思考（Instant / 6 Instant，日常聊天）"},
+                    }
+    return status
+
+
 @app.get("/api/system/overview", summary="获取所有本地子服务运行总览", tags=["系统管理"])
 def get_system_overview():
     """检测 Cookie Hub、Gemini 4账号池、ChatGPT 桥接及系统运行时间。"""
@@ -357,6 +409,8 @@ def gemini_chat(req: ChatRequest):
             print(f"⚠️ [Gemini Chat] 账号 {res.get('account_label')} 返回通用拒绝文案: '{refusal_text}'，自动切换下一个账号重试...", flush=True)
             raise RuntimeError(f"Google 上游会话软拒绝: {refusal_text}")
     except Exception as first_err:
+        if not gemini_failure_should_retry(str(first_err)):
+            _gemini_stop(str(first_err))
         print(f"⚠️ [Gemini Chat] 调度异常: {first_err}，尝试自愈并轮换至下一账号重试...", flush=True)
         # 自动故障自愈：重置代理熔断计数 + 刷新最新 Cookie 凭证后重试一次
         try:
@@ -373,7 +427,7 @@ def gemini_chat(req: ChatRequest):
                 )
         except Exception as retry_err:
             detail_msg = f"Gemini 调度调用失败: {first_err} (自愈重试亦未成功: {retry_err})"
-            raise HTTPException(status_code=502, detail=detail_msg)
+            _service_error(502, detail_msg, "gemini")
 
     return {
         "success": True,
@@ -468,7 +522,7 @@ def get_chatgpt_session():
     try:
         return chatgpt_client.get_session()
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"无法获取 ChatGPT 会话: {str(e)}")
+        _service_error(502, f"无法获取 ChatGPT 会话: {str(e)}", "chatgpt")
 
 
 @app.get("/api/chatgpt/models", summary="获取 ChatGPT 账号可用模型列表", tags=["ChatGPT 逆向与号池"])
@@ -509,7 +563,7 @@ def sync_chatgpt_browser_token():
     try:
         return chatgpt_client.sync_token_from_browser()
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"从浏览器同步 Token 失败: {str(e)}")
+        _service_error(502, f"从浏览器同步 Token 失败: {str(e)}", "chatgpt")
 
 
 @app.post("/api/chatgpt/chat", summary="向 ChatGPT 发起智能对话 (支持逆向与桥接双引擎)", tags=["ChatGPT 逆向与号池"])
@@ -540,7 +594,7 @@ def chatgpt_ask(req: ChatRequest):
         reply = chatgpt_client.ask(req.prompt, model=req.model or "auto")
         return {"success": True, "reply": reply}
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"ChatGPT 提问失败: {str(e)}")
+        _service_error(502, f"ChatGPT 提问失败: {str(e)}", "chatgpt")
 
 
 @app.post("/api/chatgpt/image", summary="ChatGPT 逆向图片生成 (gpt-image-2)", tags=["ChatGPT 逆向与号池"])
@@ -584,7 +638,7 @@ def get_baidupan_quota():
     try:
         return baidu_service.get_quota()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"查询网盘配额失败: {str(e)}")
+        _service_error(500, f"查询网盘配额失败: {str(e)}", "baidu")
 
 
 @app.get("/api/baidupan/user", summary="获取百度网盘账号资料与 VIP 等级", tags=["百度网盘服务"])
@@ -592,7 +646,7 @@ def get_baidupan_user():
     try:
         return baidu_service.get_user_info()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"查询网盘用户失败: {str(e)}")
+        _service_error(500, f"查询网盘用户失败: {str(e)}", "baidu")
 
 
 @app.get("/api/baidupan/files", summary="遍历百度网盘指定目录下的文件", tags=["百度网盘服务"])
@@ -600,7 +654,7 @@ def list_baidupan_files(dir_path: str = Query("/", description="网盘目录路�
     try:
         return baidu_service.list_files(dir_path=dir_path)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"遍历网盘文件失败: {str(e)}")
+        _service_error(500, f"遍历网盘文件失败: {str(e)}", "baidu")
 
 
 @app.post("/api/baidupan/refresh", summary="强制从浏览器刷新百度网盘凭证", tags=["百度网盘服务"])
@@ -608,7 +662,7 @@ def refresh_baidupan_auth():
     try:
         return baidu_service.refresh_auth()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"刷新网盘凭证失败: {str(e)}")
+        _service_error(500, f"刷新网盘凭证失败: {str(e)}", "baidu")
 
 
 # ==========================================
@@ -645,7 +699,7 @@ def get_suno_quota():
     try:
         return suno_client.get_credits()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"查询 Suno 配额失败: {str(e)}")
+        _service_error(500, f"查询 Suno 配额失败: {str(e)}", "suno")
 
 
 def _enrich_suno_clips(clips_data: Any) -> Any:
@@ -669,7 +723,7 @@ def get_suno_feed(page: int = Query(1, ge=1, description="页码")):
         clips = suno_client.get_feed(page=page)
         return _enrich_suno_clips(clips)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"获取 Suno 历史曲库失败: {str(e)}")
+        _service_error(500, f"获取 Suno 历史曲库失败: {str(e)}", "suno")
 
 
 @app.post("/api/suno/generate", summary="提交 Suno 音乐创作任务", tags=["Suno 音乐生成"])
@@ -712,7 +766,7 @@ def generate_suno_music(req: SunoGenerateRequest):
                 "clips": clips,
             }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"提交 Suno 音乐生成失败: {str(e)}")
+        _service_error(500, f"提交 Suno 音乐生成失败: {str(e)}", "suno")
 
 
 @app.get("/api/suno/status", summary="查询指定 clip ids 的生成状态与音频直链", tags=["Suno 音乐生成"])
@@ -722,7 +776,7 @@ def get_suno_status(clip_ids: str = Query(..., description="待查询的 clip ID
         clips = suno_client.fetch_clips_status(id_list)
         return _enrich_suno_clips(clips)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"查询任务状态失败: {str(e)}")
+        _service_error(500, f"查询任务状态失败: {str(e)}", "suno")
 
 
 @app.post("/api/suno/lyrics", summary="使用 Suno AI 单独创作歌词", tags=["Suno 音乐生成"])
@@ -730,7 +784,7 @@ def generate_suno_lyrics(req: SunoLyricsRequest):
     try:
         return suno_client.generate_lyrics(prompt=req.prompt)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"创作歌词失败: {str(e)}")
+        _service_error(500, f"创作歌词失败: {str(e)}", "suno")
 
 
 @app.post("/api/suno/refresh", summary="强制刷新 Suno 凭证与 Clerk JWT 令牌", tags=["Suno 音乐生成"])
@@ -738,7 +792,7 @@ def refresh_suno_auth():
     try:
         return suno_client.refresh_auth()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"刷新 Suno 凭证失败: {str(e)}")
+        _service_error(500, f"刷新 Suno 凭证失败: {str(e)}", "suno")
 
 
 @app.get("/api/suno/audio/{clip_id}", summary="解密并流式播放/下载指定 Clip 音频", tags=["Suno 音乐生成"])
@@ -805,13 +859,15 @@ def openai_chat_completions(req: OpenAIChatRequest):
                 prompt=last_user_msg, model=target_model, reasoning_level=reasoning
             )
         except Exception as first_err:
+            if not gemini_failure_should_retry(str(first_err)):
+                _gemini_stop(str(first_err))
             try:
                 gemini_pool.refresh_pool_cookies()
                 res = gemini_pool.ask_with_details(
                     prompt=last_user_msg, model=target_model, reasoning_level=reasoning
                 )
             except Exception as retry_err:
-                raise HTTPException(status_code=502, detail=f"Gemini 兼容接口调用失败: {str(retry_err)}")
+                _service_error(502, f"Gemini 兼容接口调用失败: {str(retry_err)}", "gemini")
 
         cid = f"chatcmpl-gemini-{int(time.time()*1000)}"
         return {
@@ -892,7 +948,7 @@ def openai_chat_completions(req: OpenAIChatRequest):
                 },
             }
         except Exception as fallback_err:
-            raise HTTPException(status_code=502, detail=f"ChatGPT 兼容调用失败: {str(fallback_err)}")
+            _service_error(502, f"ChatGPT 兼容调用失败: {str(fallback_err)}", "chatgpt")
 
 
 @app.post("/v1/images/generations", summary="OpenAI 兼容图片生成接口", tags=["OpenAI 兼容接口"])
@@ -916,16 +972,18 @@ def openai_image_generations(body: OpenAIImageGenerationRequest):
 REVERSE_MODEL_DESCRIPTIONS = {
     # --- 日常聊天专有模型 (Chat Mode: is_work_mode_model = false) ---
     "auto": "[日常聊天/Auto] ChatGPT 智能自动优选模型",
-    "gpt-6-thinking": "[深度思考/Chat] GPT-6 扩展深度思考链模型 (官方默认首选)",
-    "gpt-6": "[日常聊天/Chat] GPT-6 官方默认新一代架构模型",
+    "gpt-6-thinking": "[思考/旧标识] 当前免费账号的模型列表里没有这个 slug，请改用 gpt-6-t-mini",
+    "gpt-6": "[免费账号/不思考] Instant，选择器短名「6 Instant」，适用于日常聊天。官方备注会自动决定思考时长，不是专用思考模型。",
     "gpt-6-instant": "[极速响应/Chat] GPT-6 极速即时响应模型",
-    "gpt-6-mini": "[轻量紧凑/Chat] GPT-6 轻量紧凑高通量模型",
-    "gpt-6-t-mini": "[轻量思考/Chat] GPT-6 轻量深度思考推理模型",
-    "gpt-5-6-thinking": "[深度思考/Chat] GPT-5.6 扩展深度思考链模型",
-    "gpt-5-6": "[日常聊天/Chat] GPT-5.6 Web 旗舰模型",
+    "gpt-6-mini": "[不思考] reasoning_type=none。当前免费选择器没有单独露出这一项。",
+    "gpt-6-t-mini": "[免费账号/思考] Thinking mini，选择器短名「6 Thinking」，官方说明是快速思考。这是当前免费账号里的思考模型。",
+    "gpt-6-t-mini-mini": "[思考] 更小的思考档。当前免费选择器没有单独露出，露出的思考模型是 gpt-6-t-mini。",
+    "gpt-5-6-thinking": "[思考/旧标识] 当前免费账号的模型列表里没有这个 slug",
+    "gpt-5-6": "[自动] reasoning_type=auto。账号列表里有，不是免费选择器的两个主模型。",
     "gpt-5-6-instant": "[极速响应/Chat] GPT-5.6 极速即时响应模型",
-    "gpt-5-6-mini": "[轻量高效/Chat] GPT-5.6 轻量高效模型",
-    "gpt-5-6-t-mini": "[轻量思考/Chat] GPT-5.6 轻量深度思考推理模型",
+    "gpt-5-6-mini": "[不思考] reasoning_type=none。不是免费选择器里的两个主模型。",
+    "gpt-5-6-t-mini": "[思考] reasoning_type=reasoning。不是免费选择器当前露出的思考档。",
+    "gpt-5-6-t-mini-mini": "[思考] reasoning_type=reasoning。不是免费选择器当前露出的思考档。",
     "research": "[学术研报/Research] ChatGPT 全网深度学术与研报挖掘模型 (Deep Research)",
     "gpt-image-2": "[文生图/Image] ChatGPT 官方逆向绘图专用 (DALL-E 3)",
     "codex-gpt-image-2": "[高清绘图/Codex] ChatGPT Codex 高清画图专用",
@@ -940,6 +998,22 @@ REVERSE_MODEL_DESCRIPTIONS = {
     "gpt-5.6-luna-wm": "[工作台专有/Work] GPT-5.6 Luna 协同工作区模型",
     "gpt-5.6-terra-wm": "[工作台专有/Work] GPT-5.6 Terra 协同工作区模型",
 }
+
+
+def _chatgpt_reasoning(model_id: str) -> str:
+    """免费账号实探：思考是 gpt-6-t-mini，不思考是 gpt-6。"""
+    return {
+        "gpt-6-t-mini": "thinking",
+        "gpt-6-t-mini-mini": "thinking",
+        "gpt-5-6-t-mini": "thinking",
+        "gpt-5-6-t-mini-mini": "thinking",
+        "gpt-6": "instant",
+        "auto": "auto",
+        "gpt-5-6": "auto",
+        "gpt-6-mini": "none",
+        "gpt-5-6-mini": "none",
+        "research": "none",
+    }.get(model_id, "")
 
 
 @app.get("/v1/models", summary="OpenAI 兼容模型列表", tags=["OpenAI 兼容接口"])
@@ -967,7 +1041,7 @@ def openai_models():
                 seen_ids.add(mid)
                 desc = REVERSE_MODEL_DESCRIPTIONS.get(mid, f"[协议逆向直连] ChatGPT 官方模型 ({mid})")
                 is_wm = "-wm" in mid.lower()
-                reverse_models.append({
+                row = {
                     "id": mid,
                     "object": "model",
                     "owned_by": "openai-reverse",
@@ -975,7 +1049,11 @@ def openai_models():
                     "type": "api_reverse",
                     "scene": "work" if is_wm else "chat",
                     "description": desc,
-                })
+                }
+                reasoning = _chatgpt_reasoning(mid)
+                if reasoning:
+                    row["reasoning"] = reasoning
+                reverse_models.append(row)
         except Exception:
             pass
 
@@ -983,7 +1061,7 @@ def openai_models():
     if not reverse_models:
         for mid, desc in REVERSE_MODEL_DESCRIPTIONS.items():
             is_wm = "-wm" in mid.lower()
-            reverse_models.append({
+            row = {
                 "id": mid,
                 "object": "model",
                 "owned_by": "openai-reverse",
@@ -991,7 +1069,11 @@ def openai_models():
                 "type": "api_reverse",
                 "scene": "work" if is_wm else "chat",
                 "description": desc,
-            })
+            }
+            reasoning = _chatgpt_reasoning(mid)
+            if reasoning:
+                row["reasoning"] = reasoning
+            reverse_models.append(row)
 
     # 2. 网页模拟输入模型 (专属 moni 标签)
     moni_models = [

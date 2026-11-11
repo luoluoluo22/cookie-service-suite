@@ -6,6 +6,11 @@ const path = require('path');
 
 const PORT = 18888;
 const HOST = '127.0.0.1'; // 严格绑定到本地回环地址
+// Local-only deployment guard: prevent arbitrary websites from reading browser cookies via localhost.
+const LOCAL_HTTP_ORIGINS = new Set(['http://127.0.0.1:18888', 'http://localhost:18888', 'http://127.0.0.1:18800', 'http://localhost:18800']);
+const LOCAL_HOSTS = new Set(['127.0.0.1:18888', 'localhost:18888']);
+const isExtensionOrigin = origin => /^chrome-extension:\/\/[a-p]{32}$/.test(origin || '');
+const permittedHttpOrigin = origin => !origin || LOCAL_HTTP_ORIGINS.has(origin) || isExtensionOrigin(origin);
 
 // Store active extension WebSocket connections
 const extensionSockets = new Set();
@@ -18,7 +23,15 @@ let currentBridgeTabId = null;
 
 // Create HTTP Server
 const server = http.createServer(async (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
+  const host = (req.headers.host || '').toLowerCase();
+  const origin = req.headers.origin || '';
+  if (!LOCAL_HOSTS.has(host) || !permittedHttpOrigin(origin)) {
+    res.writeHead(403, {'Content-Type':'text/plain; charset=utf-8'});
+    res.end('Forbidden local API access');
+    return;
+  }
+  if (origin) res.setHeader('Access-Control-Allow-Origin', origin);
+  res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
@@ -348,7 +361,7 @@ const server = http.createServer(async (req, res) => {
           'Content-Type': 'text/event-stream; charset=utf-8',
           'Cache-Control': 'no-cache, no-transform',
           'Connection': 'keep-alive',
-          'Access-Control-Allow-Origin': '*'
+          'Access-Control-Allow-Origin': (req.headers.origin || 'http://127.0.0.1:18888')
         });
         if (typeof res.flushHeaders === 'function') res.flushHeaders();
 
@@ -647,6 +660,10 @@ const server = http.createServer(async (req, res) => {
 const wss = new WebSocketServer({ noServer: true });
 
 server.on('upgrade', (request, socket, head) => {
+  if (!LOCAL_HOSTS.has((request.headers.host || '').toLowerCase()) || !isExtensionOrigin(request.headers.origin)) {
+    socket.destroy();
+    return;
+  }
   const parsed = new URL(request.url, `http://${request.headers.host || '127.0.0.1'}`);
   if (parsed.pathname === '/ws') {
     wss.handleUpgrade(request, socket, head, (ws) => {

@@ -10,6 +10,7 @@ import time
 import json
 import sqlite3
 import subprocess
+import threading
 import urllib.request
 import re
 import ssl
@@ -27,6 +28,7 @@ if os.path.exists(_CANDIDATE_SRC) and _CANDIDATE_SRC not in sys.path:
     sys.path.insert(0, _CANDIDATE_SRC)
 
 from cookie_bridge import CookieBridge
+from login_status import GEMINI_BLOCK_SECONDS, GEMINI_MIN_INTERVAL_SECONDS, gemini_failure_kind
 
 
 class GeminiService:
@@ -35,7 +37,7 @@ class GeminiService:
     def __init__(
         self,
         bridge_url: str = "http://127.0.0.1:18888",
-        proxy: Optional[str] = "http://127.0.0.1:7897",
+        proxy: Optional[str] = "http://127.0.0.1:7890",
     ):
         self.bridge = CookieBridge(bridge_url=bridge_url)
         self.proxy = proxy
@@ -86,6 +88,72 @@ class GeminiService:
     def get_quota(self) -> Dict[str, Any]:
         """同步获取账号额度。"""
         return asyncio.run(self.async_get_quota())
+
+
+class GeminiPace:
+    """限制打到 Google 的频率。冷却期内直接拒绝，不再发出上游请求。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.last_finished_at = 0.0
+        self.blocked_until = 0.0
+        self.inflight = False
+
+    def _wait_message(self, remain: int, blocked: bool) -> str:
+        remain = max(1, int(remain))
+        if blocked:
+            reason = "上一次请求被 Google 风控页拦住了，服务端已暂停 Gemini 调用。"
+        else:
+            reason = f"两次 Gemini 调用至少间隔 {GEMINI_MIN_INTERVAL_SECONDS} 秒，从上一轮结束开始计算。"
+        return (
+            f"{reason}请等待 {remain} 秒后再试，这期间不要重复点击。"
+            "账号仍是登录状态，立刻重试会让 Google 风控更重。"
+        )
+
+    def acquire(self) -> None:
+        now = time.time()
+        with self._lock:
+            if self.inflight:
+                raise RuntimeError(
+                    "上一次 Gemini 调用还没结束。请等待这次调用结束后再试，不要重复点击。"
+                    "账号仍是登录状态，并发连点会让 Google 风控更重。"
+                )
+            if now < self.blocked_until:
+                raise RuntimeError(self._wait_message(self.blocked_until - now, True))
+            if self.last_finished_at and now - self.last_finished_at < GEMINI_MIN_INTERVAL_SECONDS:
+                remain = self.last_finished_at + GEMINI_MIN_INTERVAL_SECONDS - now
+                raise RuntimeError(self._wait_message(remain, False))
+            self.inflight = True
+
+    def release(self, message: str = "") -> None:
+        with self._lock:
+            self.inflight = False
+            self.last_finished_at = time.time()
+            if message and gemini_failure_kind(message) == "blocked":
+                self.blocked_until = max(self.blocked_until, time.time() + GEMINI_BLOCK_SECONDS)
+
+
+def describe_upstream_error(exc: Exception) -> str:
+    """把本地号池的 HTTP 502 换成响应正文里的真实原因。"""
+    message = str(exc)
+    body = ""
+    if hasattr(exc, "read"):
+        try:
+            body = exc.read().decode("utf-8", "replace").strip()
+        except Exception:
+            body = ""
+    if body:
+        try:
+            parsed = json.loads(body)
+            err = parsed.get("error") if isinstance(parsed, dict) else None
+            if isinstance(err, dict) and err.get("message"):
+                body = str(err["message"])
+            elif isinstance(err, str):
+                body = err
+        except Exception:
+            pass
+        return body[:500]
+    return message
 
 
 def resolve_model_reasoning(model: str, reasoning_level: str = "off") -> str:
@@ -149,7 +217,7 @@ class MultiAccountGeminiPool:
         self,
         bridge_url: str = "http://127.0.0.1:18888",
         port: int = 18083,
-        proxy: str = "http://127.0.0.1:7897",
+        proxy: str = "http://127.0.0.1:7890",
         account_count: int = 4,
         api_key: str = "sk-gemini-cookie-suite",
     ):
@@ -166,6 +234,7 @@ class MultiAccountGeminiPool:
         self.config_path = os.path.join(self.base_dir, "config_pool.json")
         self.exe_path = os.path.join(self.base_dir, "gemini-web2api.exe")
         self.proc: Optional[subprocess.Popen] = None
+        self._pace = GeminiPace()
 
     def _extract_cookie_header(self) -> str:
         """从 Cookie Hub 提取组装 Google 必要会话鉴权串。"""
@@ -561,6 +630,8 @@ class MultiAccountGeminiPool:
             started = self.start()
             if not started:
                 raise RuntimeError("无法启动本地 Gemini 多账号池代理服务！")
+        self._pace.acquire()
+        described = ""
 
         target_model = resolve_model_reasoning(model, reasoning_level)
 
@@ -589,9 +660,15 @@ class MultiAccountGeminiPool:
             },
         )
         t0 = time.time()
-        with _LOCAL_OPENER.open(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            reply = data["choices"][0]["message"]["content"].strip()
+        try:
+            with _LOCAL_OPENER.open(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                reply = data["choices"][0]["message"]["content"].strip()
+        except Exception as exc:
+            described = describe_upstream_error(exc)
+            raise RuntimeError(described) from exc
+        finally:
+            self._pace.release(described)
         took_ms = int((time.time() - t0) * 1000)
 
         # 从 requests 表查询调度详情 (稍作等待确保 Go 异步协程完成写入)
@@ -645,6 +722,12 @@ class MultiAccountGeminiPool:
         """
         if not self.is_running():
             self.start()
+        try:
+            self._pace.acquire()
+        except Exception as e:
+            yield self._stream_error_event(e)
+            yield "data: [DONE]\n\n"
+            return
 
         target_model = resolve_model_reasoning(model, reasoning_level)
         req_data = {
@@ -661,6 +744,7 @@ class MultiAccountGeminiPool:
             },
         )
         resp = None
+        described = ""
         try:
             resp = _LOCAL_OPENER.open(req, timeout=timeout)
         except Exception as first_err:
@@ -697,9 +781,17 @@ class MultiAccountGeminiPool:
             except Exception:
                 pass
         except Exception as e:
-            err_data = {"error": {"message": str(e), "type": "gemini_stream_error"}}
-            yield f"data: {json.dumps(err_data, ensure_ascii=False)}\n\n"
+            described = describe_upstream_error(e)
+            yield self._stream_error_event(RuntimeError(described))
             yield "data: [DONE]\n\n"
+        finally:
+            self._pace.release(described)
+
+    def _stream_error_event(self, exc: Exception) -> str:
+        from login_status import failure_payload
+        payload = failure_payload(describe_upstream_error(exc), "gemini")
+        payload["type"] = "gemini_stream_error"
+        return f"data: {json.dumps({'error': payload}, ensure_ascii=False)}\n\n"
 
     def stream_chat_messages(
         self,
@@ -713,6 +805,12 @@ class MultiAccountGeminiPool:
         """
         if not self.is_running():
             self.start()
+        try:
+            self._pace.acquire()
+        except Exception as e:
+            yield self._stream_error_event(e)
+            yield "data: [DONE]\n\n"
+            return
 
         target_model = resolve_model_reasoning(model, reasoning_level)
         req_data = {
@@ -729,6 +827,7 @@ class MultiAccountGeminiPool:
             },
         )
         resp = None
+        described = ""
         try:
             resp = _LOCAL_OPENER.open(req, timeout=timeout)
         except Exception as first_err:
@@ -765,9 +864,11 @@ class MultiAccountGeminiPool:
             except Exception:
                 pass
         except Exception as e:
-            err_data = {"error": {"message": str(e), "type": "gemini_stream_error"}}
-            yield f"data: {json.dumps(err_data, ensure_ascii=False)}\n\n"
+            described = describe_upstream_error(e)
+            yield self._stream_error_event(RuntimeError(described))
             yield "data: [DONE]\n\n"
+        finally:
+            self._pace.release(described)
 
     def check_account(self, account_id: int) -> Dict[str, Any]:
         """调用管理接口检测单个账号的会话凭证健康状态。"""

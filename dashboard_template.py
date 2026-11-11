@@ -199,6 +199,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <!-- 主体容器 (调试台排在第一位) -->
     <main class="max-w-7xl w-full mx-auto px-6 py-6 space-y-8">
 
+      <section id="login-guide" class="hidden rounded-2xl border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-100"></section>
+
       <!-- ==================================================== -->
       <!-- [第一位] 调试台 (在线 API 调试与交互工作台)         -->
       <!-- ==================================================== -->
@@ -266,10 +268,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                   <option value="gemini-3.6-flash">gemini-3.6-flash (多模态高通量 · 均衡)</option>
                   <option value="gemini-3.8-flash">gemini-3.8-flash (新版 3.8 Flash 架构)</option>
                   <option value="gemini-4-argon">gemini-4-argon (4 Argon 复杂推理)</option>
-                  <option value="auto">auto (ChatGPT 逆向智能优选)</option>
-                  <option value="gpt-6">gpt-6 (GPT-6 官方默认新架构)</option>
-                  <option value="gpt-6-thinking">gpt-6-thinking (GPT-6 深度思考链)</option>
-                  <option value="gpt-5-6">gpt-5-6 (ChatGPT Web 旗舰)</option>
+                  <option value="auto">auto（免费 · 自动选模型）</option>
+                  <option value="gpt-6">gpt-6（免费 · 不思考 / Instant）</option>
+                  <option value="gpt-6-t-mini">gpt-6-t-mini（免费 · 思考 / Thinking mini）</option>
+                  <option value="gpt-5-6">gpt-5-6（账号列表里有，不是免费选择器主模型）</option>
                   <option value="gpt-image-2">gpt-image-2 (ChatGPT 绘图/动图专用)</option>
                   <option value="chatgpt-web">chatgpt-web (ChatGPT 网页原生)</option>
                 </select>
@@ -1187,6 +1189,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           const reader = resp.body.getReader();
           const decoder = new TextDecoder("utf-8");
           let streamDone = false;
+          let streamFailed = false;
           let fullText = "";
           let firstTokenTime = null;
           let buffer = "";
@@ -1217,11 +1220,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                   try {
                     const parsed = JSON.parse(payload);
                     if (parsed.error) {
+                      const errObj = typeof parsed.error === "string" ? null : parsed.error;
                       const errMsg = typeof parsed.error === "string" ? parsed.error : (parsed.error.message || JSON.stringify(parsed.error));
+                      const needs = ((errObj && errObj.needs_login) || []).map(item => item && item.name).filter(Boolean);
                       streamError = errMsg;
-                      fullText += String.fromCharCode(10) + "❌ [流式异常 / 上游错误]: " + errMsg + String.fromCharCode(10);
+                      streamFailed = true;
+                      fullText += String.fromCharCode(10) + "❌ [流式异常 / 上游错误]: " + errMsg;
+                      if (needs.length) fullText += " 请登录：" + needs.join("、") + "。";
+                      fullText += String.fromCharCode(10);
                       out.innerText = fullText;
                       out.scrollTop = out.scrollHeight;
+                      statusSpan.innerText = "失败";
+                      statusSpan.className = "text-xs px-2 py-0.5 rounded font-mono bg-rose-500/20 text-rose-400";
                       continue;
                     }
                     const delta = parsed.choices?.[0]?.delta?.content || 
@@ -1283,10 +1293,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           const totalTook = Math.round(performance.now() - t0);
           timeSpan.innerText = `首字: ${formatHumanDuration(firstTokenTime || 0)} | 总耗时: ${formatHumanDuration(totalTook)}`;
 
-          if (streamError) {
+          if (streamError || streamFailed) {
             statusSpan.innerText = "Error (流式异常)";
             statusSpan.className = "text-xs px-2 py-0.5 rounded font-mono bg-rose-500/20 text-rose-400";
-            out.innerText = fullText || ("❌ [流式异常]: " + streamError);
+            out.innerText = fullText || ("❌ [流式异常]: " + (streamError || "请求失败"));
           } else if (!fullText.trim()) {
             out.innerText = "⚠️ 上游流式已结束，但未解析出文本内容。\\n建议：\\n1. 请检查上方模型与入参配置；\\n2. 点击上方【从 Cookie Hub 刷新凭证】更新最新会话。";
             statusSpan.innerText = "200 (空响应)";
@@ -1317,7 +1327,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
 
         const data = await resp.json();
-        out.innerText = JSON.stringify(data, null, 2);
+        const detail = data && data.detail && typeof data.detail === "object" ? data.detail : null;
+        if (detail && (detail.message || (detail.needs_login || []).length)) {
+          const needs = (detail.needs_login || []).map(item => item.name).filter(Boolean);
+          const head = [detail.message || "", needs.length ? ("请登录：" + needs.join("、") + "。") : ""].filter(Boolean).join(" ");
+          out.innerText = head + "\\n\\n" + JSON.stringify(data, null, 2);
+        } else {
+          out.innerText = JSON.stringify(data, null, 2);
+        }
 
         // 智能检测图片渲染 (b64_json 或 url 或 data:image)
         try {
@@ -1403,6 +1420,38 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       } finally {
         btn.disabled = false;
       }
+    }
+
+    function renderLoginGuide(data) {
+      const box = document.getElementById("login-guide");
+      if (!box) return;
+      const needs = (data && data.needs_login) || [];
+      const chatgpt = ((data && data.services) || []).find(item => item.id === "chatgpt");
+      const gemini = ((data && data.services) || []).find(item => item.id === "gemini");
+      const gptText = document.getElementById("chatgpt-status-text");
+      if (gptText && chatgpt) {
+        if (chatgpt.logged_in === false) gptText.innerText = "请登录 chatgpt.com";
+        else if (chatgpt.plan_label) gptText.innerText = "已登录 · " + chatgpt.plan_label;
+        else if (chatgpt.logged_in) gptText.innerText = "浏览器已登录";
+      }
+      const geminiText = document.getElementById("gemini-status-text");
+      if (geminiText && gemini && gemini.logged_in === false) geminiText.innerText = "请登录 Gemini";
+      if (!needs.length) {
+        box.classList.add("hidden");
+        box.innerHTML = "";
+        return;
+      }
+      const links = needs.map(item => `<a class="underline decoration-amber-300/70 hover:text-white" href="${item.login_url}" target="_blank" rel="noopener">${item.name}</a>`).join("、");
+      box.classList.remove("hidden");
+      box.innerHTML = `<div class="font-semibold text-amber-200 mb-1">这些服务还没有登录</div><div>请在已加载 Cookie Hub 的浏览器登录：${links}。登录完成后刷新本页即可。</div>`;
+    }
+
+    async function refreshLoginGuide() {
+      try {
+        const res = await fetch("/api/system/logins");
+        if (!res.ok) return;
+        renderLoginGuide(await res.json());
+      } catch (e) {}
     }
 
     async function refreshDashboard() {
@@ -1511,7 +1560,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                   </div>
                 </div>
               </td>
-              <td class="py-3 px-3"><span class="px-2 py-0.5 rounded text-xs font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">可用 (LRU)</span></td>
+              <td class="py-3 px-3"><span class="px-2 py-0.5 rounded text-xs font-bold ${a.status === "enabled" ? "bg-emerald-500/20 text-emerald-400 border border-emerald-500/30" : "bg-slate-700 text-slate-300 border border-slate-600"}">${a.status === "enabled" ? "已启用" : (a.status || "未知")}</span></td>
               <td class="py-3 px-3 text-right space-x-1">
                 <button onclick="checkAccount(${a.id})" class="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-slate-300 border border-slate-700 transition">检测</button>
                 <button onclick="rotateAccount(${a.id})" class="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-amber-400 border border-slate-700 transition">保活</button>
@@ -1520,6 +1569,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             tbody.appendChild(tr);
           });
         }
+        await refreshLoginGuide();
       } catch (e) {
         console.error("刷新失败:", e);
       } finally {

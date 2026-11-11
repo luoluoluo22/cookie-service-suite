@@ -129,7 +129,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--cookie", type=str, default=None, help="临时指定本次使用的 Cookie 字符串")
-    parser.add_argument("--proxy", type=str, default=None, help="指定 HTTP/HTTPS 代理 (默认: http://127.0.0.1:7897)")
+    parser.add_argument("--proxy", type=str, default=None, help="指定 HTTP/HTTPS 代理 (默认: http://127.0.0.1:7890)")
 
     subparsers = parser.add_subparsers(dest="command", help="子命令")
 

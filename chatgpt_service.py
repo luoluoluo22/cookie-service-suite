@@ -16,6 +16,7 @@ ChatGPT Service Suite: 浏览器原生桥接与网页逆向号池双引擎
 """
 
 import os
+import secrets
 import sys
 import time
 import json
@@ -31,7 +32,31 @@ _LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 DEFAULT_BRIDGE_URL = "http://127.0.0.1:18888"
 DEFAULT_REVERSE_PORT = 18084
-DEFAULT_REVERSE_AUTH_KEY = "chatgpt2api"
+def _load_reverse_auth_key() -> str:
+    """Load a private, per-user local key; never commit or log its value."""
+    override = os.getenv("CHATGPT2API_AUTH_KEY", "").strip()
+    if override:
+        return override
+    local_data = os.getenv("LOCALAPPDATA") or os.path.expanduser("~")
+    path = os.path.join(local_data, "CookieServiceSuite", "reverse-auth-key.txt")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if not os.path.isfile(path):
+        key = secrets.token_urlsafe(48)
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            pass
+        else:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(key + "\n")
+    with open(path, encoding="utf-8") as f:
+        key = f.read().strip()
+    if len(key) < 32:
+        raise RuntimeError("local reverse engine key file is invalid")
+    return key
+
+
+DEFAULT_REVERSE_AUTH_KEY = _load_reverse_auth_key()
 
 
 class ChatGPTBridgeClient:
@@ -133,7 +158,7 @@ class ChatGPTReverseEngine:
         self,
         port: int = DEFAULT_REVERSE_PORT,
         auth_key: str = DEFAULT_REVERSE_AUTH_KEY,
-        proxy: str = "http://127.0.0.1:7897",
+        proxy: str = "http://127.0.0.1:7890",
     ):
         self.port = port
         self.base_url = f"http://127.0.0.1:{port}"
@@ -169,31 +194,50 @@ class ChatGPTReverseEngine:
         if self.is_running():
             return True
 
-        uv_bin = shutil.which("uv") or r"C:\Users\Administrator\AppData\Local\Microsoft\WinGet\Links\uv.exe"
-        if not os.path.exists(uv_bin) and not shutil.which("uv"):
-            raise RuntimeError(f"未找到 uv 可执行文件，无法启动逆向服务 (查找路径: {uv_bin})")
-
         env = os.environ.copy()
         if self.proxy:
             env["HTTP_PROXY"] = self.proxy
             env["HTTPS_PROXY"] = self.proxy
+            env["ALL_PROXY"] = self.proxy
         env["NO_PROXY"] = "127.0.0.1,localhost,::1"
+        # The child requires this setting at import time; the manager uses
+        # precisely the same key for authenticated loopback requests.
+        env["CHATGPT2API_AUTH_KEY"] = self.auth_key
 
-        cmd = [
-            uv_bin,
-            "run",
-            "python",
-            "-m",
-            "uvicorn",
-            "api.app:create_app",
-            "--factory",
-            "--port",
-            str(self.port),
-            "--host",
-            "127.0.0.1",
-            "--log-level",
-            "warning",
-        ]
+        venv_python = os.path.join(self.base_dir, ".venv", "Scripts", "python.exe")
+        if os.path.isfile(venv_python):
+            cmd = [
+                venv_python,
+                "-m",
+                "uvicorn",
+                "api.app:create_app",
+                "--factory",
+                "--port",
+                str(self.port),
+                "--host",
+                "127.0.0.1",
+                "--log-level",
+                "warning",
+            ]
+        else:
+            uv_bin = shutil.which("uv") or r"C:\Users\Administrator\AppData\Local\Microsoft\WinGet\Links\uv.exe"
+            if not os.path.exists(uv_bin) and not shutil.which("uv"):
+                raise RuntimeError(f"未找到 uv 可执行文件，无法启动逆向服务 (查找路径: {uv_bin})")
+            cmd = [
+                uv_bin,
+                "run",
+                "python",
+                "-m",
+                "uvicorn",
+                "api.app:create_app",
+                "--factory",
+                "--port",
+                str(self.port),
+                "--host",
+                "127.0.0.1",
+                "--log-level",
+                "warning",
+            ]
 
         flags = 0
         if sys.platform == "win32":
@@ -212,6 +256,7 @@ class ChatGPTReverseEngine:
         deadline = time.time() + wait_timeout
         while time.time() < deadline:
             if self.is_running():
+                self.apply_proxy()
                 return True
             time.sleep(0.5)
 
@@ -276,6 +321,31 @@ class ChatGPTReverseEngine:
         payload = json.dumps({"tokens": [token]}).encode("utf-8")
         req = urllib.request.Request(url, data=payload, headers=self._auth_headers(), method="DELETE")
         with self.opener.open(req, timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def apply_proxy(self) -> bool:
+        """把本地代理写进逆向引擎自己的出口配置。仅设置环境变量不会改变它的直连模式。"""
+        if not self.proxy or not self.is_running():
+            return False
+        url = f"{self.base_url}/api/proxy/runtime"
+        payload = json.dumps({
+            "enabled": True,
+            "egress_mode": "single_proxy",
+            "proxy_url": self.proxy,
+        }).encode("utf-8")
+        req = urllib.request.Request(url, data=payload, headers=self._auth_headers())
+        try:
+            with self.opener.open(req, timeout=8) as resp:
+                return resp.status == 200
+        except Exception:
+            return False
+
+    def update_account(self, token: str, updates: Dict[str, Any]) -> dict:
+        """按浏览器读到的真实方案修正号池账号，例如把过期的 Plus 改成免费。"""
+        url = f"{self.base_url}/api/accounts/update"
+        payload = json.dumps({"access_token": token, **updates}).encode("utf-8")
+        req = urllib.request.Request(url, data=payload, headers=self._auth_headers())
+        with self.opener.open(req, timeout=15) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
     def chat(
@@ -364,21 +434,45 @@ class UnifiedChatGPTService:
         self,
         reverse_port: int = DEFAULT_REVERSE_PORT,
         bridge_url: str = DEFAULT_BRIDGE_URL,
-        proxy: str = "http://127.0.0.1:7897",
+        proxy: str = "http://127.0.0.1:7890",
     ):
         self.reverse = ChatGPTReverseEngine(port=reverse_port, proxy=proxy)
         self.bridge = ChatGPTBridgeClient(base_url=bridge_url)
+        self.live_plan = ""
+        self.live_plan_label = ""
+        self._resyncing = False
 
     def is_reverse_available(self) -> bool:
-        """判断逆向引擎是否在线且有可用账号"""
+        """逆向引擎在线，且号池里至少有一个不是异常/禁用的账号。"""
         if not self.reverse.is_running():
             return False
         try:
             health = self.reverse.get_health()
             accounts = health.get("accounts", {})
-            return (accounts.get("active", 0) > 0) or (accounts.get("total", 0) > 0)
+            return int(accounts.get("active") or 0) > 0
         except Exception:
             return False
+
+    @staticmethod
+    def plan_from_session(session: dict) -> str:
+        account = session.get("account") if isinstance(session, dict) else {}
+        raw = ""
+        if isinstance(account, dict):
+            raw = str(account.get("planType") or account.get("plan_type") or "")
+        raw = raw or str((session or {}).get("accountPlan") or "")
+        key = raw.strip().lower().replace("-", "_").replace(" ", "_")
+        return {
+            "free": "free",
+            "plus": "Plus",
+            "pro": "Pro",
+            "prolite": "ProLite",
+            "pro_lite": "ProLite",
+            "team": "Team",
+        }.get(key, raw or "free")
+
+    @staticmethod
+    def plan_label(plan: str) -> str:
+        return {"free": "免费", "Plus": "Plus", "Pro": "Pro", "ProLite": "ProLite", "Team": "Team"}.get(plan, plan or "免费")
 
     def get_status(self) -> dict:
         """获取综合健康状态"""
@@ -410,6 +504,7 @@ class UnifiedChatGPTService:
                 "server_online": bridge_online,
                 "extension_connected": bridge_ext,
             },
+            "browser_account": self.public_account(),
         }
 
     def check_health(self) -> dict:
@@ -422,24 +517,75 @@ class UnifiedChatGPTService:
             "mode": status["mode"],
         }
 
-    def get_session(self) -> dict:
-        """提取会话信息，优先返回浏览器扩展登录态"""
+    def _open_chatgpt_tab(self) -> None:
+        req = urllib.request.Request(f"{self.bridge.base_url}/chatgpt/open")
+        with self.bridge.opener.open(req, timeout=20) as resp:
+            json.loads(resp.read().decode("utf-8"))
+
+    def read_live_session(self, open_if_missing: bool = True) -> dict:
+        """直接问扩展要浏览器里的真实会话。没有 chatgpt.com 标签时才在后台打开一个。"""
+        data = {}
+        opened = False
+        for attempt in range(6):
+            try:
+                data = self.bridge.get_session()
+            except Exception as exc:
+                data = {"success": False, "error": str(exc)}
+            session = data.get("session") if isinstance(data, dict) else None
+            if isinstance(session, dict) and session.get("accessToken"):
+                return data
+            err = str((data or {}).get("error") or "")
+            needs_tab = ("标签" in err) or ("未找到" in err) or ("chatgpt.com" in err)
+            if open_if_missing and needs_tab and not opened:
+                opened = True
+                try:
+                    self._open_chatgpt_tab()
+                except Exception as exc:
+                    data = {"success": False, "error": str(exc)}
+                    break
+            elif not needs_tab:
+                break
+            time.sleep(1.2)
+        return data if isinstance(data, dict) else {"success": False, "error": "无法读取浏览器会话"}
+
+    def public_account(self) -> dict:
+        if self.live_plan:
+            return {"plan": self.live_plan, "plan_label": self.live_plan_label}
+        if not self.reverse.is_running():
+            return {}
         try:
-            return self.bridge.get_session()
-        except Exception as e:
-            if self.reverse.is_running():
-                accounts = self.reverse.list_accounts()
-                if accounts:
-                    first = accounts[0]
-                    return {
-                        "success": True,
-                        "session": {
-                            "user": {"email": first.get("email", "unknown@chatgpt2api.local"), "name": first.get("name", "Pool User")},
-                            "accountPlan": first.get("type", "free"),
-                            "expires": "N/A (Managed Pool)",
-                        }
-                    }
-            raise RuntimeError(f"无法获取 ChatGPT 会话: {e}")
+            accounts = self.reverse.list_accounts()
+        except Exception:
+            return {}
+        usable = [item for item in accounts if item.get("status") not in ("异常", "禁用")]
+        chosen = usable[0] if usable else (accounts[0] if accounts else None)
+        if not chosen:
+            return {}
+        plan = self.plan_from_session({"accountPlan": chosen.get("type") or "free"})
+        return {"plan": plan, "plan_label": self.plan_label(plan)}
+
+    def get_session(self) -> dict:
+        """读取浏览器扩展里的真实登录态。不返回令牌，也不再用过期的 Plus 号池冒充当前账号。"""
+        data = self.read_live_session(open_if_missing=True)
+        session = data.get("session") if isinstance(data, dict) else None
+        if not isinstance(session, dict) or not session.get("accessToken"):
+            err = str((data or {}).get("error") or "浏览器里没有可用的 ChatGPT 登录态")
+            raise RuntimeError(
+                f"{err}。请在已加载 Cookie Hub 的浏览器打开并登录 https://chatgpt.com/ ，免费账号也可以。"
+            )
+        plan = self.plan_from_session(session)
+        user = session.get("user") if isinstance(session.get("user"), dict) else {}
+        self.live_plan = plan
+        self.live_plan_label = self.plan_label(plan)
+        return {
+            "success": True,
+            "logged_in": True,
+            "source": "browser",
+            "plan": plan,
+            "plan_label": self.live_plan_label,
+            "email": user.get("email") or "",
+            "name": user.get("name") or "",
+        }
 
     def get_models(self) -> dict:
         """获取模型列表，优先从逆向引擎拉取"""
@@ -451,23 +597,96 @@ class UnifiedChatGPTService:
         return self.bridge.get_models()
 
     def sync_token_from_browser(self) -> dict:
-        """从浏览器 Cookie Hub 自动提取 AccessToken 并导入到逆向号池"""
-        session_info = self.bridge.get_session()
-        session = session_info.get("session", {})
-        token = session.get("accessToken")
+        """从扩展读取真实会话，按免费/Plus 等方案写入号池，并清掉已经失效的旧令牌。"""
+        data = self.read_live_session(open_if_missing=True)
+        session = data.get("session") if isinstance(data, dict) else None
+        token = session.get("accessToken") if isinstance(session, dict) else ""
         if not token:
-            raise RuntimeError("未能从浏览器会话中提取到 accessToken，请确认浏览器中已打开并登录 chatgpt.com！")
+            err = str((data or {}).get("error") or "浏览器里没有可用的 ChatGPT 登录态")
+            raise RuntimeError(
+                f"{err}。请在已加载 Cookie Hub 的浏览器打开并登录 https://chatgpt.com/ ，免费账号也可以。"
+            )
 
+        plan = self.plan_from_session(session)
+        user = session.get("user") if isinstance(session.get("user"), dict) else {}
+        self.live_plan = plan
+        self.live_plan_label = self.plan_label(plan)
         if not self.reverse.is_running():
             self.reverse.start()
 
-        res = self.reverse.import_tokens([token])
+        before = set()
+        try:
+            before = {
+                str(account.get("access_token") or "")
+                for account in self.reverse.list_accounts()
+                if account.get("access_token")
+            }
+        except Exception:
+            before = set()
+
+        self.reverse.import_tokens([token])
+        after = []
+        try:
+            after = self.reverse.list_accounts()
+        except Exception:
+            after = []
+
+        kept = []
+        for account in after:
+            current = str(account.get("access_token") or "")
+            if current and (current == token or current not in before):
+                kept.append(current)
+        if not kept:
+            for account in after:
+                current = str(account.get("access_token") or "")
+                if current and account.get("email") and account.get("email") == user.get("email"):
+                    kept.append(current)
+
+        removed = 0
+        for account in after:
+            current = str(account.get("access_token") or "")
+            if current and current not in kept:
+                try:
+                    self.reverse.delete_account(current)
+                    removed += 1
+                except Exception:
+                    pass
+        for current in kept:
+            try:
+                self.reverse.update_account(current, {"type": plan, "status": "正常"})
+            except Exception:
+                pass
+
         return {
             "success": True,
-            "email": session.get("user", {}).get("email"),
-            "plan": session.get("accountPlan", "free"),
-            "import_result": res,
+            "source": "browser",
+            "email": user.get("email") or "",
+            "name": user.get("name") or "",
+            "plan": plan,
+            "plan_label": self.live_plan_label,
+            "replaced_stale_accounts": removed,
+            "message": f"已按浏览器真实登录态同步，当前是{self.live_plan_label}账号。",
         }
+
+    def ensure_live_account(self) -> dict:
+        """号池里没有可用账号时，用扩展里的当前登录态替换掉失效的旧 Plus 令牌。"""
+        if not self.reverse.is_running():
+            self.reverse.start()
+        else:
+            self.reverse.apply_proxy()
+        usable = []
+        try:
+            usable = [
+                account for account in self.reverse.list_accounts()
+                if account.get("status") not in ("异常", "禁用")
+            ]
+        except Exception:
+            usable = []
+        if usable:
+            return {"synced": False, "plan": usable[0].get("type") or self.live_plan or "free"}
+        synced = self.sync_token_from_browser()
+        synced["synced"] = True
+        return synced
 
     def ask(self, prompt: str, model: str = "auto", stream: bool = False) -> Union[str, Generator[str, None, None]]:
         """统一提问接口：
@@ -478,20 +697,15 @@ class UnifiedChatGPTService:
         if "moni" in model_lower or model_lower in ("chatgpt-web", "chatgpt-web-moni"):
             return self.bridge.ask(prompt, model="chatgpt-web", stream=stream)
 
-        # 协议逆向直连通道 (绝不回退到浏览器 DOM 输入，两者严格物理隔离)
-        if not self.reverse.is_running():
-            self.reverse.start()
-
         if stream:
             def _gen():
-                for chunk in self.reverse.chat([{"role": "user", "content": prompt}], model=model, stream=True):
+                for chunk in self.chat([{"role": "user", "content": prompt}], model=model, stream=True):
                     delta = chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
                     if delta:
                         yield delta
             return _gen()
-        else:
-            res = self.reverse.chat([{"role": "user", "content": prompt}], model=model, stream=False)
-            return res["choices"][0]["message"]["content"]
+        res = self.chat([{"role": "user", "content": prompt}], model=model, stream=False)
+        return res["choices"][0]["message"]["content"]
 
     def chat(self, messages: List[Dict[str, Any]], model: str = "auto", stream: bool = False, thinking_effort: str = "") -> Union[dict, Generator[dict, None, None]]:
         """OpenAI 兼容对话调用接口：
@@ -502,20 +716,19 @@ class UnifiedChatGPTService:
         if "moni" in model_lower or model_lower in ("chatgpt-web", "chatgpt-web-moni"):
             return self.bridge.chat(messages, model="chatgpt-web", stream=stream)
 
-        # 协议逆向直连通道 (严格隔离，若报错直接抛出真实异常，禁止篡改用户意图偷调浏览器)
-        if not self.reverse.is_running():
-            self.reverse.start()
+        self.ensure_live_account()
         try:
             return self.reverse.chat(messages, model=model, stream=stream, thinking_effort=thinking_effort)
         except Exception as first_err:
             err_msg = str(first_err).lower()
-            if any(k in err_msg for k in ("429", "401", "quota", "token", "unauthorized", "too many requests")):
+            retryable = any(k in err_msg for k in ("429", "401", "403", "502", "quota", "token", "unauthorized", "anon", "invalid"))
+            if retryable and not self._resyncing:
+                self._resyncing = True
                 try:
-                    sync_res = self.sync_token_from_browser()
-                    if sync_res.get("success"):
-                        return self.reverse.chat(messages, model=model, stream=stream, thinking_effort=thinking_effort)
-                except Exception:
-                    pass
+                    self.sync_token_from_browser()
+                    return self.reverse.chat(messages, model=model, stream=stream, thinking_effort=thinking_effort)
+                finally:
+                    self._resyncing = False
             raise first_err
 
     def generate_image(
