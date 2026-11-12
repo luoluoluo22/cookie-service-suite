@@ -18,6 +18,14 @@ SERVICES = (
         "hint_out": "请登录 Gemini：在已加载 Cookie Hub 的浏览器打开 https://gemini.google.com/ 并登录 Google 账号。",
     },
     {
+        "id": "aistudio",
+        "name": "Google AI Studio",
+        "login_url": "https://aistudio.google.com/",
+        "domains": ("google.com", "aistudio.google.com"),
+        "hint_in": "浏览器里已有 Google 登录凭证，可直接同步至 Google AI Studio 逆向引擎。",
+        "hint_out": "请登录 Google AI Studio：在已加载 Cookie Hub 的浏览器打开 https://aistudio.google.com/ 并登录 Google 账号。",
+    },
+    {
         "id": "chatgpt",
         "name": "ChatGPT",
         "login_url": "https://chatgpt.com/",
@@ -72,8 +80,8 @@ def _names_for(domains):
 
 
 def _logged_in(service_id: str, names: set) -> bool:
-    if service_id == "gemini":
-        return "__Secure-1PSID" in names
+    if service_id in ("gemini", "aistudio"):
+        return "__Secure-1PSID" in names or "SAPISID" in names
     if service_id == "chatgpt":
         return any(name.startswith("__Secure-next-auth.session-token") for name in names)
     if service_id == "baidu":

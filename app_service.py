@@ -36,6 +36,7 @@ from baidu_pan_service import BaiduPanService
 from suno_service import SunoService, suno_service
 from login_status import collect_login_status, failure_payload, gemini_failure_should_retry
 from minimax_service import MinimaxAudioService, minimax_service, PRESET_VOICES, OPENAI_VOICE_MAP
+from aistudio_service import aistudio_service, AIStudioService
 from autostart import (
     is_autostart_enabled,
     enable_autostart,
@@ -85,6 +86,7 @@ bili_service = BilibiliService()
 baidu_service = BaiduPanService()
 suno_client = suno_service
 minimax_client = minimax_service
+aistudio_client = aistudio_service
 
 START_TIME = datetime.datetime.now()
 
@@ -98,6 +100,13 @@ class ChatRequest(BaseModel):
     reasoning_level: Optional[str] = Field("off", description="推理级别: 'off'(关闭思考/极速), 'medium'(中等推理), 'high'(深度扩展思考)", example="off")
     stream: Optional[bool] = Field(True, description="是否启用实时流式输出 (SSE)，默认为 True (首字秒出)", example=True)
     timeout: Optional[int] = Field(300, description="请求超时时间 (秒)，默认 300 秒", example=300)
+
+
+class AIStudioChatRequest(BaseModel):
+    prompt: str = Field(..., description="提问正文或指令内容", example="量子纠缠的基本原理是什么？")
+    model: Optional[str] = Field("gemini-4-argon", description="模型名称 (gemini-4-argon, gemini-3.8-flash 等)", example="gemini-4-argon")
+    stream: Optional[bool] = Field(True, description="是否启用实时流式输出 (SSE)，默认为 True (首字秒出)", example=True)
+    timeout: Optional[int] = Field(120, description="请求超时时间 (秒)，默认 120 秒", example=120)
 
 
 class ChatGPTAccountImportRequest(BaseModel):
@@ -235,6 +244,12 @@ def get_system_overview():
     except Exception:
         pass
 
+    aistudio_status = {}
+    try:
+        aistudio_status = aistudio_client.get_status()
+    except Exception:
+        pass
+
     autostart_ok = False
     autostart_desc = None
     try:
@@ -276,6 +291,16 @@ def get_system_overview():
             "chatgpt_bridge": {
                 "status": "ready" if hub_ok else "waiting_hub",
                 "method": "in_page_hook_sse",
+            },
+            "aistudio": {
+                "port": aistudio_client.port,
+                "status": "running" if aistudio_status.get("running") else "stopped",
+                "running": aistudio_status.get("running", False),
+                "data_plane_ready": aistudio_status.get("data_plane_ready", False),
+                "state": aistudio_status.get("state", "STOPPED"),
+                "accounts_total": aistudio_status.get("accounts_total", 0),
+                "accounts_ready": aistudio_status.get("accounts_ready", 0),
+                "models_count": aistudio_status.get("models_count", 0),
             },
             "minimax_audio": {
                 "status": "ready" if bool(minimax_client.token) else ("connected" if hub_ok else "idle"),
@@ -649,6 +674,125 @@ def chatgpt_image_generation(body: ChatGPTImageRequest):
 
 
 # ==========================================
+# 3.5. Google AI Studio 逆向工程与模型直连
+# ==========================================
+@app.get("/api/aistudio/status", summary="获取 Google AI Studio 逆向服务全景状态", tags=["Google AI Studio 逆向"])
+def aistudio_get_status():
+    """检测 aistudio2api 进程状态、数据面就绪情况、导入账号与可用模型清单。"""
+    try:
+        return aistudio_client.get_status()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取 AI Studio 状态异常: {str(e)}")
+
+
+@app.post("/api/aistudio/start", summary="启动 Google AI Studio 逆向后台服务", tags=["Google AI Studio 逆向"])
+def aistudio_start_service():
+    """手动启动 aistudio2api 核心引擎并激活数据面。"""
+    try:
+        ok = aistudio_client.start()
+        return {
+            "success": ok,
+            "message": "AI Studio 逆向服务已成功启动并就绪" if ok else "启动失败，请检查控制台日志",
+            "status": aistudio_client.get_status(),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"启动 AI Studio 服务失败: {str(e)}")
+
+
+@app.post("/api/aistudio/stop", summary="停止 Google AI Studio 逆向后台服务", tags=["Google AI Studio 逆向"])
+def aistudio_stop_service():
+    """停止 aistudio2api 核心引擎与数据面。"""
+    try:
+        ok = aistudio_client.stop()
+        return {
+            "success": ok,
+            "message": "AI Studio 逆向服务已停止",
+            "status": aistudio_client.get_status(),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"停止 AI Studio 服务失败: {str(e)}")
+
+
+@app.post("/api/aistudio/restart", summary="重启 Google AI Studio 逆向服务", tags=["Google AI Studio 逆向"])
+def aistudio_restart_service():
+    """重启 aistudio2api 引擎并重新加载账号凭证与 BotGuard 引擎。"""
+    try:
+        ok = aistudio_client.restart()
+        return {
+            "success": ok,
+            "message": "AI Studio 逆向服务已重启并重新就绪" if ok else "重启失败",
+            "status": aistudio_client.get_status(),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"重启 AI Studio 服务失败: {str(e)}")
+
+
+@app.get("/api/aistudio/accounts", summary="获取已导入的 AI Studio 账号列表", tags=["Google AI Studio 逆向"])
+def aistudio_list_accounts():
+    """查看已绑定的 Google 账号列表及健康状态。"""
+    try:
+        accounts = aistudio_client.list_accounts()
+        return {"accounts": accounts, "total": len(accounts)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取账号列表失败: {str(e)}")
+
+
+@app.get("/api/aistudio/models", summary="获取 AI Studio 可用原生模型列表", tags=["Google AI Studio 逆向"])
+def aistudio_list_models():
+    """获取 AI Studio 原生暴露的 78+ 模型清单（包括 gemini-4-argon 等最新实验模型）。"""
+    try:
+        models = aistudio_client.list_models()
+        return {"models": models, "total": len(models)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取模型列表失败: {str(e)}")
+
+
+@app.post("/api/aistudio/sync-cookies", summary="从浏览器 Cookie Hub 一键同步 Google 凭证入池", tags=["Google AI Studio 逆向"])
+def aistudio_sync_cookies():
+    """从本地 Cookie Hub 提取最新 google.com 登录凭证并自动生成 account.json 入池。"""
+    try:
+        res = aistudio_client.sync_cookies_from_hub()
+        return res
+    except Exception as e:
+        _service_error(500, f"同步 AI Studio 凭证失败: {str(e)}", "aistudio")
+
+
+@app.post("/api/aistudio/chat", summary="向 Google AI Studio 发起原生智能对话", tags=["Google AI Studio 逆向"])
+def aistudio_chat(req: AIStudioChatRequest):
+    """
+    通过 Google AI Studio Playground 逆向原生通道调用 Gemini 大模型，
+    支持 gemini-4-argon, gemini-3.8-flash 等全系列模型，支持流式 SSE 打字机输出。
+    """
+    try:
+        if req.stream:
+            stream_gen = aistudio_client.chat(
+                prompt=req.prompt,
+                model=req.model or "gemini-4-argon",
+                stream=True,
+                timeout=req.timeout or 120,
+            )
+            return StreamingResponse(
+                stream_gen,
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+        else:
+            result = aistudio_client.chat(
+                prompt=req.prompt,
+                model=req.model or "gemini-4-argon",
+                stream=False,
+                timeout=req.timeout or 120,
+            )
+            return {"success": True, "result": result}
+    except Exception as e:
+        _service_error(502, f"AI Studio 对话请求失败: {str(e)}", "aistudio")
+
+
+# ==========================================
 # 4. Bilibili 业务接口
 # ==========================================
 @app.get("/api/bilibili/user", summary="获取 B 站登录用户信息与大会员资产", tags=["Bilibili 视频特权"])
@@ -924,6 +1068,40 @@ def openai_chat_completions(req: OpenAIChatRequest):
         raise HTTPException(status_code=400, detail="未包含有效的 user 消息")
 
     model_name = (req.model or "gemini-3.5-flash-lite").lower().strip()
+
+    # 0. Google AI Studio 逆向分流
+    if model_name.startswith("aistudio") or model_name.startswith("gemini-4") or "argon" in model_name:
+        actual_model = req.model.replace("aistudio/", "").replace("aistudio-", "") if req.model else "gemini-4-argon"
+        messages_payload = [{"role": m.role, "content": m.content} for m in req.messages]
+        req_timeout = getattr(req, "timeout", None) or 120
+        if req.stream:
+            return StreamingResponse(
+                aistudio_client.chat(
+                    prompt=last_user_msg,
+                    model=actual_model,
+                    stream=True,
+                    messages=messages_payload,
+                    timeout=req_timeout,
+                ),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+        else:
+            try:
+                res = aistudio_client.chat(
+                    prompt=last_user_msg,
+                    model=actual_model,
+                    stream=False,
+                    messages=messages_payload,
+                    timeout=req_timeout,
+                )
+                return res
+            except Exception as e:
+                _service_error(502, f"AI Studio 兼容接口调用失败: {str(e)}", "aistudio")
 
     # 1. Gemini 分流
     if model_name.startswith("gemini"):
@@ -1215,9 +1393,25 @@ def openai_models():
         {"id": "gemini-3.1-pro-thinking", "object": "model", "owned_by": "google-cookie-suite", "tag": "pool", "type": "gemini_pool", "description": "[号池协议直连] 扩展深度思考链模式"},
     ]
 
+    # 4. Google AI Studio 逆向原生模型
+    aistudio_models = []
+    try:
+        raw_ai_models = aistudio_client.list_models()
+        for mid in raw_ai_models[:15]:
+            aistudio_models.append({
+                "id": mid,
+                "object": "model",
+                "owned_by": "google-aistudio-reverse",
+                "tag": "aistudio_reverse",
+                "type": "playground_waa_rpc",
+                "description": f"[AI Studio 逆向直连] 官方 Playground 原生模型 ({mid})",
+            })
+    except Exception:
+        pass
+
     return {
         "object": "list",
-        "data": reverse_models + moni_models + gemini_models,
+        "data": reverse_models + moni_models + gemini_models + aistudio_models,
     }
 
 

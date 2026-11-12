@@ -46,6 +46,14 @@
       "js": ["minimax_hook.js"],
       "run_at": "document_start",
       "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://*.udio.com/*",
+        "https://udio.com/*"
+      ],
+      "js": ["udio_bridge.js"],
+      "run_at": "document_idle"
     }
   ],
   "action": {

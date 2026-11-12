@@ -37,7 +37,20 @@ CLERK_CLIENT_URL = "https://clerk.suno.com/v1/client?_clerk_js_version=5.15.0"
 CLERK_TOKEN_URL_TMPL = "https://clerk.suno.com/v1/client/sessions/{sid}/tokens?_clerk_js_version=5.15.0"
 CLERK_TOKEN_ALT_URL_TMPL = "https://clerk.suno.com/v1/client/sessions/{sid}/tokens/api?_clerk_js_version=5.15.0"
 
-DEFAULT_PROXY = "http://127.0.0.1:7890"
+def get_default_proxy() -> str:
+    env_p = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or os.getenv("ALL_PROXY")
+    if env_p:
+        return env_p
+    import socket
+    for port in (7897, 7890):
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                return f"http://127.0.0.1:{port}"
+        except Exception:
+            pass
+    return "http://127.0.0.1:7897"
+
+DEFAULT_PROXY = get_default_proxy()
 DEFAULT_IMPERSONATE = "edge101"
 
 COOKIE_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".suno_cookie")

@@ -110,6 +110,8 @@ document.addEventListener('DOMContentLoaded', () => {
   loadCookies();
   checkBridgeStatus();
   setupEventListeners();
+  // 弹窗开启期间定时自动同步连接状态
+  setInterval(checkBridgeStatus, 2000);
 });
 
 function setupEventListeners() {
@@ -119,9 +121,13 @@ function setupEventListeners() {
   });
 
   elBridgePill.addEventListener('click', () => {
+    elBridgeText.textContent = '正在连接...';
+    showToast('正在尝试连接本地服务 (127.0.0.1:18888)...');
     chrome.runtime.sendMessage({ type: 'RECONNECT_BRIDGE' }, (res) => {
-      checkBridgeStatus();
-      showToast('正在尝试连接本地服务 (127.0.0.1:18888)...');
+      updateBridgeUI(!!(res && res.isConnected));
+      if (res && res.isConnected) {
+        showToast('已成功连接到本地通信服务 (127.0.0.1:18888)');
+      }
     });
   });
 

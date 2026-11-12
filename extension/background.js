@@ -68,12 +68,24 @@ function connectBridge() {
           return;
         }
 
+        // 1.1 运行环境检测
+        if (req.action === 'get_env') {
+          ws.send(JSON.stringify({
+            id: req.id,
+            action: 'get_env',
+            ua: navigator.userAgent,
+            extensionId: chrome.runtime.id
+          }));
+          return;
+        }
+
         // 1.5 浏览器原生沙箱代理请求 (绕过 Cloudflare TLS / 指纹风控)
         if (req.action === 'proxy_fetch') {
           try {
             const fetchOptions = {
               method: req.method || 'GET',
-              headers: req.headers || {}
+              headers: req.headers || {},
+              credentials: 'include'
             };
             if (req.body) {
               fetchOptions.body = typeof req.body === 'string' ? req.body : JSON.stringify(req.body);
@@ -160,14 +172,45 @@ function connectBridge() {
 
         // 4.65 通用打开指定标签页
         if (req.action === 'open_tab') {
-          const newTab = await chrome.tabs.create({ url: req.url || 'https://www.minimax.io/audio', active: !!req.active });
-          await new Promise(r => setTimeout(r, 3000));
-          ws.send(JSON.stringify({
-            id: req.id,
-            action: 'open_tab',
-            tabId: newTab.id,
-            url: newTab.url
-          }));
+          try {
+            const newTab = await chrome.tabs.create({ url: req.url || 'https://www.udio.com/create', active: req.active === true });
+            ws.send(JSON.stringify({
+              id: req.id,
+              action: 'open_tab',
+              success: true,
+              tabId: newTab.id,
+              url: newTab.url
+            }));
+          } catch (err) {
+            ws.send(JSON.stringify({
+              id: req.id,
+              action: 'open_tab',
+              success: false,
+              error: err.message
+            }));
+          }
+          return;
+        }
+
+        // 4.66 通用导航/跳转指定标签页
+        if (req.action === 'navigate_tab') {
+          try {
+            const tab = await chrome.tabs.update(Number(req.tabId), { url: req.url, active: req.active === true });
+            ws.send(JSON.stringify({
+              id: req.id,
+              action: 'navigate_tab',
+              success: true,
+              tabId: tab.id,
+              url: tab.url
+            }));
+          } catch (err) {
+            ws.send(JSON.stringify({
+              id: req.id,
+              action: 'navigate_tab',
+              success: false,
+              error: err.message
+            }));
+          }
           return;
         }
 
@@ -185,12 +228,24 @@ function connectBridge() {
         // 4.8 任意标签页脚本求值 (Generic Tab Eval)
         if (req.action === 'tab_eval') {
           try {
+            const targetTabId = Number(req.tabId);
+            try {
+              const currentTab = await chrome.tabs.get(targetTabId);
+              if (!currentTab.active) {
+                await chrome.tabs.update(targetTabId, { active: true });
+                await new Promise(r => setTimeout(r, 600));
+              }
+            } catch (e) {}
+
             const results = await chrome.scripting.executeScript({
-              target: { tabId: Number(req.tabId) },
+              target: { tabId: targetTabId },
               world: 'MAIN',
-              func: (codeStr) => {
+              func: async (codeStr) => {
                 try {
-                  const val = eval(codeStr);
+                  let val = eval(codeStr);
+                  if (val && typeof val.then === 'function') {
+                    val = await val;
+                  }
                   return { success: true, result: val };
                 } catch (e) {
                   return { success: false, error: e.message };
@@ -222,6 +277,21 @@ function connectBridge() {
               id: req.id,
               action: req.action,
               ...result
+            }));
+          } catch (err) {
+            ws.send(JSON.stringify({ id: req.id, success: false, error: err.message }));
+          }
+          return;
+        }
+
+        // 5.1 Udio 页面原生桥接 (通过 content script 绕过 Cloudflare/Vercel TLS/WAF)
+        if (req.action && req.action.startsWith('udio_')) {
+          try {
+            const result = await dispatchToUdioTab(req.action, req);
+            ws.send(JSON.stringify({
+              ...result,
+              id: req.id,
+              action: req.action
             }));
           } catch (err) {
             ws.send(JSON.stringify({ id: req.id, success: false, error: err.message }));
@@ -314,6 +384,105 @@ function connectBridge() {
             }));
           } catch (err) {
             ws.send(JSON.stringify({ id: req.id, action: 'suno_execute', success: false, error: err.message }));
+          }
+          return;
+        }
+
+        // 5.95 Udio 页面 DOM 自动化与原生调用（在已登录的 Udio 标签页内执行）
+        if (req.action === 'udio_execute') {
+          try {
+            const allTabs = await chrome.tabs.query({});
+            let tab = allTabs.find(t => (t.url || '').includes('udio.com'));
+            if (!tab) {
+              tab = await chrome.tabs.create({ url: 'https://www.udio.com/create', active: false });
+              await new Promise(r => setTimeout(r, 4000));
+            }
+            const results = await chrome.scripting.executeScript({
+              target: { tabId: tab.id },
+              func: async (operation, payload) => {
+                const rect = (el) => {
+                  const r = el.getBoundingClientRect();
+                  return { x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height) };
+                };
+                if (operation === 'inspect') {
+                  const fields = [...document.querySelectorAll('textarea,input,[contenteditable="true"],[role="textbox"]')].map((el, index) => ({
+                    index, tag: el.tagName, type: el.getAttribute('type'),
+                    placeholder: el.getAttribute('placeholder') || el.getAttribute('data-placeholder') || '',
+                    ariaLabel: el.getAttribute('aria-label') || '',
+                    role: el.getAttribute('role') || '',
+                    className: String(el.className || '').slice(0, 180),
+                    disabled: !!el.disabled, value: el.value || el.innerText || '',
+                    rect: rect(el)
+                  }));
+                  const buttons = [...document.querySelectorAll('button,[role="button"],a')].map((el, index) => ({
+                    index, text: String(el.innerText || el.getAttribute('aria-label') || el.title || '').trim().replace(/\s+/g, ' ').slice(0, 100),
+                    ariaLabel: el.getAttribute('aria-label') || '',
+                    title: el.title || '', disabled: !!el.disabled,
+                    testId: el.getAttribute('data-testid') || '', rect: rect(el)
+                  })).filter(x => x.text || x.ariaLabel || x.title).slice(0, 100);
+                  return { success: true, title: document.title, url: location.href, fields, buttons };
+                }
+                if (operation === 'fill_and_create') {
+                  // 1. 寻找 prompt 输入框
+                  const promptInput = document.querySelector('textarea, input[placeholder*="prompt" i], input[placeholder*="music" i], input[placeholder*="song" i], textarea[placeholder*="describe" i], textarea[placeholder*="music" i]') ||
+                    document.querySelector('textarea') ||
+                    document.querySelector('input[type="text"]');
+                  if (!promptInput) throw new Error('未找到 Udio 描述词输入框');
+
+                  const promptText = String(payload.prompt || '');
+                  promptInput.focus();
+                  const proto = Object.getPrototypeOf(promptInput);
+                  const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+                  if (setter) setter.call(promptInput, promptText); else promptInput.value = promptText;
+                  promptInput.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: promptText }));
+                  promptInput.dispatchEvent(new Event('change', { bubbles: true }));
+
+                  // 2. 如果开启纯器乐 (Instrumental)
+                  if (payload.is_instrumental) {
+                    const buttons = [...document.querySelectorAll('button,[role="button"]')];
+                    const instBtn = buttons.find(b => {
+                      const t = (b.innerText || b.getAttribute('aria-label') || '').toLowerCase();
+                      return t.includes('instrumental') || t.includes('伴奏') || t.includes('器乐');
+                    });
+                    if (instBtn && !instBtn.classList.contains('active') && !instBtn.getAttribute('aria-pressed')) {
+                      instBtn.click();
+                    }
+                  }
+
+                  await new Promise(r => setTimeout(r, 400));
+
+                  // 3. 寻找 Create 按钮
+                  const allButtons = [...document.querySelectorAll('button,[role="button"]')];
+                  const createBtn = allButtons.find(b => {
+                    const txt = String(b.innerText || b.getAttribute('aria-label') || '').trim().toLowerCase();
+                    return (txt === 'create' || txt.startsWith('create ') || txt === '生成') && !b.disabled;
+                  });
+
+                  if (!createBtn) throw new Error('未找到可点击的 Create 按钮 (可能处于禁用状态或文本不匹配)');
+                  createBtn.click();
+
+                  return { success: true, message: '已触发生成按钮点击', prompt: promptText };
+                }
+                if (operation === 'fetch_songs') {
+                  try {
+                    const res = await fetch('/api/songs?page=1&perPage=10');
+                    const data = await res.json();
+                    return { success: true, data };
+                  } catch (e) {
+                    return { success: false, error: e.message };
+                  }
+                }
+                throw new Error('不支持的 Udio 页面操作: ' + operation);
+              },
+              args: [req.operation || 'inspect', req.payload || {}]
+            });
+            ws.send(JSON.stringify({
+              id: req.id, action: 'udio_execute', success: true,
+              result: results && results[0] ? results[0].result : null,
+              tabId: tab.id
+            }));
+          } catch (err) {
+            ws.send(JSON.stringify({ id: req.id, action: 'udio_execute', success: false, error: err.message }));
           }
           return;
         }
@@ -484,9 +653,11 @@ async function getSunoCookiesFromBrowser() {
   try {
     const sunoCookies = await chrome.cookies.getAll({ domain: 'suno.com' });
     const dotSuno = await chrome.cookies.getAll({ domain: '.suno.com' });
+    const authCookies = await chrome.cookies.getAll({ domain: 'auth.suno.com' });
+    const dotAuth = await chrome.cookies.getAll({ domain: '.auth.suno.com' });
     const clerkCookies = await chrome.cookies.getAll({ domain: 'clerk.suno.com' });
     const dotClerk = await chrome.cookies.getAll({ domain: '.clerk.suno.com' });
-    return [...sunoCookies, ...dotSuno, ...clerkCookies, ...dotClerk];
+    return [...sunoCookies, ...dotSuno, ...authCookies, ...dotAuth, ...clerkCookies, ...dotClerk];
   } catch (e) {
     return [];
   }
@@ -496,7 +667,8 @@ async function getSunoCookiesFromBrowser() {
 async function handleSunoAutoFetch(forceVisit = false) {
   try {
     console.log('[CookieHub] 正在检索浏览器中 Suno / Clerk Cookie...');
-    let rawCookies = await getSunoCookiesFromBrowser();
+    const cookieRes = await handleGetCookies('suno.com');
+    let rawCookies = cookieRes.cookies || [];
     let hasAuthToken = rawCookies.some(c => c.name === '__client' || c.name === '__session');
 
     // 如果还没有获取到登录凭据，或者明确指定了强制访问唤醒
@@ -523,7 +695,8 @@ async function handleSunoAutoFetch(forceVisit = false) {
       await new Promise(resolve => setTimeout(resolve, 3500));
 
       // 再次刷新获取最新 Cookie
-      rawCookies = await getSunoCookiesFromBrowser();
+      const reRes = await handleGetCookies('suno.com');
+      rawCookies = reRes.cookies || [];
       hasAuthToken = rawCookies.some(c => c.name === '__client' || c.name === '__session');
 
       // 如果是我们创建的且获取完成，可安全在后台保留或静默关闭
@@ -602,10 +775,6 @@ async function handleMinimaxAutoFetch(forceVisit = false) {
       kv: kv,
       cookies: uniqueCookies
     };
-  } catch (err) {
-    return { success: false, error: err.message };
-  }
-}
   } catch (err) {
     return { success: false, error: err.message };
   }
@@ -913,7 +1082,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ isConnected });
   } else if (msg.type === 'RECONNECT_BRIDGE') {
     connectBridge();
-    sendResponse({ isConnected });
+    if (isConnected) {
+      sendResponse({ isConnected: true });
+    } else {
+      const start = Date.now();
+      const timer = setInterval(() => {
+        if (isConnected) {
+          clearInterval(timer);
+          sendResponse({ isConnected: true });
+        } else if (Date.now() - start > 3500) {
+          clearInterval(timer);
+          sendResponse({ isConnected: false });
+        }
+      }, 100);
+      return true; // 保持异步消息通道
+    }
   } else if (msg.type === 'COOKIE_HUB_LOG') {
     console.log('[In-Page Tab]', msg.text);
   } else if (msg.type === 'COOKIE_HUB_SSE_DEBUG') {
@@ -991,6 +1174,263 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   return true;
 });
+
+// Helper: Safe script execution with timeout
+async function executeScriptWithTimeout(tabId, func, args = [], timeoutMs = 20000) {
+  let timer;
+  const timeoutPromise = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`页面脚本执行超时 (${timeoutMs}ms)`)), timeoutMs);
+  });
+  const execPromise = chrome.scripting.executeScript({
+    target: { tabId },
+    func,
+    args
+  }).then(res => {
+    clearTimeout(timer);
+    return res;
+  }).catch(err => {
+    clearTimeout(timer);
+    throw err;
+  });
+  return Promise.race([execPromise, timeoutPromise]);
+}
+
+// Helper: Ensure Udio tab is opened and loaded
+async function ensureUdioTab() {
+  const allTabs = await chrome.tabs.query({});
+  let tab = allTabs.find(t => t.url && t.url.includes('udio.com'));
+  if (tab) {
+    try {
+      if (!tab.active) {
+        await chrome.tabs.update(tab.id, { active: true });
+        await new Promise(r => setTimeout(r, 800));
+      }
+    } catch (e) {}
+    return tab;
+  }
+
+  // 复用现存空白页或创建新标签页
+  const blankTab = allTabs.find(t => t.url && (t.url.includes('chrome://newtab') || t.url.includes('about:blank')));
+  if (blankTab) {
+    console.log('[CookieHub] 复用空白页导航到 Udio:', blankTab.id);
+    tab = await chrome.tabs.update(blankTab.id, { url: 'https://www.udio.com/create', active: true });
+  } else {
+    console.log('[CookieHub] 未找到已打开的 Udio 页面，正在打开前台标签页...');
+    tab = await chrome.tabs.create({ url: 'https://www.udio.com/create', active: true });
+  }
+
+  for (let i = 0; i < 40; i++) {
+    await new Promise(r => setTimeout(r, 500));
+    try {
+      const current = await chrome.tabs.get(tab.id);
+      if (current.status === 'complete') {
+        await new Promise(r => setTimeout(r, 2000));
+        return current;
+      }
+    } catch (e) {}
+  }
+  return tab;
+}
+
+// Helper: Dispatch action into Udio tab using direct chrome.scripting.executeScript
+async function dispatchToUdioTab(action, payload) {
+  let tab;
+  try {
+    tab = await ensureUdioTab();
+  } catch (err) {
+    return { success: false, error: '打开/获取 Udio 标签页失败: ' + err.message };
+  }
+
+  // 1. 获取当前登录用户信息
+  if (action === 'udio_get_user') {
+    try {
+      const results = await executeScriptWithTimeout(tab.id, async () => {
+        try {
+          const cookies = document.cookie.split('; ');
+          const part0 = (cookies.find(r => r.startsWith('sb-ssr-production-auth-token.0=')) || '').slice('sb-ssr-production-auth-token.0='.length);
+          const part1 = (cookies.find(r => r.startsWith('sb-ssr-production-auth-token.1=')) || '').slice('sb-ssr-production-auth-token.1='.length);
+          const combined = (part0 + part1).replace(/^base64-/, '');
+          let val = combined.replace(/-/g, '+').replace(/_/g, '/');
+          while (val.length % 4 !== 0) val += '=';
+          const decoded = atob(val);
+          const data = JSON.parse(decodeURIComponent(escape(decoded)));
+          return {
+            success: true,
+            email: data.user.email,
+            id: data.user.id,
+            name: data.user.user_metadata?.full_name || data.user.email,
+            user: data.user
+          };
+        } catch (e) {
+          return { success: false, error: e.message };
+        }
+      });
+      return results[0]?.result || { success: false, error: 'No result returned from Udio tab' };
+    } catch (err) {
+      return { success: false, error: '提取 Udio 用户信息失败: ' + err.message };
+    }
+  }
+
+  // 2. 获取曲目列表
+  if (action === 'udio_get_songs') {
+    try {
+      const results = await executeScriptWithTimeout(tab.id, async () => {
+        try {
+          let apiData = null;
+          try {
+            const res = await fetch('/api/songs?page=1&perPage=20');
+            apiData = await res.json();
+          } catch (e) {
+            apiData = { error: e.message };
+          }
+
+          const audios = [...document.querySelectorAll('audio')].map(a => ({
+            src: a.currentSrc || a.src,
+            duration: a.duration,
+            paused: a.paused
+          }));
+
+          const allLinks = [...document.querySelectorAll('a[href*="/songs/"]')].map(a => ({
+            href: a.href,
+            text: (a.innerText || '').trim()
+          }));
+
+          return {
+            success: true,
+            apiData: apiData,
+            audios: audios,
+            links: allLinks
+          };
+        } catch (e) {
+          return { success: false, error: e.message };
+        }
+      });
+      return results[0]?.result || { success: false, error: 'No result returned from Udio tab' };
+    } catch (err) {
+      return { success: false, error: '提取 Udio 曲目失败: ' + err.message };
+    }
+  }
+
+  // 3. 检查 DOM
+  if (action === 'udio_inspect_dom') {
+    try {
+      const results = await executeScriptWithTimeout(tab.id, () => {
+        try {
+          const inputs = [...document.querySelectorAll('textarea, input')].map(i => ({
+            tag: i.tagName,
+            type: i.type,
+            placeholder: i.placeholder,
+            value: i.value
+          }));
+          const buttons = [...document.querySelectorAll('button,[role="button"]')].map(b => ({
+            text: (b.innerText || b.getAttribute('aria-label') || '').trim(),
+            disabled: b.disabled
+          })).filter(b => b.text).slice(0, 40);
+
+          return {
+            success: true,
+            title: document.title,
+            url: window.location.href,
+            inputs,
+            buttons
+          };
+        } catch (e) {
+          return { success: false, error: e.message };
+        }
+      });
+      return results[0]?.result || { success: false, error: 'No result returned from Udio tab' };
+    } catch (err) {
+      return { success: false, error: '检查 Udio DOM 失败: ' + err.message };
+    }
+  }
+
+  // 4. 触发生成
+  if (action === 'udio_generate' || action === 'udio_create') {
+    try {
+      const results = await executeScriptWithTimeout(tab.id, async (promptText, isInstrumental) => {
+        // 方法 1: 直接页面内 fetch 调用 /api/generate-proxy 官方生成端点
+        try {
+          const apiRes = await fetch('/api/generate-proxy', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Accept': 'application/json'
+            },
+            body: JSON.stringify({
+              prompt: promptText,
+              samplerOptions: { seed: -1 }
+            })
+          });
+          const apiData = await apiRes.json();
+          if (apiRes.ok && (apiData.track_ids || apiData.trackIds || apiData.songs || apiData.song_ids || apiData.jobId || apiData.id)) {
+            return { success: true, via: 'api', data: apiData, prompt: promptText };
+          }
+          if (!apiRes.ok) {
+            console.warn('[Udio] generate-proxy API response not ok:', apiRes.status, apiData);
+          }
+        } catch (apiErr) {
+          console.warn('[Udio] generate-proxy fetch failed:', apiErr);
+        }
+
+        // 方法 2: DOM 拟真输入与点击
+        try {
+          const textareas = [...document.querySelectorAll('textarea, input[type="text"]')];
+          const promptInput = textareas.find(el => {
+            const ph = (el.placeholder || '').toLowerCase();
+            return ph.includes('prompt') || ph.includes('describe') || ph.includes('song') || ph.includes('music') || ph.includes('create') || ph.includes('pop-tarts');
+          }) || textareas[0];
+
+          if (promptInput) {
+            promptInput.focus();
+            const lastVal = promptInput.value;
+            promptInput.value = promptText;
+            const tracker = promptInput._valueTracker;
+            if (tracker) tracker.setValue(lastVal);
+            promptInput.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertText', data: promptText }));
+            promptInput.dispatchEvent(new Event('input', { bubbles: true }));
+            promptInput.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+
+          if (isInstrumental) {
+            const radioBtn = document.querySelector('#instrumental') ||
+                             document.querySelector('button[value="instrumental"]');
+            const labelBtn = document.querySelector('label[for="instrumental"]');
+            const isChecked = radioBtn?.getAttribute('aria-checked') === 'true' || radioBtn?.getAttribute('data-state') === 'checked';
+            if (!isChecked) {
+              if (labelBtn) labelBtn.click();
+              else if (radioBtn) radioBtn.click();
+            }
+          }
+
+          await new Promise(r => setTimeout(r, 600));
+
+          const allBtns = [...document.querySelectorAll('button,[role="button"]')];
+          const createBtn = allBtns.find(b => {
+            const t = (b.innerText || b.getAttribute('aria-label') || '').trim().toLowerCase();
+            return (t === 'create' || t.startsWith('create ') || t === '生成') && !b.disabled;
+          });
+
+          if (createBtn) {
+            createBtn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+            createBtn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+            createBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+            createBtn.click();
+            return { success: true, via: 'dom_click', prompt: promptText };
+          }
+
+          return { success: false, error: '未找到可用 Create 按钮 (可能正在生成或额度不足)' };
+        } catch (e) {
+          return { success: false, error: e.message };
+        }
+      }, [payload.prompt || '', payload.is_instrumental !== false]);
+      return results[0]?.result || { success: false, error: 'No result returned from Udio tab' };
+    } catch (err) {
+      return { success: false, error: '触发 Udio 生成失败: ' + err.message };
+    }
+  }
+
+  return { success: false, error: '未知 Udio 操作: ' + action };
+}
 
 // Helper: Dispatch action into ChatGPT tab using direct chrome.scripting.executeScript
 async function dispatchToChatGPTTab(action, payload) {

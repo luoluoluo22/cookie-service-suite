@@ -9,7 +9,7 @@ const HOST = '127.0.0.1'; // 严格绑定到本地回环地址
 // Local-only deployment guard: prevent arbitrary websites from reading browser cookies via localhost.
 const LOCAL_HTTP_ORIGINS = new Set(['http://127.0.0.1:18888', 'http://localhost:18888', 'http://127.0.0.1:18800', 'http://localhost:18800']);
 const LOCAL_HOSTS = new Set(['127.0.0.1:18888', 'localhost:18888']);
-const isExtensionOrigin = origin => /^chrome-extension:\/\/[a-p]{32}$/.test(origin || '');
+const isExtensionOrigin = origin => /^(chrome-extension|extension):\/\/[a-z0-9]{32}$/i.test(origin || '');
 const permittedHttpOrigin = origin => !origin || LOCAL_HTTP_ORIGINS.has(origin) || isExtensionOrigin(origin);
 
 // Store active extension WebSocket connections
@@ -61,6 +61,19 @@ const server = http.createServer(async (req, res) => {
         status: '/status'
       }
     }, null, 2));
+    return;
+  }
+
+  // 1.1 Environment Check
+  if (pathname === '/env') {
+    try {
+      const data = await dispatchToExtension('get_env', {}, 5000);
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(data, null, 2));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
     return;
   }
 
@@ -140,6 +153,21 @@ const server = http.createServer(async (req, res) => {
       const url = parsedUrl.searchParams.get('url') || 'https://www.minimax.io/audio';
       const active = parsedUrl.searchParams.get('active') === 'true';
       const data = await dispatchToExtension('open_tab', { url, active });
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(data, null, 2));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  if (pathname === '/tab/navigate') {
+    try {
+      const tabId = parsedUrl.searchParams.get('tabId');
+      const url = parsedUrl.searchParams.get('url');
+      const active = parsedUrl.searchParams.get('active') === 'true';
+      const data = await dispatchToExtension('navigate_tab', { tabId, url, active });
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify(data, null, 2));
     } catch (err) {
@@ -617,7 +645,28 @@ const server = http.createServer(async (req, res) => {
     try {
       const forceVisit = parsedUrl.searchParams.get('force') === 'true' || parsedUrl.searchParams.get('visit') === 'true';
       const timeout = parseInt(parsedUrl.searchParams.get('timeout')) || 25000;
-      const data = await dispatchToExtension('suno_auto_fetch', { forceVisit, timeout });
+
+      // 优先毫秒级直取 suno.com 及其子域 (auth.suno.com) 完整 Cookie
+      if (!forceVisit) {
+        try {
+          const fastData = await dispatchToExtension('get_cookies', { domain: 'suno.com' }, 5000);
+          if (fastData && fastData.success && fastData.cookies && fastData.cookies.length > 0) {
+            const hasAuth = (fastData.cookies || []).some(c => c.name === '__client' || c.name === '__session');
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({
+              success: true,
+              hasAuth: hasAuth,
+              count: fastData.count || fastData.cookies.length,
+              header: fastData.header || '',
+              kv: fastData.kv || {},
+              cookies: fastData.cookies || []
+            }, null, 2));
+            return;
+          }
+        } catch (e) {}
+      }
+
+      const data = await dispatchToExtension('suno_auto_fetch', { forceVisit, timeout }, timeout);
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify(data, null, 2));
     } catch (err) {
@@ -645,6 +694,109 @@ const server = http.createServer(async (req, res) => {
       });
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify(data, null, 2));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ success: false, error: err.message }));
+    }
+    return;
+  }
+
+  // 5.06 Udio 页面 DOM 自动化与原生调用（由本地 Cookie Hub 扩展在已打开的 Udio 页面执行）
+  if (pathname === '/udio/generate' && req.method === 'POST') {
+    if (extensionSockets.size === 0) {
+      res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ success: false, error: '浏览器扩展未连接本地服务' }));
+      return;
+    }
+    try {
+      const body = await readRequestBody(req);
+      const json = JSON.parse(body || '{}');
+      const data = await dispatchToExtension('udio_generate', {
+        prompt: json.prompt || '',
+        is_instrumental: json.is_instrumental !== false,
+        timeout: json.timeout || 60000
+      }, 60000);
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(data, null, 2));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ success: false, error: err.message }));
+    }
+    return;
+  }
+
+  if (pathname === '/udio/songs' && req.method === 'GET') {
+    if (extensionSockets.size === 0) {
+      res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ success: false, error: '浏览器扩展未连接本地服务' }));
+      return;
+    }
+    try {
+      const data = await dispatchToExtension('udio_get_songs', {}, 45000);
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(data, null, 2));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ success: false, error: err.message }));
+    }
+    return;
+  }
+
+  if (pathname === '/udio/inspect' && (req.method === 'GET' || req.method === 'POST')) {
+    if (extensionSockets.size === 0) {
+      res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ success: false, error: '浏览器扩展未连接本地服务' }));
+      return;
+    }
+    try {
+      const data = await dispatchToExtension('udio_inspect_dom', {}, 45000);
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(data, null, 2));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ success: false, error: err.message }));
+    }
+    return;
+  }
+
+  if (pathname === '/udio/user' && req.method === 'GET') {
+    if (extensionSockets.size === 0) {
+      res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ success: false, error: '浏览器扩展未连接本地服务' }));
+      return;
+    }
+    try {
+      const data = await dispatchToExtension('udio_get_user', {}, 45000);
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(data, null, 2));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ success: false, error: err.message }));
+    }
+    return;
+  }
+
+  // 5.09 Udio Save Audio (/udio/save_audio)
+  if (pathname === '/udio/save_audio' && req.method === 'POST') {
+    try {
+      const songId = req.headers['x-udio-song-id'] || `song_${Date.now()}`;
+      const format = req.headers['x-udio-format'] || 'mp3';
+      const customName = req.headers['x-udio-filename'] ? decodeURIComponent(req.headers['x-udio-filename']) : `${songId}.${format}`;
+
+      const chunks = [];
+      req.on('data', chunk => chunks.push(chunk));
+      req.on('end', () => {
+        const buffer = Buffer.concat(chunks);
+        const downloadDir = path.join(__dirname, '..', 'downloads', 'udio');
+        if (!fs.existsSync(downloadDir)) {
+          fs.mkdirSync(downloadDir, { recursive: true });
+        }
+        const filePath = path.join(downloadDir, customName);
+        fs.writeFileSync(filePath, buffer);
+        console.log(`[Bridge Server] 🎵 成功保存 Udio 音频: ${customName} (${(buffer.length / 1024 / 1024).toFixed(2)} MB)`);
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ success: true, songId, path: filePath, size: buffer.length }));
+      });
     } catch (err) {
       res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify({ success: false, error: err.message }));
@@ -783,12 +935,14 @@ const wss = new WebSocketServer({ noServer: true });
 
 server.on('upgrade', (request, socket, head) => {
   if (!LOCAL_HOSTS.has((request.headers.host || '').toLowerCase()) || !isExtensionOrigin(request.headers.origin)) {
+    console.warn(`[Bridge Server] ⚠️ 拦截 WebSocket 升级: host=${request.headers.host}, origin=${request.headers.origin}`);
     socket.destroy();
     return;
   }
   const parsed = new URL(request.url, `http://${request.headers.host || '127.0.0.1'}`);
   if (parsed.pathname === '/ws') {
     wss.handleUpgrade(request, socket, head, (ws) => {
+      console.log(`[Bridge Server] 🟢 WebSocket 升级成功！Origin: ${request.headers.origin}`);
       wss.emit('connection', ws, request);
     });
   } else {

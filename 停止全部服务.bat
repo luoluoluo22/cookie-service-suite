@@ -20,7 +20,7 @@ import urllib.request, subprocess, sys
 
 print('正在检测并关闭服务...')
 # 尝试通知托盘或检查端口
-for port in [18800, 18888, 18083, 18084]:
+for port in [18800, 18888, 18083, 18084, 2048]:
     try:
         cmd = f'Get-NetTCPConnection -LocalPort {port} -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique'
         res = subprocess.run(['powershell', '-Command', cmd], capture_output=True, text=True)

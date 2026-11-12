@@ -85,7 +85,7 @@ from PIL import Image
 import uvicorn
 
 from generate_icon import ensure_app_icon, PNG_PATH, ICO_PATH
-from app_service import app, gemini_pool, chatgpt_client
+from app_service import app, gemini_pool, chatgpt_client, aistudio_client
 from autostart import (
     is_autostart_enabled,
     enable_autostart,
@@ -98,6 +98,7 @@ SERVER_HOST = "127.0.0.1"
 SERVER_PORT = 18800
 HUB_PORT = 18888
 GEMINI_PORT = 18083
+AISTUDIO_PORT = 2048
 CHATGPT_PORT = 18084
 
 DASHBOARD_URL = f"http://{SERVER_HOST}:{SERVER_PORT}/"
@@ -142,6 +143,8 @@ class TrayAppServer:
             "gemini_accounts": 0,
             "gemini_active": 0,
             "gemini_port": GEMINI_PORT,
+            "aistudio_ok": False,
+            "aistudio_port": AISTUDIO_PORT,
             "chatgpt_ok": False,
             "chatgpt_port": CHATGPT_PORT,
             "uptime_str": "0秒",
@@ -207,20 +210,26 @@ class TrayAppServer:
 
     @staticmethod
     def _ensure_port_available(port: int):
-        """检查并释放被残留孤儿进程占用的端口"""
-        try:
-            cmd = f'netstat -ano | findstr ":{port}" | findstr "LISTENING"'
-            out = subprocess.check_output(cmd, shell=True, text=True, errors="replace")
-            for line in out.strip().split("\n"):
-                parts = line.strip().split()
-                if len(parts) >= 5 and parts[1].endswith(f":{port}"):
-                    pid = int(parts[4])
-                    if pid != os.getpid() and pid > 0:
-                        print(f"⚠️ [API 服务] 端口 {port} 被旧进程 (PID: {pid}) 占用，正在释放...", flush=True)
-                        subprocess.run(f'taskkill /F /PID {pid}', shell=True, capture_output=True)
-                        time.sleep(1.0)
-        except Exception:
-            pass
+        """检查并释放被残留孤儿进程占用的端口，直到端口彻底释放"""
+        for _ in range(5):
+            pids = set()
+            try:
+                cmd = f'netstat -ano | findstr ":{port}" | findstr "LISTENING"'
+                out = subprocess.check_output(cmd, shell=True, text=True, errors="replace")
+                for line in out.strip().split("\n"):
+                    parts = line.strip().split()
+                    if len(parts) >= 5 and parts[1].endswith(f":{port}"):
+                        pid = int(parts[4])
+                        if pid != os.getpid() and pid > 0:
+                            pids.add(pid)
+            except Exception:
+                pass
+            if not pids:
+                break
+            for pid in pids:
+                print(f"⚠️ [API 服务] 端口 {port} 被旧进程 (PID: {pid}) 占用，正在释放...", flush=True)
+                subprocess.run(f'taskkill /F /PID {pid}', shell=True, capture_output=True)
+            time.sleep(1.5)
 
     def start_api_server(self):
         """在后台守护线程中启动 FastAPI + Uvicorn 统一本地 API 服务 (18800)"""
@@ -285,6 +294,22 @@ class TrayAppServer:
             if self.tray_icon:
                 self.tray_icon.notify(f"ChatGPT 服务操作失败: {e}", "错误")
 
+    def toggle_aistudio_engine(self, icon=None, item=None):
+        """启动或关闭 Google AI Studio 网页端逆向服务 (2048)"""
+        try:
+            if aistudio_client.is_running():
+                aistudio_client.stop()
+                if self.tray_icon:
+                    self.tray_icon.notify("AI Studio 逆向引擎已停止。", "服务操作")
+            else:
+                aistudio_client.start()
+                if self.tray_icon:
+                    self.tray_icon.notify("AI Studio 逆向引擎已在后台启动 (端口 2048)！", "服务操作")
+            self._update_service_status()
+        except Exception as e:
+            if self.tray_icon:
+                self.tray_icon.notify(f"AI Studio 服务操作失败: {e}", "错误")
+
     def stop_all_subservices(self):
         """完全停止所有后台衍生子服务"""
         # 1. 停止 FastAPI
@@ -318,6 +343,14 @@ class TrayAppServer:
             if chatgpt_client.reverse.is_running():
                 chatgpt_client.reverse.stop()
                 print("🛑 [ChatGPT 逆向] 服务已停止。", flush=True)
+        except Exception:
+            pass
+
+        # 5. 停止 AI Studio 逆向服务
+        try:
+            if aistudio_client.is_running():
+                aistudio_client.stop()
+                print("🛑 [AI Studio 逆向] 服务已停止。", flush=True)
         except Exception:
             pass
 
@@ -375,7 +408,14 @@ class TrayAppServer:
         except Exception:
             pass
 
-        # 4. ChatGPT 逆向
+        # 4. Google AI Studio 逆向
+        aistudio_ok = False
+        try:
+            aistudio_ok = aistudio_client.is_running()
+        except Exception:
+            pass
+
+        # 5. ChatGPT 逆向
         chatgpt_ok = False
         try:
             chatgpt_ok = chatgpt_client.reverse.is_running()
@@ -390,6 +430,7 @@ class TrayAppServer:
             "gemini_ok": gemini_ok,
             "gemini_accounts": gemini_accounts,
             "gemini_active": gemini_active,
+            "aistudio_ok": aistudio_ok,
             "chatgpt_ok": chatgpt_ok,
             "uptime_str": self._format_uptime(),
             "last_checked": time.time(),
@@ -462,6 +503,11 @@ class TrayAppServer:
             return f"  ├─ 🤖 Gemini 统一池: 🟢 运行中 ({c['gemini_accounts']}账号/{c['gemini_active']}可用)"
         else:
             return "  ├─ 🤖 Gemini 统一池: ⚪ 未启动 (点击启动)"
+
+    def _menu_text_aistudio(self, item=None) -> str:
+        ok = self.status_cache.get("aistudio_ok", False)
+        mark = "🟢 运行中" if ok else "⚪ 未启动"
+        return f"  ├─ 🪄 AI Studio 逆向: {mark} (端口 {AISTUDIO_PORT})"
 
     def _menu_text_chatgpt(self, item=None) -> str:
         ok = self.status_cache["chatgpt_ok"]
@@ -541,7 +587,11 @@ class TrayAppServer:
             f"   - 端口地址: http://127.0.0.1:{GEMINI_PORT}/\n"
             f"   - 运行状态: {'🟢 正常运行中' if c['gemini_ok'] else '⚪ 未启动'}\n"
             f"   - 账号状态: {c['gemini_accounts']} 个账号接入 / {c['gemini_active']} 个可用\n\n"
-            f"4. ⚡ ChatGPT 独立网页逆向后端\n"
+            f"4. 🪄 Google AI Studio 网页逆向引擎\n"
+            f"   - 端口地址: http://127.0.0.1:{AISTUDIO_PORT}/\n"
+            f"   - 运行状态: {'🟢 正常运行中' if c.get('aistudio_ok') else '⚪ 未启动'}\n"
+            f"   - 原生模型: 78+ (支持 gemini-4-argon 等)\n\n"
+            f"5. ⚡ ChatGPT 独立网页逆向后端\n"
             f"   - 端口地址: http://127.0.0.1:{CHATGPT_PORT}/\n"
             f"   - 运行状态: {'🟢 正常运行中' if c['chatgpt_ok'] else '⚪ 未启动'}\n\n"
             "======================================================\n"
@@ -638,6 +688,7 @@ class TrayAppServer:
             pystray.MenuItem(self._menu_text_hub, self.open_hub_status),
             pystray.MenuItem(self._menu_text_extension, self.show_extension_guide),
             pystray.MenuItem(self._menu_text_gemini, self.ensure_gemini_pool),
+            pystray.MenuItem(self._menu_text_aistudio, self.toggle_aistudio_engine),
             pystray.MenuItem(self._menu_text_chatgpt, self.toggle_chatgpt_engine),
             pystray.Menu.SEPARATOR,
             # 常用访问入口

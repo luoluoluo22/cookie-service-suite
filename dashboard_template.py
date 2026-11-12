@@ -96,7 +96,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               <i class="fa-solid fa-chart-pie text-sky-400 w-4 text-center"></i>
               <span class="font-medium">运行概览</span>
             </span>
-            <span class="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 font-mono">5指标</span>
+            <span class="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 font-mono">6指标</span>
           </a>
 
           <!-- 3. 账号看板 (四字) -->
@@ -114,7 +114,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               <i class="fa-solid fa-list-check text-emerald-400 w-4 text-center"></i>
               <span class="font-medium">接口清单</span>
             </span>
-            <span class="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-300 font-mono">36端点</span>
+            <span class="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-300 font-mono">45端点</span>
           </a>
 
           <!-- 5. 文档规范 (四字) -->
@@ -231,8 +231,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               当前: <span class="text-cyan-300 font-semibold">Google Gemini</span> (7个模板)
             </div>
           </div>
-          <div class="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-7 gap-2.5" id="playground-category-nav">
-            <!-- 由 JS 渲染 7 个分类导航按钮 (上图标 + 下名称 + 接口数徽章) -->
+          <div class="grid grid-cols-3 sm:grid-cols-5 md:grid-cols-9 gap-2" id="playground-category-nav">
+            <!-- 由 JS 渲染 9 个分类导航按钮 (上图标 + 下名称 + 接口数徽章) -->
           </div>
         </div>
 
@@ -395,7 +395,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <span class="text-xs text-slate-400">实时子服务运行总线指标</span>
         </div>
 
-        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-4">
           <!-- 1. Cookie Hub -->
           <div class="glass-card rounded-2xl p-4 shadow-xl relative overflow-hidden group">
             <div class="flex justify-between items-start">
@@ -434,7 +434,26 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             </div>
           </div>
 
-          <!-- 3. ChatGPT 逆向工程 -->
+          <!-- 3. Google AI Studio 逆向 -->
+          <div class="glass-card rounded-2xl p-4 shadow-xl relative overflow-hidden group">
+            <div class="flex justify-between items-start">
+              <div>
+                <div class="text-[11px] uppercase tracking-wider text-slate-400 font-semibold mb-1">AI Studio 逆向</div>
+                <div class="text-xl font-bold text-cyan-300 flex items-center gap-2" id="aistudio-status-text">
+                  <span class="inline-block w-2.5 h-2.5 rounded-full bg-emerald-400"></span> 运行中
+                </div>
+              </div>
+              <div class="w-9 h-9 rounded-xl bg-cyan-500/10 text-cyan-400 flex items-center justify-center">
+                <i class="fa-solid fa-wand-magic-sparkles"></i>
+              </div>
+            </div>
+            <div class="mt-3 text-[11px] text-slate-400 flex justify-between">
+              <span id="aistudio-models-count">78+ 原生模型</span>
+              <span>端口: 2048</span>
+            </div>
+          </div>
+
+          <!-- 4. ChatGPT 逆向工程 -->
           <div class="glass-card rounded-2xl p-4 shadow-xl relative overflow-hidden group">
             <div class="flex justify-between items-start">
               <div>
@@ -553,10 +572,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
         <!-- 分类标签过滤器 -->
         <div class="flex flex-wrap items-center gap-2 border-b border-slate-800 pb-3" id="category-tabs">
-          <button onclick="setCategoryFilter('all')" class="category-tab px-3 py-1.5 rounded-lg text-xs font-medium border transition tab-active" data-cat="all">全部 (37)</button>
+          <button onclick="setCategoryFilter('all')" class="category-tab px-3 py-1.5 rounded-lg text-xs font-medium border transition tab-active" data-cat="all">全部 (45)</button>
           <button onclick="setCategoryFilter('gemini')" class="category-tab px-3 py-1.5 rounded-lg text-xs font-medium border border-slate-700 bg-slate-900 text-slate-400 hover:text-slate-200 transition" data-cat="gemini">Google Gemini (7)</button>
+          <button onclick="setCategoryFilter('aistudio')" class="category-tab px-3 py-1.5 rounded-lg text-xs font-medium border border-slate-700 bg-slate-900 text-slate-400 hover:text-slate-200 transition" data-cat="aistudio">Google AI Studio (8)</button>
           <button onclick="setCategoryFilter('openai')" class="category-tab px-3 py-1.5 rounded-lg text-xs font-medium border border-slate-700 bg-slate-900 text-slate-400 hover:text-slate-200 transition" data-cat="openai">OpenAI 兼容 (3)</button>
           <button onclick="setCategoryFilter('chatgpt')" class="category-tab px-3 py-1.5 rounded-lg text-xs font-medium border border-slate-700 bg-slate-900 text-slate-400 hover:text-slate-200 transition" data-cat="chatgpt">ChatGPT 逆向 (9)</button>
+          <button onclick="setCategoryFilter('minimax')" class="category-tab px-3 py-1.5 rounded-lg text-xs font-medium border border-slate-700 bg-slate-900 text-slate-400 hover:text-slate-200 transition" data-cat="minimax">MiniMax 语音 (6)</button>
           <button onclick="setCategoryFilter('system')" class="category-tab px-3 py-1.5 rounded-lg text-xs font-medium border border-slate-700 bg-slate-900 text-slate-400 hover:text-slate-200 transition" data-cat="system">Cookie Hub & 系统 (6)</button>
           <button onclick="setCategoryFilter('ecosystem')" class="category-tab px-3 py-1.5 rounded-lg text-xs font-medium border border-slate-700 bg-slate-900 text-slate-400 hover:text-slate-200 transition" data-cat="ecosystem">生态扩展 (B站/网盘/Suno) (12)</button>
         </div>
@@ -637,19 +658,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <script>
         // 平台分类导航定义 (上图标 + 下名称 + 独立分类)
     const PLATFORM_CATEGORIES = [
-      { key: "all", name: "全部平台", shortName: "全部", icon: "/assets/icons/all.svg", fallbackIcon: "fa-solid fa-shapes text-sky-400", count: 43 },
+      { key: "all", name: "全部平台", shortName: "全部", icon: "/assets/icons/all.svg", fallbackIcon: "fa-solid fa-shapes text-sky-400", count: 51 },
       { key: "gemini", name: "Google Gemini", shortName: "Gemini", icon: "/assets/icons/gemini.svg", fallbackIcon: "fa-solid fa-sparkles text-purple-400", count: 7 },
+      { key: "aistudio", name: "Google AI Studio", shortName: "AI Studio", icon: "/assets/icons/gemini.svg", fallbackIcon: "fa-solid fa-wand-magic-sparkles text-cyan-400", count: 8 },
       { key: "gpt", name: "ChatGPT / OpenAI", shortName: "GPT / 逆向", icon: "/assets/icons/chatgpt.png", fallbackIcon: "fa-solid fa-robot text-emerald-400", count: 12 },
       { key: "minimax", name: "MiniMax 语音", shortName: "MiniMax", icon: "/assets/icons/minimax.png", fallbackIcon: "fa-solid fa-microphone-lines text-rose-400", count: 6 },
       { key: "suno", name: "Suno AI 音乐", shortName: "Suno AI", icon: "/assets/icons/suno.png", fallbackIcon: "fa-solid fa-music text-amber-400", count: 6 },
-      { key: "baidu", name: "百度网盘", shortName: "百度网盘", icon: "/assets/icons/baidupan.png", fallbackIcon: "fa-solid fa-cloud text-blue-400", count: 3 },
+      { key: "baidu", name: "百度网盘", shortName: "百度网盘", icon: "/assets/icons/baidupan.png", fallbackIcon: "fa-solid fa-cloud text-blue-400", count: 4 },
       { key: "bilibili", name: "哔哩哔哩", shortName: "哔哩哔哩", icon: "/assets/icons/bilibili.png", fallbackIcon: "fa-solid fa-tv text-pink-400", count: 2 },
       { key: "system", name: "Cookie Hub & 系统", shortName: "系统服务", icon: "/assets/icons/system.svg", fallbackIcon: "fa-solid fa-terminal text-cyan-400", count: 6 },
     ];
 
     let currentPlaygroundCategory = "gemini";
 
-    // 36 个 API 端点完整定义 (按平台精细化归属)
+    // 51 个 API 端点完整定义 (按平台精细化归属)
     const ALL_ENDPOINTS = [
       // 1. Google Gemini (7)
       { id: "gemini_chat", category: "gemini", method: "POST", url: "/api/gemini/chat", name: "Gemini 智能对话", desc: "4账号 LRU 自动轮换，支持模型切换与思考链推理级别", body: { prompt: "请用一句话告诉我：量子纠缠是什么？", model: "gemini-3.5-flash-lite", reasoning_level: "off", stream: true, timeout: 300 } },
@@ -659,6 +681,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       { id: "gemini_rotate", category: "gemini", method: "POST", url: "/api/gemini/accounts/1/rotate", name: "触发账号令牌保活续期", desc: "向 Google 申请换发最新短命会话票据，防止 Cookie 失效", body: {} },
       { id: "gemini_refresh", category: "gemini", method: "POST", url: "/api/gemini/refresh", name: "从 Cookie Hub 刷新凭证", desc: "从浏览器提取最新鉴权 Cookie 并批量写入 SQLite 数据库", body: {} },
       { id: "gemini_requests", category: "gemini", method: "GET", url: "/api/gemini/requests?limit=10", name: "请求调度轨迹历史", desc: "查看最近请求调度轨迹与各账号响应延迟历史", body: null },
+
+      // 1.5. Google AI Studio 逆向直连 (8)
+      { id: "aistudio_chat", category: "aistudio", method: "POST", url: "/api/aistudio/chat", name: "AI Studio 原生智能对话", desc: "走 Google 官方 Playground 原生通道，支持 gemini-4-argon, gemini-3.8-flash 等 78+ 模型与 SSE 流式打字机输出", body: { prompt: "请用一句话告诉我：量子纠缠是什么？", model: "gemini-4-argon", stream: true, timeout: 120 } },
+      { id: "aistudio_status", category: "aistudio", method: "GET", url: "/api/aistudio/status", name: "AI Studio 逆向服务状态", desc: "检测 aistudio2api 本地核心引擎 (2048)、数据面与 BotGuard 状态", body: null },
+      { id: "aistudio_models", category: "aistudio", method: "GET", url: "/api/aistudio/models", name: "AI Studio 可用原生模型列表", desc: "获取 78 个原生暴露的 Google 最新大模型清单 (gemini-4-argon, gemini-3.8-flash 等)", body: null },
+      { id: "aistudio_accounts", category: "aistudio", method: "GET", url: "/api/aistudio/accounts", name: "AI Studio 号池账号清单", desc: "查看当前绑定的 Google AI Studio 账号列表及健康度", body: null },
+      { id: "aistudio_sync", category: "aistudio", method: "POST", url: "/api/aistudio/sync-cookies", name: "从 Cookie Hub 一键同步入池", desc: "从浏览器 Cookie Hub 自动提取 google.com Cookie 并载入 AI Studio 号池", body: {} },
+      { id: "aistudio_start", category: "aistudio", method: "POST", url: "/api/aistudio/start", name: "启动 AI Studio 独立逆向", desc: "启动本地 aistudio2api 无头服务并激活数据面", body: {} },
+      { id: "aistudio_stop", category: "aistudio", method: "POST", url: "/api/aistudio/stop", name: "停止 AI Studio 逆向服务", desc: "优雅停止本地 aistudio2api 进程与数据面", body: {} },
+      { id: "aistudio_restart", category: "aistudio", method: "POST", url: "/api/aistudio/restart", name: "重启 AI Studio 逆向服务", desc: "重启核心进程并重载 BotGuard 与账号池", body: {} },
 
       // 2. OpenAI 兼容规范 (3)
       { id: "openai_chat", category: "openai", method: "POST", url: "/v1/chat/completions", name: "OpenAI 兼容聊天接口", desc: "无缝对接 NextChat、Chatbox、Cursor，底层分流 Gemini 与 ChatGPT", body: { model: "gemini-3.5-flash-lite", messages: [{ role: "user", content: "请用一句话告诉我：量子纠缠是什么？" }], reasoning_level: "off", stream: true } },
@@ -719,7 +751,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     function endpointMatchesPlatform(ep, platformKey) {
       if (platformKey === "all") return true;
       if (platformKey === "gemini") return ep.category === "gemini";
+      if (platformKey === "aistudio") return ep.category === "aistudio";
       if (platformKey === "gpt") return ep.category === "chatgpt" || ep.category === "openai";
+      if (platformKey === "minimax") return ep.category === "minimax";
       if (platformKey === "suno") return ep.category === "suno";
       if (platformKey === "baidu") return ep.category === "baidu";
       if (platformKey === "bilibili") return ep.category === "bilibili";
@@ -729,7 +763,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     function getPlatformKeyForEndpoint(ep) {
       if (ep.category === "gemini") return "gemini";
+      if (ep.category === "aistudio") return "aistudio";
       if (ep.category === "chatgpt" || ep.category === "openai") return "gpt";
+      if (ep.category === "minimax") return "minimax";
       if (ep.category === "suno") return "suno";
       if (ep.category === "baidu") return "baidu";
       if (ep.category === "bilibili") return "bilibili";
@@ -804,8 +840,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         let html = "";
         const groups = [
           { label: "── Google Gemini 4账号统一池 ──", key: "gemini" },
+          { label: "── Google AI Studio 逆向直连 ──", key: "aistudio" },
           { label: "── OpenAI 标准兼容接口 ──", key: "openai" },
           { label: "── ChatGPT 逆向工程与号池 ──", key: "chatgpt" },
+          { label: "── MiniMax 语音合成 ──", key: "minimax" },
           { label: "── Suno AI 音乐创作 ──", key: "suno" },
           { label: "── 百度网盘 存储与资产 ──", key: "baidu" },
           { label: "── 哔哩哔哩 视频与特权 ──", key: "bilibili" },
@@ -866,6 +904,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         else if (currentCategory === "chatgpt") matchesCategory = ep.category === "chatgpt";
         else if (currentCategory === "openai") matchesCategory = ep.category === "openai";
         else if (currentCategory === "gemini") matchesCategory = ep.category === "gemini";
+        else if (currentCategory === "aistudio") matchesCategory = ep.category === "aistudio";
+        else if (currentCategory === "minimax") matchesCategory = ep.category === "minimax";
         else if (currentCategory === "system") matchesCategory = ep.category === "system";
         else matchesCategory = (ep.category === currentCategory);
         if (!matchesCategory) return false;
@@ -876,7 +916,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                ep.method.toLowerCase().includes(searchKeyword);
       });
 
-      document.getElementById("endpoints-count-badge").innerText = `展示 ${filtered.length} / 共 37 个端点`;
+      document.getElementById("endpoints-count-badge").innerText = `展示 ${filtered.length} / 共 ${ALL_ENDPOINTS.length} 个端点`;
 
       if (filtered.length === 0) {
         grid.innerHTML = `<div class="col-span-full py-8 text-center text-slate-500 text-xs">未找到匹配的 API 端点</div>`;
@@ -1431,12 +1471,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           const head = [detail.message || "", needs.length ? ("请登录：" + needs.join("、") + "。") : ""].filter(Boolean).join(" ");
           let showText = head;
           if (lastFailReason && !head.includes(lastFailReason)) {
-            showText += "\n🔍 [上次失败原因]: " + lastFailReason;
+            showText += "\\n🔍 [上次失败原因]: " + lastFailReason;
           }
           if (retryAfter) {
             showText += `\n⏳ [保护倒计时]: 需等待 ${retryAfter} 秒，按钮已启动倒计时（可点击按钮立即强制解锁）。`;
           }
-          out.innerText = showText + "\n\n" + JSON.stringify(data, null, 2);
+          out.innerText = showText + "\\n\\n" + JSON.stringify(data, null, 2);
         } else {
           out.innerText = JSON.stringify(data, null, 2);
         }
@@ -1545,6 +1585,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
       const geminiText = document.getElementById("gemini-status-text");
       if (geminiText && gemini && gemini.logged_in === false) geminiText.innerText = "请登录 Gemini";
+      const aistudio = ((data && data.services) || []).find(item => item.id === "aistudio");
+      const aisText = document.getElementById("aistudio-status-text");
+      if (aisText && aistudio && aistudio.logged_in === false) aisText.innerText = "请登录 AI Studio";
       if (!needs.length) {
         box.classList.add("hidden");
         box.innerHTML = "";
@@ -1580,6 +1623,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             : `<span class="inline-block w-2.5 h-2.5 rounded-full bg-rose-400"></span> 扩展未连接`;
           document.getElementById("hub-clients").innerText = `客户端: ${sys.services?.cookie_hub?.clients || 0}`;
           document.getElementById("gemini-status-text").innerText = `${sys.services?.gemini_pool?.active_accounts || 4} 账号就绪`;
+
+          const ais = sys.services?.aistudio;
+          const aisText = document.getElementById("aistudio-status-text");
+          const aisModels = document.getElementById("aistudio-models-count");
+          if (aisText && ais) {
+            if (ais.running && ais.data_plane_ready) {
+              aisText.innerHTML = `<span class="inline-block w-2.5 h-2.5 rounded-full bg-emerald-400"></span> 运行中`;
+            } else if (ais.running) {
+              aisText.innerHTML = `<span class="inline-block w-2.5 h-2.5 rounded-full bg-cyan-400"></span> 待命`;
+            } else {
+              aisText.innerHTML = `<span class="inline-block w-2.5 h-2.5 rounded-full bg-slate-500"></span> 待启动`;
+            }
+          }
+          if (aisModels && ais && ais.models_count) {
+            aisModels.innerText = `${ais.models_count} 个原生模型`;
+          }
 
           const gptRunning = sys.services?.chatgpt?.reverse_running;
           document.getElementById("chatgpt-status-text").innerText = gptRunning ? "🟢 逆向运行中" : "⚪ 就绪 (按需)";
