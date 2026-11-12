@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Paired benchmark: Gemini Cookie Pool vs Google AI Studio direct endpoint."""
-import csv, json, os, statistics, tempfile, time, urllib.error, urllib.request, sys
+import csv, json, os, statistics, tempfile, time, urllib.error, urllib.request, sys, math
 from datetime import datetime
 sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
 from pathlib import Path
@@ -19,6 +19,8 @@ REPORT_DIR.mkdir(parents=True, exist_ok=True)
 STAMP = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
 PREFIX = "gemini-pool-vs-aistudio-" + STAMP
 JSON_PATH, CSV_PATH, MD_PATH = (REPORT_DIR / (PREFIX + ext) for ext in (".json", ".csv", ".md"))
+HISTORY_JSONL = REPORT_DIR / "hourly-history.jsonl"
+HISTORY_CSV = REPORT_DIR / "hourly-history.csv"
 
 def request_json(path, payload=None, timeout=30):
     data = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -92,10 +94,67 @@ def save_json(data):
     finally:
         if os.path.exists(tmp): os.unlink(tmp)
 
+def append_history(data):
+    """Append one idempotent aggregate row for long-term hourly trend analysis."""
+    run_id = data.get("run_id") or PREFIX
+    existing_ids = set()
+    if HISTORY_JSONL.exists():
+        with HISTORY_JSONL.open("r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    existing_ids.add(json.loads(line).get("run_id"))
+                except Exception:
+                    continue
+    if run_id in existing_ids:
+        return
+    summary = {
+        "run_id": run_id,
+        "created_at": data.get("created_at"),
+        "model": data.get("model"),
+    }
+    for route, prefix in (("gemini_pool", "pool"), ("aistudio", "aistudio")):
+        xs = [x for x in data["tests"] if x["route"] == route]
+        good = [x for x in xs if x["success"] and isinstance(x.get("client_wall_ms"), int)]
+        vals = sorted(x["client_wall_ms"] for x in good)
+        p95 = vals[max(0, math.ceil(0.95 * len(vals)) - 1)] if vals else None
+        summary[prefix + "_success"] = len(good)
+        summary[prefix + "_total"] = len(xs)
+        summary[prefix + "_avg_ms"] = round(statistics.mean(vals)) if vals else None
+        summary[prefix + "_median_ms"] = round(statistics.median(vals)) if vals else None
+        summary[prefix + "_p95_ms"] = p95
+    pool_rounds = {x["round"]: x for x in data["tests"] if x["route"] == "gemini_pool"}
+    ai_rounds = {x["round"]: x for x in data["tests"] if x["route"] == "aistudio"}
+    paired = [(pool_rounds[n], ai_rounds[n]) for n in sorted(set(pool_rounds) & set(ai_rounds))
+              if pool_rounds[n]["success"] and ai_rounds[n]["success"]]
+    summary["paired_rounds"] = len(paired)
+    summary["pool_wins"] = sum(1 for p, a in paired if p["client_wall_ms"] < a["client_wall_ms"])
+    summary["aistudio_wins"] = sum(1 for p, a in paired if a["client_wall_ms"] < p["client_wall_ms"])
+    summary["ties"] = sum(1 for p, a in paired if a["client_wall_ms"] == p["client_wall_ms"])
+    after = data.get("after") or {}
+    accounts = after.get("gemini_accounts") or []
+    summary["gemini_enabled_accounts"] = sum(1 for a in accounts if a.get("status") == "enabled")
+    summary["gemini_fail_count_total"] = sum(int(a.get("fail_count") or 0) for a in accounts)
+    summary["gemini_5h_remaining_total"] = sum(int(a.get("quota_5h_remaining") or 0) for a in accounts)
+    summary["gemini_5h_limit_total"] = sum(int(a.get("quota_5h_limit") or 0) for a in accounts)
+    summary["gemini_weekly_remaining_total"] = sum(int(a.get("quota_weekly_remaining") or 0) for a in accounts)
+    summary["gemini_weekly_limit_total"] = sum(int(a.get("quota_weekly_limit") or 0) for a in accounts)
+    summary["aistudio_state"] = after.get("aistudio_state")
+    summary["aistudio_ready_accounts"] = after.get("aistudio_accounts_ready")
+    summary["errors"] = [x for x in data["tests"] if not x["success"]]
+    with HISTORY_JSONL.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(summary, ensure_ascii=False) + "\n")
+    fields = [k for k in summary if k != "errors"]
+    write_header = not HISTORY_CSV.exists() or HISTORY_CSV.stat().st_size == 0
+    with HISTORY_CSV.open("a", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        if write_header:
+            w.writeheader()
+        w.writerow(summary)
+
 def main():
     data = {
         "benchmark":"Gemini Cookie Pool vs AI Studio direct",
-        "created_at":datetime.now().astimezone().isoformat(),
+        "created_at":datetime.now().astimezone().isoformat(), "run_id":PREFIX,
         "base_url":BASE, "model":MODEL, "rounds_requested":ROUNDS, "prompt":PROMPT,
         "methodology":{"same_model_and_prompt_per_pair":True,"stream":False,
             "gemini_reasoning_level":"off","alternating_order":True,
@@ -190,6 +249,7 @@ def main():
         "## 文件","- 完整 JSON："+JSON_PATH.name,"- CSV："+CSV_PATH.name,
         "- Markdown："+MD_PATH.name,"- 可复用脚本：scripts/compare_gemini_routes.py"]
     MD_PATH.write_text("\n".join(lines)+"\n",encoding="utf-8")
+    append_history(data)
     print(json.dumps({"done":True,"json":str(JSON_PATH),"csv":str(CSV_PATH),
         "markdown":str(MD_PATH),"tests":len(data["tests"]),"before":data["before"],
         "after":data["after"]},ensure_ascii=False),flush=True)
