@@ -17,7 +17,7 @@ import sqlite3
 import datetime
 import subprocess
 from typing import Optional, Dict, Any, List
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Path, Request
@@ -29,7 +29,7 @@ from fastapi.staticfiles import StaticFiles
 os.environ["NO_PROXY"] = "127.0.0.1,localhost,::1"
 
 from cookie_bridge import CookieBridge
-from gemini_service import MultiAccountGeminiPool, GeminiService
+from gemini_service import GeminiService, MultiAccountGeminiPool, resolve_model_reasoning
 from chatgpt_service import chatgpt_service, UnifiedChatGPTService, ChatGPTBridgeClient, ChatGPTReverseEngine
 from bilibili_service import BilibiliService
 from baidu_pan_service import BaiduPanService
@@ -37,6 +37,7 @@ from suno_service import SunoService, suno_service
 from login_status import collect_login_status, failure_payload, gemini_failure_should_retry
 from minimax_service import MinimaxAudioService, minimax_service, PRESET_VOICES, OPENAI_VOICE_MAP
 from aistudio_service import aistudio_service, AIStudioService
+from opencode_export import export_to_file
 from autostart import (
     is_autostart_enabled,
     enable_autostart,
@@ -128,11 +129,13 @@ class OpenAIImageGenerationRequest(BaseModel):
 
 
 class OpenAIMessage(BaseModel):
+    model_config = ConfigDict(extra="allow")
     role: str = Field(..., example="user")
-    content: str = Field(..., example="Hello!")
+    content: Optional[Any] = Field(None, example="Hello!")
 
 
 class OpenAIChatRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
     model: Optional[str] = Field("gemini-3.5-flash-lite", example="gemini-3.5-flash-lite")
     messages: List[OpenAIMessage] = Field(..., description="对话历史消息列表")
     reasoning_effort: Optional[str] = Field(None, description="OpenAI 兼容推理强度: 'low', 'medium', 'high'", example="medium")
@@ -278,8 +281,8 @@ def get_system_overview():
             "gemini_pool": {
                 "port": gemini_pool.port,
                 "status": "running" if gemini_running else "stopped",
-                "account_count": len(gemini_accounts),
-                "active_accounts": sum(1 for a in gemini_accounts if a.get("status") == "enabled"),
+                "account_count": sum(1 for a in gemini_accounts if a.get("visible")),
+                "active_accounts": sum(1 for a in gemini_accounts if a.get("visible") and a.get("status") == "enabled"),
             },
             "chatgpt": {
                 "mode": chatgpt_status.get("mode"),
@@ -362,6 +365,17 @@ def open_project_directory():
 # ==========================================
 # 2. Google Gemini 多账号池统一调度接口
 # ==========================================
+@app.get("/api/gemini/models", summary="读取 Gemini 网页当前模型选择器", tags=["Gemini 多账号调度"])
+def list_gemini_models():
+    """返回当前登录账号在 gemini.google.com 上能看到的模型，名字与网页选择器一致。"""
+    models = gemini_pool.list_web_models()
+    return {
+        "source": "web",
+        "models": models,
+        "service_running": gemini_pool.is_running(),
+    }
+
+
 @app.get("/api/gemini/accounts", summary="获取已接入的 4 个 Google 账号状态", tags=["Gemini 多账号调度"])
 def list_gemini_accounts():
     """获取通过 /u/0, /u/1, /u/2, /u/3 区分的 4 个 Google 账号的最新池化状态与轮询统计。"""
@@ -424,7 +438,11 @@ def gemini_chat(req: ChatRequest):
         gemini_pool.start()
 
     reasoning = req.reasoning_level or "off"
-    model_name = (req.model or "gemini-3.8-flash").lower().strip()
+    model_name = (req.model or "gemini-4-hydrogen").lower().strip()
+    try:
+        resolve_model_reasoning(model_name, reasoning)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     # 动态适配充足安全超时时间：根据模型复杂度智能调整下限，避免因客户端超时过短切断连接
     if any(m in model_name for m in ["3.8", "3.6", "4-", "pro", "thinking"]):
         min_timeout = 600
@@ -518,11 +536,17 @@ def rotate_gemini_account(account_id: int = Path(..., description="账号自增 
 def refresh_gemini_cookies():
     """从 Cookie Hub (18888) 提取浏览器内最新鉴权 Cookie 并批量写入 SQLite 数据库。"""
     try:
-        cookie_str = gemini_pool.refresh_pool_cookies()
+        cookie_str = gemini_pool.refresh_pool_cookies(reload=True)
+        accounts = gemini_pool.list_accounts()
+        named = [item for item in accounts if item.get("email")]
         return {
             "success": True,
-            "message": "已从浏览器成功拉取最新 Google 凭证并更新多账号池！",
+            "message": f"已同步浏览器凭证，识别到 {len(named)} 个 Google 账号。",
             "cookie_length": len(cookie_str),
+            "accounts": [
+                {"id": item.get("id"), "name": item.get("name"), "email": item.get("email"), "auth_user": item.get("auth_user")}
+                for item in named
+            ],
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"凭证刷新失败: {str(e)}")
@@ -1067,10 +1091,12 @@ def openai_chat_completions(req: OpenAIChatRequest):
     if not last_user_msg:
         raise HTTPException(status_code=400, detail="未包含有效的 user 消息")
 
-    model_name = (req.model or "gemini-3.5-flash-lite").lower().strip()
+    model_name = (req.model or "gemini-4-hydrogen").lower().strip()
 
-    # 0. Google AI Studio 逆向分流
-    if model_name.startswith("aistudio") or model_name.startswith("gemini-4") or "argon" in model_name:
+    # 0. Google AI Studio 逆向分流。网页选择器里的 4 Hydrogen / 4 Argon 留在号池。
+    if not _is_gemini_web_pool_model(model_name) and (
+        model_name.startswith("aistudio") or model_name.startswith("gemini-4") or "argon" in model_name
+    ):
         actual_model = req.model.replace("aistudio/", "").replace("aistudio-", "") if req.model else "gemini-4-argon"
         messages_payload = [{"role": m.role, "content": m.content} for m in req.messages]
         req_timeout = getattr(req, "timeout", None) or 120
@@ -1108,14 +1134,19 @@ def openai_chat_completions(req: OpenAIChatRequest):
         if not gemini_pool.is_running():
             gemini_pool.start()
 
-        target_model = req.model if req.model and "gemini" in req.model else "gemini-3.8-flash"
+        target_model = req.model if req.model and "gemini" in req.model else "gemini-4-hydrogen"
         reasoning = req.reasoning_effort or req.reasoning_level or "off"
-        messages_payload = [{"role": m.role, "content": m.content} for m in req.messages]
+        messages_payload = [m.model_dump() for m in req.messages]
+        extra = req.model_extra or {}
 
         if req.stream:
             return StreamingResponse(
                 gemini_pool.stream_chat_messages(
-                    messages=messages_payload, model=target_model, reasoning_level=reasoning
+                    messages=messages_payload,
+                    model=target_model,
+                    reasoning_level=reasoning,
+                    tools=extra.get("tools"),
+                    tool_choice=extra.get("tool_choice"),
                 ),
                 media_type="text/event-stream",
                 headers={
@@ -1319,6 +1350,110 @@ def _chatgpt_reasoning(model_id: str) -> str:
     }.get(model_id, "")
 
 
+_GEMINI_MODEL_NOTES = {
+    "gemini-3.5-flash-lite": "极速响应",
+    "gemini-3.6-flash": "多模态高通量",
+    "gemini-3.8-flash": "新一代 Flash",
+    "gemini-3.7-flash": "3.8 Flash 的旧别名",
+    "gemini-3.1-pro": "强推理",
+    "gemini-4-argon": "复杂推理",
+    "gemini-image": "网页生图",
+    "gemini-video": "网页生视频",
+    "gemini-music": "网页生音乐",
+    "gemini-canvas": "Canvas",
+}
+
+_GEMINI_MODEL_FALLBACK = [
+    "gemini-3.5-flash-lite",
+    "gemini-3.6-flash",
+    "gemini-3.8-flash",
+    "gemini-3.1-pro",
+    "gemini-4-argon",
+    "gemini-canvas",
+    "gemini-image",
+    "gemini-music",
+    "gemini-video",
+]
+
+
+def _is_gemini_web_pool_model(name: str) -> bool:
+    """网页选择器上的模型走 Gemini 号池，不进 AI Studio。"""
+    base = (name or "").lower().strip()
+    for suffix in ("-thinking-medium", "-thinking", "-thinking-lite"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            break
+    return base in {
+        "gemini-3.5-flash-lite",
+        "gemini-3.6-flash",
+        "gemini-3.7-flash",
+        "gemini-3.8-flash",
+        "gemini-3.1-pro",
+        "gemini-4-hydrogen",
+        "gemini-4-argon",
+        "gemini-4-carbon",
+        "gemini-image",
+        "gemini-video",
+        "gemini-music",
+        "gemini-canvas",
+    }
+
+
+def _gemini_catalog_rows():
+    """对外目录用网页上的型号名。3.8 已下线，日常模型是 4 Hydrogen。"""
+    rows = []
+    seen = set()
+    for item in gemini_pool.list_web_models():
+        mid = item.get("id") or ""
+        if not mid or mid in seen:
+            continue
+        seen.add(mid)
+        note = item.get("label") or mid
+        if item.get("locked"):
+            note += "（当前账号未开通）"
+        rows.append({
+            "id": mid,
+            "object": "model",
+            "owned_by": "google-cookie-suite",
+            "tag": "pool",
+            "type": "gemini_pool",
+            "description": f"[Gemini 网页] {note}",
+        })
+    for mid, note in (
+        ("gemini-image", "网页生图"),
+        ("gemini-video", "网页生视频"),
+        ("gemini-music", "网页生音乐"),
+        ("gemini-canvas", "Canvas"),
+    ):
+        if mid in seen:
+            continue
+        rows.append({
+            "id": mid,
+            "object": "model",
+            "owned_by": "google-cookie-suite",
+            "tag": "pool",
+            "type": "gemini_pool",
+            "description": f"[号池协议直连] {mid} · {note}",
+        })
+    return rows
+
+
+@app.post("/api/export/opencode", summary="把当前对话模型写入 OpenCode 配置", tags=["系统管理"])
+def export_opencode(set_default: bool = Query(False, description="是否把默认模型改成 cookie-suite/gemini-3.5-flash-lite")):
+    """按本机 OpenCode 1.18 的 provider 格式合并写入 ~/.config/opencode/opencode.json。"""
+    catalog = openai_models()
+    raw = catalog.get("data") if isinstance(catalog, dict) else []
+    try:
+        result = export_to_file(raw or [], set_default=set_default)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"写入 OpenCode 配置失败: {exc}")
+    return {
+        "success": True,
+        "message": f"已写入 OpenCode，共 {result['count']} 个对话模型。",
+        **result,
+    }
+
+
 @app.get("/v1/models", summary="OpenAI 兼容模型列表", tags=["OpenAI 兼容接口"])
 def openai_models():
     """返回 OpenAI 兼容模型列表，动态同步逆向引擎真实可用模型并打标：
@@ -1384,14 +1519,8 @@ def openai_models():
         {"id": "chatgpt-web", "object": "model", "owned_by": "moni", "tag": "moni", "type": "dom_simulated", "description": "[网页模拟输入/moni] ChatGPT 浏览器同源页面输入桥接"},
     ]
 
-    # 3. Google 多账号池直连模型
-    gemini_models = [
-        {"id": "gemini-3.5-flash-lite", "object": "model", "owned_by": "google-cookie-suite", "tag": "pool", "type": "gemini_pool", "description": "[号池协议直连] 极速响应毫秒级，推荐默认"},
-        {"id": "gemini-3.1-pro", "object": "model", "owned_by": "google-cookie-suite", "tag": "pool", "type": "gemini_pool", "description": "[号池协议直连] 高智力强推理，适合复杂任务"},
-        {"id": "gemini-3.6-flash", "object": "model", "owned_by": "google-cookie-suite", "tag": "pool", "type": "gemini_pool", "description": "[号池协议直连] 多模态高通量，通用均衡"},
-        {"id": "gemini-3.8-flash", "object": "model", "owned_by": "google-cookie-suite", "tag": "pool", "type": "gemini_pool", "description": "[号池协议直连] 新一代 Flash 架构"},
-        {"id": "gemini-3.1-pro-thinking", "object": "model", "owned_by": "google-cookie-suite", "tag": "pool", "type": "gemini_pool", "description": "[号池协议直连] 扩展深度思考链模式"},
-    ]
+    # 3. Google 多账号池直连模型（跟号池 /v1/models 走，不再写死一份旧名单）
+    gemini_models = _gemini_catalog_rows()
 
     # 4. Google AI Studio 逆向原生模型
     aistudio_models = []

@@ -9,8 +9,10 @@ import sys
 import time
 import json
 import sqlite3
+import socket
 import subprocess
 import threading
+import urllib.parse
 import urllib.request
 import re
 import ssl
@@ -20,6 +22,94 @@ from typing import Optional, Dict, Any, List, Tuple
 # 保证本地回环网络请求不走外部代理（Clash 等），避免 502 Bad Gateway
 os.environ["NO_PROXY"] = "127.0.0.1,localhost,::1"
 _LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _proxy_is_open(proxy_url: str) -> bool:
+    raw = (proxy_url or "").strip()
+    if not raw:
+        return False
+    if "://" not in raw:
+        raw = "http://" + raw
+    host_port = raw.split("://", 1)[1].split("/", 1)[0]
+    if host_port.startswith("["):
+        host, _, port_text = host_port.rpartition("]:")
+        host = host[1:]
+    elif ":" in host_port:
+        host, port_text = host_port.rsplit(":", 1)
+    else:
+        return False
+    try:
+        port = int(port_text)
+    except ValueError:
+        return False
+    try:
+        with socket.create_connection((host, port), timeout=0.2):
+            return True
+    except Exception:
+        return False
+
+
+def _windows_system_proxy() -> str:
+    """读取本机 Windows 系统代理，避免沿用别的开发机写死的端口。"""
+    if sys.platform != "win32":
+        return ""
+    try:
+        import winreg
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+        ) as key:
+            enabled, _ = winreg.QueryValueEx(key, "ProxyEnable")
+            if not enabled:
+                return ""
+            server, _ = winreg.QueryValueEx(key, "ProxyServer")
+    except Exception:
+        return ""
+    server = str(server or "").strip()
+    if not server or "=" in server:
+        parts = {}
+        for item in server.split(";"):
+            if "=" in item:
+                name, value = item.split("=", 1)
+                parts[name.strip().lower()] = value.strip()
+        server = parts.get("https") or parts.get("http") or ""
+    if not server:
+        return ""
+    if "://" not in server:
+        server = "http://" + server
+    return server
+
+
+def _detect_local_proxy() -> str:
+    """选用当前这台机器上真正在监听的代理。没有可用端口时不套用旧机器配置。"""
+    candidates = []
+    for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "all_proxy"):
+        value = (os.environ.get(key) or "").strip()
+        if value:
+            candidates.append(value)
+    system_proxy = _windows_system_proxy()
+    if system_proxy:
+        candidates.append(system_proxy)
+    for port in (7890, 7897, 10808, 10809, 1080, 7891):
+        candidates.append(f"http://127.0.0.1:{port}")
+
+    seen = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if _proxy_is_open(candidate):
+            return candidate if "://" in candidate else "http://" + candidate
+    return ""
+
+
+def _cookie_value(cookie_str: str, name: str) -> str:
+    prefix = f"{name}="
+    for part in (cookie_str or "").split(";"):
+        item = part.strip()
+        if item.startswith(prefix):
+            return item[len(prefix):]
+    return ""
 
 _CANDIDATE_SRC = os.path.join(
     os.path.dirname(__file__), "candidate_repos", "Gemini-API-HanaokaYuzu", "src"
@@ -40,7 +130,7 @@ class GeminiService:
         proxy: Optional[str] = None,
     ):
         self.bridge = CookieBridge(bridge_url=bridge_url)
-        self.proxy = proxy or os.environ.get("HTTP_PROXY") or os.environ.get("ALL_PROXY") or "http://127.0.0.1:7897"
+        self.proxy = proxy or _detect_local_proxy()
         self.client = None
         self._loop = None
 
@@ -159,37 +249,8 @@ class GeminiPace:
         )
 
     def acquire(self) -> None:
-        now = time.time()
-        with self._lock:
-            # 1. 检查上一轮调用是否已超时失联，若超时则自动强制解除
-            if self.inflight and (now - self.inflight_started_at > self.max_inflight_timeout):
-                self.inflight = False
-                self.last_finished_at = now
-                if not self.last_failure_reason:
-                    self.last_failure_reason = f"上一轮调用挂起超时 ({int(self.max_inflight_timeout)}s)，已自动解除锁定"
-
-            # 2. 仍在调用中
-            if self.inflight:
-                elapsed = max(1, int(now - self.inflight_started_at))
-                remain = max(1, int(self.max_inflight_timeout - elapsed))
-                fail_hint = f" 【上次失败原因: {self.last_failure_reason}】" if self.last_failure_reason else ""
-                raise RuntimeError(
-                    f"上一次 Gemini 调用还没结束（当前已进行 {elapsed} 秒，最长超时还剩 {remain} 秒）。"
-                    f"请等待倒计时 {remain} 秒后再试，不要重复连点。账号仍是登录状态。{fail_hint}"
-                )
-
-            # 3. 风控冷却
-            if now < self.blocked_until:
-                remain = self.blocked_until - now
-                raise RuntimeError(self._wait_message(remain, True))
-
-            # 4. 最小间隔冷却
-            if self.last_finished_at and now - self.last_finished_at < GEMINI_MIN_INTERVAL_SECONDS:
-                remain = self.last_finished_at + GEMINI_MIN_INTERVAL_SECONDS - now
-                raise RuntimeError(self._wait_message(remain, False))
-
-            self.inflight = True
-            self.inflight_started_at = now
+        # 本地间隔锁已撤掉，用来观察 Google 现在是否还要求两次调用之间留空。
+        return
 
     def release(self, message: str = "") -> None:
         with self._lock:
@@ -229,50 +290,144 @@ def describe_upstream_error(exc: Exception) -> str:
     return message
 
 
+# 网页显示名已经换代。4 Hydrogen 沿用原 3.8 的线路，号池二进制仍叫 gemini-3.8-flash。
+_WEB_BASE_TO_POOL = {
+    "gemini-4-hydrogen": "gemini-3.8-flash",
+    "gemini-3.7-flash": "gemini-3.8-flash",
+    "gemini-3.6-flash": "gemini-3.8-flash",
+}
+
+
 def resolve_model_reasoning(model: str, reasoning_level: str = "off") -> str:
-    """
-    根据基础模型名称和推理级别解析最终的模型 ID。
-    
-    推理级别可选:
-    - 'off' / 'none': 关闭思考模式，使用标准极速模型 (如 gemini-3.5-flash-lite, gemini-3.6-flash, gemini-3.1-pro)
-    - 'medium': 中等推理 (如 gemini-4-argon-thinking-medium，其余模型映射至标准或思考档)
-    - 'high' / 'extended': 深度长链扩展思考 (自动加 -thinking 后缀，如 gemini-3.1-pro-thinking, gemini-3.6-flash-thinking)
-    """
+    """把网页模型名和思考档换成号池当前接受的模型 id。"""
     clean_level = (reasoning_level or "off").lower().strip()
-    base_model = (model or "gemini-3.5-flash-lite").strip()
+    base_model = (model or "gemini-4-hydrogen").strip()
     if not base_model.startswith("gemini"):
         return base_model
 
     raw_base = base_model
-    for suffix in ["-thinking-medium", "-thinking", "-thinking-lite"]:
+    for suffix in ("-thinking-medium", "-thinking", "-thinking-lite"):
         if raw_base.endswith(suffix):
-            raw_base = raw_base[:-len(suffix)]
+            raw_base = raw_base[: -len(suffix)]
             break
+    if raw_base == "gemini-4-carbon":
+        raise ValueError("4 Carbon（高难任务）在当前账号未开通")
+    raw_base = _WEB_BASE_TO_POOL.get(raw_base, raw_base)
 
     if clean_level in ("high", "extended", "deep"):
-        if raw_base == "gemini-3.5-flash-lite":
-            return "gemini-3.5-flash-lite-thinking"
-        elif raw_base == "gemini-3.6-flash":
-            return "gemini-3.6-flash-thinking"
-        elif raw_base == "gemini-3.1-pro":
-            return "gemini-3.1-pro-thinking"
-        elif raw_base in ("gemini-3.8-flash", "gemini-3.7-flash"):
-            return "gemini-3.8-flash-thinking"
-        elif raw_base == "gemini-4-argon":
-            return "gemini-4-argon-thinking"
-        else:
-            return f"{raw_base}-thinking"
-    elif clean_level == "medium":
         if raw_base == "gemini-4-argon":
-            return "gemini-4-argon-thinking-medium"
-        elif raw_base == "gemini-3.1-pro":
-            return "gemini-3.1-pro"
-        elif raw_base == "gemini-3.6-flash":
-            return "gemini-3.6-flash-thinking"
-        else:
-            return raw_base
-    else:
-        return raw_base
+            return "gemini-4-argon-thinking"
+        return f"{raw_base}-thinking"
+    if clean_level == "medium" and raw_base == "gemini-4-argon":
+        return "gemini-4-argon-thinking-medium"
+    return raw_base
+
+
+_DISPLAY_TO_ID = {
+    "3.5 flash-lite": "gemini-3.5-flash-lite",
+    "4 hydrogen": "gemini-4-hydrogen",
+    "3.1 pro": "gemini-3.1-pro",
+    "4 argon": "gemini-4-argon",
+    "4 carbon": "gemini-4-carbon",
+}
+
+_WEB_MODEL_FALLBACK = [
+    {"id": "gemini-3.5-flash-lite", "name": "3.5 Flash-Lite", "role": "快速解答", "label": "3.5 Flash-Lite（快速解答）", "locked": False},
+    {"id": "gemini-4-hydrogen", "name": "4 Hydrogen", "role": "日常帮助", "label": "4 Hydrogen（日常帮助）", "locked": False},
+    {"id": "gemini-3.1-pro", "name": "3.1 Pro", "role": "深度研究", "label": "3.1 Pro（深度研究）", "locked": False},
+    {"id": "gemini-4-argon", "name": "4 Argon", "role": "代码与分析", "label": "4 Argon（代码与分析）", "locked": False},
+    {"id": "gemini-4-carbon", "name": "4 Carbon", "role": "高难任务", "label": "4 Carbon（高难任务 · 未开通）", "locked": True},
+]
+
+
+def _web_model_id(display: str) -> str:
+    key = re.sub(r"\s+", " ", (display or "").strip().lower())
+    if key in _DISPLAY_TO_ID:
+        return _DISPLAY_TO_ID[key]
+    slug = re.sub(r"[^a-z0-9]+", "-", key).strip("-")
+    return f"gemini-{slug}" if slug else ""
+
+
+def _web_model_label(display: str, role: str, locked: bool) -> str:
+    display = (display or "").strip()
+    role = (role or "").strip()
+    if locked:
+        role = f"{role} · 未开通" if role else "未开通"
+    if role and role != display:
+        return f"{display}（{role}）"
+    return display
+
+
+def _parse_web_model_payload(body: str) -> List[Dict[str, Any]]:
+    inner = None
+    for line in body.splitlines():
+        line = line.strip()
+        if not line.startswith("[["):
+            continue
+        try:
+            arr = json.loads(line)
+        except Exception:
+            continue
+        for item in arr:
+            if (
+                isinstance(item, list)
+                and item
+                and item[0] == "wrb.fr"
+                and len(item) > 2
+                and isinstance(item[2], str)
+            ):
+                try:
+                    inner = json.loads(item[2])
+                except Exception:
+                    inner = None
+                break
+        if inner is not None:
+            break
+    if not isinstance(inner, list):
+        return []
+
+    models: List[Dict[str, Any]] = []
+    seen = set()
+    picker = None
+    if len(inner) > 24 and isinstance(inner[24], list) and len(inner[24]) > 1:
+        picker = inner[24][1]
+    if isinstance(picker, list):
+        for item in picker:
+            head = item[0] if isinstance(item, list) and item and isinstance(item[0], list) else None
+            if not head or len(head) < 6:
+                continue
+            display = str(head[5] or "").strip()
+            role = str(head[12]).strip() if len(head) > 12 and isinstance(head[12], str) else ""
+            mid = _web_model_id(display)
+            if not mid or mid in seen:
+                continue
+            seen.add(mid)
+            models.append({
+                "id": mid,
+                "name": display,
+                "role": role,
+                "label": _web_model_label(display, role, False),
+                "locked": False,
+            })
+
+    catalog = inner[15] if len(inner) > 15 and isinstance(inner[15], list) else []
+    for row in catalog:
+        if not isinstance(row, list) or len(row) < 3:
+            continue
+        display = str(row[2] or row[1] or "").strip()
+        role = str(row[11]).strip() if len(row) > 11 and isinstance(row[11], str) else ""
+        mid = _web_model_id(display)
+        if not mid or mid in seen:
+            continue
+        seen.add(mid)
+        models.append({
+            "id": mid,
+            "name": display,
+            "role": role,
+            "label": _web_model_label(display, role, True),
+            "locked": True,
+        })
+    return models
 
 
 class MultiAccountGeminiPool:
@@ -296,7 +451,7 @@ class MultiAccountGeminiPool:
     ):
         self.bridge = CookieBridge(bridge_url=bridge_url)
         self.port = port
-        self.proxy = proxy or os.environ.get("HTTP_PROXY") or os.environ.get("ALL_PROXY") or "http://127.0.0.1:7897"
+        self.proxy = proxy or _detect_local_proxy()
         self.account_count = account_count
         self.api_key = api_key
         
@@ -308,6 +463,10 @@ class MultiAccountGeminiPool:
         self.exe_path = os.path.join(self.base_dir, "gemini-web2api.exe")
         self.proc: Optional[subprocess.Popen] = None
         self._pace = GeminiPace()
+        self._lifecycle_lock = threading.Lock()
+        self._sync_thread: Optional[threading.Thread] = None
+        self._web_models_cache: List[Dict[str, Any]] = []
+        self._web_models_at = 0.0
 
     def _extract_cookie_header(self) -> str:
         """从 Cookie Hub 提取组装 Google 必要会话鉴权串。"""
@@ -339,13 +498,14 @@ class MultiAccountGeminiPool:
             raise RuntimeError("未能提取到有效的 Google 鉴权 Cookie！")
         return "; ".join(parts)
 
-    def init_database(self, force_refresh: bool = False):
+    def init_database(self, force_refresh: bool = False, cookie_str: Optional[str] = None):
         """初始化多账号数据库与池化配额表。"""
-        cookie_str = ""
-        try:
-            cookie_str = self._extract_cookie_header()
-        except Exception as e:
-            print(f"⚠️ 初始化账号池凭证提示: {e}", flush=True)
+        if cookie_str is None:
+            cookie_str = ""
+            try:
+                cookie_str = self._extract_cookie_header()
+            except Exception as e:
+                print(f"⚠️ 初始化账号池凭证提示: {e}", flush=True)
         conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
 
@@ -380,28 +540,29 @@ class MultiAccountGeminiPool:
         )
 
         now = int(time.time())
-        existing = cur.execute("SELECT authuser FROM accounts").fetchall()
-        existing_users = {row[0] for row in existing}
+        existing = cur.execute("SELECT authuser, cookie FROM accounts").fetchall()
+        existing_users = {row[0]: row[1] or "" for row in existing}
 
         for u in range(self.account_count):
-            if u not in existing_users or force_refresh:
-                if u in existing_users:
-                    cur.execute(
-                        "UPDATE accounts SET cookie=?, status='enabled', fail_count=0 WHERE authuser=?",
-                        (cookie_str, u),
-                    )
-                else:
-                    cur.execute(
-                        """INSERT INTO accounts (label, cookie, status, note, created_at, authuser)
-                           VALUES (?, ?, 'enabled', ?, ?, ?)""",
-                        (
-                            f"Google Account [u/{u}]",
-                            cookie_str,
-                            f"Browser Multi-Account Index {u}",
-                            now,
-                            u,
-                        ),
-                    )
+            if u not in existing_users:
+                cur.execute(
+                    """INSERT INTO accounts (label, cookie, status, note, created_at, authuser)
+                       VALUES (?, ?, 'enabled', ?, ?, ?)""",
+                    (
+                        f"Google Account [u/{u}]",
+                        cookie_str,
+                        f"Browser Multi-Account Index {u}",
+                        now,
+                        u,
+                    ),
+                )
+                continue
+            # 扩展还没连上时不要用空串覆盖已经可用的凭证
+            if cookie_str and (force_refresh or not _cookie_value(existing_users[u], "__Secure-1PSID")):
+                cur.execute(
+                    "UPDATE accounts SET cookie=?, status='enabled', fail_count=0 WHERE authuser=?",
+                    (cookie_str, u),
+                )
 
         conn.commit()
         conn.close()
@@ -437,42 +598,251 @@ class MultiAccountGeminiPool:
         except Exception:
             return False
 
-    def start(self, wait_timeout: int = 15) -> bool:
-        """启动多账号统一代理服务。"""
-        if self.is_running():
-            return True
+    def list_upstream_models(self) -> list:
+        """读取号池当前公布的 Gemini 网页模型 id。"""
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{self.port}/v1/models",
+                headers={"Authorization": f"Bearer {self.api_key}"},
+            )
+            with _LOCAL_OPENER.open(req, timeout=5) as resp:
+                payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+        except Exception:
+            return []
+        ids = []
+        seen = set()
+        for item in payload.get("data") or []:
+            mid = str((item or {}).get("id") or "").strip()
+            if not mid or mid in seen:
+                continue
+            seen.add(mid)
+            ids.append(mid)
+        return ids
 
+    def list_web_models(self) -> List[Dict[str, Any]]:
+        """读取 Gemini 网页选择器当前的模型，名字与页面一致。"""
+        now = time.time()
+        if self._web_models_cache and now - self._web_models_at < 600:
+            return list(self._web_models_cache)
+        parsed = self._fetch_web_models()
+        models = parsed or list(_WEB_MODEL_FALLBACK)
+        self._web_models_cache = list(models)
+        self._web_models_at = now if parsed else now - 540
+        return list(models)
+
+    def _fetch_web_models(self) -> List[Dict[str, Any]]:
+        cookie = ""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            row = conn.execute(
+                "SELECT cookie FROM accounts WHERE authuser = 0 AND cookie != '' LIMIT 1"
+            ).fetchone()
+            conn.close()
+            cookie = row[0] if row else ""
+        except Exception:
+            return []
+        if not cookie or not self.proxy:
+            return []
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": self.proxy, "https": self.proxy}),
+            urllib.request.HTTPSHandler(context=ctx),
+        )
+        ua = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+        )
+        try:
+            page_req = urllib.request.Request(
+                "https://gemini.google.com/app",
+                headers={"Cookie": cookie, "User-Agent": ua},
+            )
+            with opener.open(page_req, timeout=20) as resp:
+                html = resp.read().decode("utf-8", errors="ignore")
+        except Exception:
+            return []
+        xsrf = (re.search(r'"SNlM0e":"([^"]+)"', html) or [None, ""])[1]
+        bl = (re.search(r'"cfb2h":"([^"]+)"', html) or [None, ""])[1]
+        if not xsrf or not bl:
+            return []
+        freq = json.dumps([[["otAQ7b", "[]", None, "generic"]]])
+        form = urllib.parse.urlencode({"f.req": freq, "at": xsrf}).encode()
+        url = (
+            "https://gemini.google.com/_/BardChatUi/data/batchexecute"
+            f"?rpcids=otAQ7b&bl={urllib.parse.quote(bl)}&hl=zh-CN&_reqid=123456&rt=c"
+        )
+        try:
+            rpc_req = urllib.request.Request(
+                url,
+                data=form,
+                headers={
+                    "Cookie": cookie,
+                    "User-Agent": ua,
+                    "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+                    "Origin": "https://gemini.google.com",
+                    "Referer": "https://gemini.google.com/app",
+                    "X-Same-Domain": "1",
+                },
+            )
+            with opener.open(rpc_req, timeout=20) as resp:
+                body = resp.read().decode("utf-8", errors="ignore")
+        except Exception:
+            return []
+        return _parse_web_model_payload(body)
+
+    def _config_proxy(self) -> str:
+        try:
+            with open(self.config_path, "r", encoding="utf-8") as fh:
+                return str(json.load(fh).get("proxy") or "")
+        except Exception:
+            return ""
+
+    def _release_port(self):
+        """停掉自己拉起的进程，以及仍占用本端口的旧 gemini-web2api。"""
+        if self.proc:
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=3)
+            except Exception:
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+            self.proc = None
+
+        try:
+            out = subprocess.check_output(
+                f'netstat -ano | findstr ":{self.port}" | findstr "LISTENING"',
+                shell=True,
+                text=True,
+                errors="replace",
+            )
+        except Exception:
+            out = ""
+        pids = set()
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 5 and parts[1].endswith(f":{self.port}"):
+                try:
+                    pid = int(parts[-1])
+                except ValueError:
+                    continue
+                if pid > 0 and pid != os.getpid():
+                    pids.add(pid)
+        for pid in pids:
+            subprocess.run(
+                f"taskkill /F /PID {pid}",
+                shell=True,
+                capture_output=True,
+            )
+        for _ in range(10):
+            if not self.is_running():
+                return
+            time.sleep(0.3)
+
+    def _launch_process(self, wait_timeout: int = 15) -> bool:
         if not os.path.exists(self.exe_path):
             raise FileNotFoundError(f"未找到 gemini-web2api.exe 核心二进制: {self.exe_path}")
 
-        self.init_database()
         self.generate_config()
-
         log_path = os.path.join(self.base_dir, "gemini_pool.log")
         log_file = open(log_path, "a", encoding="utf-8", errors="replace")
-
         self.proc = subprocess.Popen(
             [self.exe_path, "-config", self.config_path],
             cwd=self.base_dir,
             stdout=log_file,
             stderr=subprocess.STDOUT,
         )
-
         for _ in range(wait_timeout):
             time.sleep(1)
             if self.is_running():
                 return True
         return False
 
+    def _cookies_out_of_date(self, cookie_str: str) -> bool:
+        hub_psid = _cookie_value(cookie_str, "__Secure-1PSID")
+        if not hub_psid or not os.path.exists(self.db_path):
+            return True
+        conn = sqlite3.connect(self.db_path)
+        rows = conn.execute("SELECT cookie FROM accounts WHERE status!='deleted'").fetchall()
+        conn.close()
+        if len(rows) < self.account_count:
+            return True
+        return any(_cookie_value(row[0] or "", "__Secure-1PSID") != hub_psid for row in rows)
+
+    def _write_cookies(self, cookie_str: str):
+        if not cookie_str:
+            return
+        self.init_database(force_refresh=True, cookie_str=cookie_str)
+
+    def _schedule_account_sync(self):
+        """扩展可能晚于服务启动。连上后再写入 Cookie，并补全邮箱显示。"""
+        if self._sync_thread and self._sync_thread.is_alive():
+            return
+
+        def _worker():
+            deadline = time.time() + 90
+            synced_cookie = ""
+            while time.time() < deadline:
+                try:
+                    synced_cookie = self._extract_cookie_header()
+                    break
+                except Exception as exc:
+                    print(f"⚠️ [Gemini] Cookie Hub 尚未就绪，稍后重试: {exc}", flush=True)
+                    time.sleep(5)
+            if synced_cookie and self._cookies_out_of_date(synced_cookie):
+                print("🔄 [Gemini] 浏览器凭证已更新，正在写回账号池并重载服务...", flush=True)
+                with self._lifecycle_lock:
+                    self._write_cookies(synced_cookie)
+                    self.proxy = _detect_local_proxy()
+                    if self.is_running():
+                        self._release_port()
+                    self._launch_process()
+            try:
+                time.sleep(2)
+                profiles = self.sync_account_profiles()
+                named = []
+                for item in profiles.values():
+                    email = item.get("email") or ""
+                    if email and email not in named and "同一登录" not in (item.get("note") or ""):
+                        named.append(email)
+                if not named:
+                    time.sleep(4)
+                    profiles = self.sync_account_profiles()
+                    named = []
+                    for item in profiles.values():
+                        email = item.get("email") or ""
+                        if email and email not in named and "同一登录" not in (item.get("note") or ""):
+                            named.append(email)
+                print(f"✅ [Gemini] 已识别 {len(named)} 个 Google 账号: {', '.join(named)}", flush=True)
+            except Exception as exc:
+                print(f"⚠️ [Gemini] 账号资料同步失败: {exc}", flush=True)
+
+        self._sync_thread = threading.Thread(target=_worker, name="gemini-account-sync", daemon=True)
+        self._sync_thread.start()
+
+    def start(self, wait_timeout: int = 15) -> bool:
+        """启动多账号统一代理服务，并在后台把浏览器账号同步到看板上。"""
+        self.proxy = _detect_local_proxy()
+        with self._lifecycle_lock:
+            proxy_changed = self.is_running() and self._config_proxy() != self.proxy
+            if proxy_changed:
+                print(f"🔄 [Gemini] 代理已从 {self._config_proxy()} 切换到 {self.proxy}，正在重载号池...", flush=True)
+                self._release_port()
+            if not self.is_running():
+                self.init_database(force_refresh=True)
+                ok = self._launch_process(wait_timeout=wait_timeout)
+            else:
+                ok = True
+        self._schedule_account_sync()
+        return ok
+
     def stop(self):
         """停止多账号统一服务。"""
-        if self.proc:
-            try:
-                self.proc.terminate()
-                self.proc.wait(timeout=3)
-            except Exception:
-                self.proc.kill()
-            self.proc = None
+        with self._lifecycle_lock:
+            self._release_port()
 
     def fetch_account_profile(
         self, authuser: int, cookie_override: Optional[str] = None
@@ -515,10 +885,22 @@ class MultiAccountGeminiPool:
         ctx.verify_mode = ssl.CERT_NONE
         opener = urllib.request.build_opener(proxy_handler, urllib.request.HTTPSHandler(context=ctx))
 
-        try:
-            with opener.open(req, timeout=12) as resp:
-                html = resp.read().decode("utf-8", errors="ignore")
+        html = ""
+        last_error = None
+        for attempt in range(3):
+            try:
+                with opener.open(req, timeout=15) as resp:
+                    html = resp.read().decode("utf-8", errors="ignore")
+                last_error = None
+                break
+            except Exception as exc:
+                last_error = exc
+                time.sleep(1.2 * (attempt + 1))
+        if last_error is not None or not html:
+            print(f"⚠️ [Profile 获取] u/{authuser} 提取失败: {last_error}")
+            return "", ""
 
+        try:
             # 匹配 aria-label="Google Account: Alena Bray  &#10;(wargowskytom404@gmail.com)" 或中文 帐号：
             m = re.search(
                 r'Google\s*[^:："]*[:：]\s*([^&"\(]+?)\s*(?:&#10;|\n)?\(([^)]+@gmail\.com)\)',
@@ -539,7 +921,7 @@ class MultiAccountGeminiPool:
             if gm:
                 return "", gm[0]
         except Exception as e:
-            print(f"⚠️ [Profile 获取] u/{authuser} 提取失败: {e}")
+            print(f"⚠️ [Profile 获取] u/{authuser} 解析失败: {e}")
 
         return "", ""
 
@@ -551,29 +933,39 @@ class MultiAccountGeminiPool:
 
         conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
-        rows = cur.execute("SELECT authuser FROM accounts").fetchall()
+        rows = cur.execute("SELECT authuser FROM accounts ORDER BY authuser ASC").fetchall()
         conn.close()
 
+        seen_emails = {}
         for (u,) in rows:
             name, email = self.fetch_account_profile(u)
-            if email:
-                if name:
-                    new_label = f"{name} ({email})"
-                else:
-                    new_label = email
+            email = (email or "").strip()
+            email_key = email.lower()
+            if email and email_key in seen_emails:
+                owner = seen_emails[email_key]
+                new_label = f"{name} ({email})" if name else email
+                note = f"authuser={u} | 与 u/{owner} 为同一登录"
+                status = "disabled"
+            elif email:
+                seen_emails[email_key] = u
+                new_label = f"{name} ({email})" if name else email
                 note = f"authuser={u} | {email}"
+                status = "enabled"
             else:
-                new_label = f"Google Account [u/{u}]"
-                note = f"Browser Multi-Account Index {u}"
+                new_label = ""
+                note = ""
+                status = ""
 
-            conn = sqlite3.connect(self.db_path)
-            conn.execute(
-                "UPDATE accounts SET label = ?, note = ? WHERE authuser = ?",
-                (new_label, note, u),
-            )
-            conn.commit()
-            conn.close()
-            results[u] = {"name": name, "email": email, "label": new_label}
+            if email:
+                conn = sqlite3.connect(self.db_path)
+                conn.execute(
+                    "UPDATE accounts SET label = ?, note = ?, status = ? WHERE authuser = ?",
+                    (new_label, note, status, u),
+                )
+                conn.commit()
+                conn.close()
+
+            results[u] = {"name": name, "email": email, "label": new_label, "note": note}
 
         return results
 
@@ -605,6 +997,7 @@ class MultiAccountGeminiPool:
                 email = parts[1].rstrip(")").strip()
             elif "@" in label_val:
                 email = label_val.strip()
+            note = r[6] or ""
 
             # 查询该账号 5 小时内与本周内的精确调用轨迹
             row_5h = cur.execute(
@@ -658,7 +1051,7 @@ class MultiAccountGeminiPool:
                     "status": r[3],
                     "last_used_at": r[4],
                     "fail_count": r[5],
-                    "note": r[6],
+                    "note": note,
                     "quota_5h_used": count_5h,
                     "quota_5h_limit": limit_5h,
                     "quota_5h_remaining": rem_5h,
@@ -670,6 +1063,15 @@ class MultiAccountGeminiPool:
                     "quota_status_color": status_color,
                 }
             )
+        seen_emails = set()
+        for item in res:
+            email_key = (item.get("email") or "").strip().lower()
+            duplicate = "同一登录" in (item.get("note") or "")
+            if email_key and email_key not in seen_emails and not duplicate:
+                seen_emails.add(email_key)
+                item["visible"] = True
+            else:
+                item["visible"] = False
         conn.close()
         return res
 
@@ -874,13 +1276,16 @@ class MultiAccountGeminiPool:
 
     def stream_chat_messages(
         self,
-        messages: List[Dict[str, str]],
+        messages: List[Dict[str, Any]],
         model: str = "gemini-3.8-flash",
         reasoning_level: str = "off",
         timeout: int = 180,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Any = None,
     ):
         """
         向 Go 核心池发送 messages 列表的实时流式提问 (SSE)。
+        tools / tool_choice 原样交给号池，由它转成网页能执行的 tool_call。
         """
         if not self.is_running():
             self.start()
@@ -899,6 +1304,10 @@ class MultiAccountGeminiPool:
                 "messages": messages,
                 "stream": True,
             }
+            if tools:
+                req_data["tools"] = tools
+            if tool_choice is not None:
+                req_data["tool_choice"] = tool_choice
             req = urllib.request.Request(
                 f"http://127.0.0.1:{self.port}/v1/chat/completions",
                 data=json.dumps(req_data).encode("utf-8"),
@@ -1012,19 +1421,22 @@ class MultiAccountGeminiPool:
                 pass
         return True
 
-    def refresh_pool_cookies(self) -> str:
+    def refresh_pool_cookies(self, reload: bool = False) -> str:
         """从前台 Cookie Hub 重新拉取最新凭证并更新多账号数据库。"""
         self.reset_proxies()
+        self.proxy = _detect_local_proxy()
         cookie_str = self._extract_cookie_header()
+        self._write_cookies(cookie_str)
         conn = sqlite3.connect(self.db_path)
-        cur = conn.cursor()
-        cur.execute(
-            "UPDATE accounts SET cookie=?, status='enabled', fail_count=0 WHERE status!='deleted'",
-            (cookie_str,),
-        )
-        cur.execute("UPDATE proxies SET fail_count=0, last_error=''")
+        conn.execute("UPDATE proxies SET fail_count=0, last_error=''")
         conn.commit()
         conn.close()
+        if reload:
+            with self._lifecycle_lock:
+                if self.is_running():
+                    self._release_port()
+                self._launch_process()
+            self.sync_account_profiles()
         return cookie_str
 
     def list_recent_requests(self, limit: int = 10) -> List[Dict[str, Any]]:

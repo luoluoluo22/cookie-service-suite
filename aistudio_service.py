@@ -24,7 +24,23 @@ os.environ["NO_PROXY"] = "127.0.0.1,localhost,::1"
 _LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 DEFAULT_AISTUDIO_PORT = 2048
-DEFAULT_PROXY = "http://127.0.0.1:7897"
+
+
+def _detect_default_proxy() -> str:
+    """动态探测本机可用科学上网代理端口 (优先 7890 / 7897 / 10808)"""
+    if os.environ.get("HTTP_PROXY"):
+        return os.environ["HTTP_PROXY"]
+    import socket
+    for p in [7890, 7897, 10808, 10809]:
+        try:
+            with socket.create_connection(("127.0.0.1", p), timeout=0.15):
+                return f"http://127.0.0.1:{p}"
+        except Exception:
+            continue
+    return "http://127.0.0.1:7890"
+
+
+DEFAULT_PROXY = _detect_default_proxy()
 
 
 class AIStudioService:
@@ -33,22 +49,23 @@ class AIStudioService:
     def __init__(
         self,
         port: int = DEFAULT_AISTUDIO_PORT,
-        proxy: str = DEFAULT_PROXY,
+        proxy: Optional[str] = None,
         base_dir: Optional[str] = None,
         bridge_url: str = "http://127.0.0.1:18888",
     ):
         self.port = port
-        self.proxy = proxy or os.environ.get("HTTP_PROXY") or DEFAULT_PROXY
+        self.proxy = proxy or os.environ.get("HTTP_PROXY") or _detect_default_proxy()
         self.bridge_url = bridge_url.rstrip("/")
         
-        # 默认二进制位于 candidate_repos/aistudio2api-go/aistudio2api-v0.3.5-windows-amd64
+        # 自动搜索可用 aistudio2api 二进制目录
+        root_dir = os.path.dirname(os.path.abspath(__file__))
         if base_dir is None:
-            self.base_dir = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                "candidate_repos",
-                "aistudio2api-go",
-                "aistudio2api-v0.3.5-windows-amd64",
-            )
+            candidates = [
+                os.path.join(root_dir, "candidate_repos", "AIStudio2API"),
+                os.path.join(root_dir, "candidate_repos", "aistudio2api-go", "aistudio2api-v0.3.5-windows-amd64"),
+                os.path.join(root_dir, "candidate_repos", "AIStudio2API", "bin", "aistudio2api-v0.3.4-windows-amd64"),
+            ]
+            self.base_dir = next((c for c in candidates if os.path.isfile(os.path.join(c, "aistudio2api.exe"))), candidates[0])
         else:
             self.base_dir = base_dir
 

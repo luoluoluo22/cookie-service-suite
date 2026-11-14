@@ -264,8 +264,7 @@ class TrayAppServer:
     def ensure_gemini_pool(self, icon=None, item=None):
         """启动或健康检查 Gemini 多账号统一代理服务 (18083)"""
         try:
-            if not gemini_pool.is_running():
-                gemini_pool.start()
+            gemini_pool.start()
             is_ok = gemini_pool.is_running()
             status = "🟢 运行正常" if is_ok else "🔴 启动异常"
             if self.tray_icon:
@@ -621,7 +620,7 @@ class TrayAppServer:
         """从前台 Cookie Hub 刷新凭证"""
         try:
             print("🔄 [系统托盘] 正在从 Cookie Hub 提取最新凭证...", flush=True)
-            cookie_str = gemini_pool.refresh_pool_cookies()
+            cookie_str = gemini_pool.refresh_pool_cookies(reload=True)
             if self.tray_icon:
                 self.tray_icon.notify("已成功从浏览器拉取最新 Google 会话凭证！", "凭证刷新成功")
             print("✅ [系统托盘] 凭证刷新成功，Cookie 长度:", len(cookie_str), flush=True)

@@ -105,7 +105,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               <i class="fa-solid fa-users-gear text-amber-400 w-4 text-center"></i>
               <span class="font-medium">账号看板</span>
             </span>
-            <span class="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-300 font-mono">4账号</span>
+            <span id="nav-account-count" class="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-300 font-mono">同步中</span>
           </a>
 
           <!-- 4. 接口清单 (四字) -->
@@ -215,9 +215,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             </h2>
             <p class="text-xs text-slate-400 mt-0.5">在线发起真实 API 请求，支持多模型、思考链与图片/动图渲染预览</p>
           </div>
-          <button onclick="openProjectFolder()" class="self-start sm:self-auto text-xs px-3 py-1.5 rounded-lg bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 border border-amber-500/30 items-center gap-1.5 transition flex shadow-sm">
-            <i class="fa-solid fa-folder-open text-amber-400"></i> 打开目录
-          </button>
+          <div class="flex items-center gap-2 self-start sm:self-auto">
+            <button onclick="exportToOpenCode()" class="text-xs px-3 py-1.5 rounded-lg bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-300 border border-cyan-500/30 items-center gap-1.5 transition flex shadow-sm">
+              <i class="fa-solid fa-file-export text-cyan-400"></i> 导入到 OpenCode
+            </button>
+            <button onclick="openProjectFolder()" class="text-xs px-3 py-1.5 rounded-lg bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 border border-amber-500/30 items-center gap-1.5 transition flex shadow-sm">
+              <i class="fa-solid fa-folder-open text-amber-400"></i> 打开目录
+            </button>
+          </div>
         </div>
 
         <!-- 2. 平台专属分类导航栏 (上图标 + 下名称 + 接口数徽章) -->
@@ -263,17 +268,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                   <span><i class="fa-solid fa-cube text-cyan-400 mr-1.5"></i> 选择模型 (Model)</span>
                 </label>
                 <select id="model-selector" onchange="onModelOrReasoningChange()" class="w-full bg-slate-900 border border-cyan-500/40 rounded-xl px-3 py-2 text-xs text-cyan-300 focus:outline-none focus:border-cyan-400 shadow-inner">
-                  <option value="gemini-3.5-flash-lite">gemini-3.5-flash-lite (极速响应 · 推荐)</option>
-                  <option value="gemini-3.1-pro">gemini-3.1-pro (强推理 · 复杂任务)</option>
-                  <option value="gemini-3.6-flash">gemini-3.6-flash (多模态高通量 · 均衡)</option>
-                  <option value="gemini-3.8-flash">gemini-3.8-flash (新版 3.8 Flash 架构)</option>
-                  <option value="gemini-4-argon">gemini-4-argon (4 Argon 复杂推理)</option>
-                  <option value="auto">auto（免费 · 自动选模型）</option>
-                  <option value="gpt-6">gpt-6（免费 · 不思考 / Instant）</option>
-                  <option value="gpt-6-t-mini">gpt-6-t-mini（免费 · 思考 / Thinking mini）</option>
-                  <option value="gpt-5-6">gpt-5-6（账号列表里有，不是免费选择器主模型）</option>
-                  <option value="gpt-image-2">gpt-image-2 (ChatGPT 绘图/动图专用)</option>
-                  <option value="chatgpt-web">chatgpt-web (ChatGPT 网页原生)</option>
+                  <option value="gemini-3.5-flash-lite">3.5 Flash-Lite（快速解答）</option>
+                  <option value="gemini-4-hydrogen" selected>4 Hydrogen（日常帮助）</option>
+                  <option value="gemini-3.1-pro">3.1 Pro（深度研究）</option>
+                  <option value="gemini-4-argon">4 Argon（代码与分析）</option>
+                  <option value="gemini-4-carbon" disabled>4 Carbon（高难任务 · 未开通）</option>
                 </select>
               </div>
 
@@ -517,7 +516,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <h2 class="text-base font-bold text-slate-100 flex items-center gap-2">
               <i class="fa-solid fa-users-gear text-amber-400"></i> 账号看板
             </h2>
-            <p class="text-xs text-slate-400">基于浏览器 /u/0 ~ /u/3 多登录体系，自动分发、保活与熔断切换</p>
+            <p class="text-xs text-slate-400" id="accounts-summary">正在从浏览器同步 Google 账号…</p>
           </div>
           <div class="flex items-center gap-2.5">
             <button onclick="syncProfiles()" id="btn-sync-profiles" class="px-3.5 py-1.5 rounded-lg text-xs font-medium bg-indigo-500/10 text-indigo-400 border border-indigo-500/30 hover:bg-indigo-500/20 transition flex items-center gap-1.5" title="抓取各账号在 Google 的真实用户名与 Gmail 邮箱">
@@ -671,10 +670,117 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     let currentPlaygroundCategory = "gemini";
 
+    const MODELS_BY_PLATFORM = {
+      gemini: [
+        ["gemini-3.5-flash-lite", "3.5 Flash-Lite（快速解答）", false],
+        ["gemini-4-hydrogen", "4 Hydrogen（日常帮助）", false],
+        ["gemini-3.1-pro", "3.1 Pro（深度研究）", false],
+        ["gemini-4-argon", "4 Argon（代码与分析）", false],
+        ["gemini-4-carbon", "4 Carbon（高难任务 · 未开通）", true],
+      ],
+      aistudio: [
+        ["gemini-4-argon", "gemini-4-argon (AI Studio 原生)"],
+        ["gemini-3.8-flash", "gemini-3.8-flash"],
+        ["gemini-3.5-flash-lite", "gemini-3.5-flash-lite"],
+        ["gemini-3.1-pro-preview", "gemini-3.1-pro-preview"],
+      ],
+      gpt: [
+        ["auto", "auto（免费 · 自动选模型）"],
+        ["gpt-6", "gpt-6（免费 · 不思考 / Instant）"],
+        ["gpt-6-t-mini", "gpt-6-t-mini（免费 · 思考 / Thinking mini）"],
+        ["gpt-5-6", "gpt-5-6"],
+        ["gpt-image-2", "gpt-image-2 (绘图/动图)"],
+        ["chatgpt-web", "chatgpt-web (网页原生)"],
+      ],
+    };
+
+    const GEMINI_ID_ALIAS = {
+      "gemini-3.8-flash": "gemini-4-hydrogen",
+      "gemini-3.7-flash": "gemini-4-hydrogen",
+      "gemini-3.6-flash": "gemini-4-hydrogen",
+    };
+    const REASONING_LABELS = {
+      gemini: ["低 · Fast and efficient", "中 · 深度适中", "高 · 超级详尽"],
+      other: ["🟢 关闭思考 / 快速模式 (Off · 直出)", "🟡 中等推理 (Medium · 适度权衡)", "🟣 深度扩展思考 (High · 长思维链)"],
+    };
+
+    function geminiBaseId(id) {
+      const raw = String(id || "").replace(/-thinking-medium$/, "").replace(/-thinking$/, "");
+      return GEMINI_ID_ALIAS[raw] || raw;
+    }
+
+    function applyGeminiModelCatalog(models) {
+      const rows = [];
+      models.forEach(item => {
+        if (!item) return;
+        if (typeof item === "string") {
+          rows.push([item, item, false]);
+          return;
+        }
+        if (!item.id || /-thinking/.test(item.id)) return;
+        rows.push([item.id, item.label || item.id, !!item.locked]);
+      });
+      if (!rows.length) return;
+      MODELS_BY_PLATFORM.gemini = rows;
+    }
+
+    function syncReasoningLabels(platformKey) {
+      const el = document.getElementById("reasoning-selector");
+      if (!el) return;
+      const texts = platformKey === "gemini" ? REASONING_LABELS.gemini : REASONING_LABELS.other;
+      ["off", "medium", "high"].forEach((value, index) => {
+        const opt = el.querySelector(`option[value="${value}"]`);
+        if (opt) opt.textContent = texts[index];
+      });
+    }
+
+    async function refreshGeminiModelCatalog() {
+      try {
+        const res = await fetch("/api/gemini/models");
+        const data = await res.json();
+        const models = data.models || [];
+        if (!models.length) return;
+        const current = document.getElementById("model-selector");
+        const before = current ? current.value : "";
+        applyGeminiModelCatalog(models);
+        if (currentPlaygroundCategory === "gemini") {
+          populateModelSelector("gemini", before || "gemini-4-hydrogen");
+          const after = document.getElementById("model-selector");
+          if (after && before && after.value !== geminiBaseId(before)) onModelOrReasoningChange();
+        }
+      } catch (e) {}
+    }
+
+    function resolveGeminiModel(baseModel, reasoning) {
+      const raw = geminiBaseId(baseModel);
+      if (raw === "gemini-4-carbon") return raw;
+      if (reasoning === "high") return raw + "-thinking";
+      if (reasoning === "medium" && raw === "gemini-4-argon") return raw + "-thinking-medium";
+      return raw;
+    }
+
+    function populateModelSelector(platformKey, preferred) {
+      const select = document.getElementById("model-selector");
+      const models = MODELS_BY_PLATFORM[platformKey];
+      if (!select || !models) return;
+      select.innerHTML = models.map(([value, label, locked]) => {
+        const disabled = locked ? " disabled" : "";
+        return `<option value="${value}"${disabled}>${label}</option>`;
+      }).join("");
+      let want = preferred || "";
+      if (platformKey === "gemini") want = geminiBaseId(want);
+      const enabled = models.filter(([, , locked]) => !locked);
+      const matched = enabled.some(([value]) => value === want);
+      const fallback = (enabled[0] && enabled[0][0]) || models[0][0];
+      const hydrogen = enabled.some(([value]) => value === "gemini-4-hydrogen");
+      select.value = matched ? want : (platformKey === "gemini" && hydrogen && !preferred ? "gemini-4-hydrogen" : fallback);
+      syncReasoningLabels(platformKey);
+    }
+
     // 51 个 API 端点完整定义 (按平台精细化归属)
     const ALL_ENDPOINTS = [
       // 1. Google Gemini (7)
-      { id: "gemini_chat", category: "gemini", method: "POST", url: "/api/gemini/chat", name: "Gemini 智能对话", desc: "4账号 LRU 自动轮换，支持模型切换与思考链推理级别", body: { prompt: "请用一句话告诉我：量子纠缠是什么？", model: "gemini-3.5-flash-lite", reasoning_level: "off", stream: true, timeout: 300 } },
+      { id: "gemini_chat", category: "gemini", method: "POST", url: "/api/gemini/chat", name: "Gemini 智能对话", desc: "4账号 LRU 自动轮换，模型与网页选择器一致", body: { prompt: "请用一句话告诉我：量子纠缠是什么？", model: "gemini-4-hydrogen", reasoning_level: "off", stream: true, timeout: 300 } },
       { id: "gemini_accounts", category: "gemini", method: "GET", url: "/api/gemini/accounts", name: "Gemini 4账号状态与额度", desc: "查看 4 个 Google 账号状态、5小时与每周计算配额、健康度", body: null },
       { id: "gemini_sync_profiles", category: "gemini", method: "POST", url: "/api/gemini/accounts/sync-profiles", name: "同步 Google 真实昵称邮箱", desc: "向 Google 上游拉取各 authuser 对应的真实用户显示昵称与 Gmail 邮箱", body: {} },
       { id: "gemini_check", category: "gemini", method: "POST", url: "/api/gemini/accounts/1/check", name: "检测账号凭证健康度", desc: "向 Google 上游验证指定账号 (如 #1) 会话有效性并更新健康状态", body: {} },
@@ -813,10 +919,24 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     function setPlaygroundCategory(catKey, autoSelect = true) {
       currentPlaygroundCategory = catKey;
       renderPlaygroundCategoryNav();
+      populateModelSelector(catKey);
+      if (catKey === "gemini") refreshGeminiModelCatalog();
       const filtered = populateApiSelector(catKey);
+      syncEndpointListToPlatform(catKey);
       if (autoSelect && filtered && filtered.length > 0) {
         loadEndpoint(filtered[0].id, false);
       }
+    }
+
+    function syncEndpointListToPlatform(catKey) {
+      currentCategory = catKey;
+      document.querySelectorAll(".category-tab").forEach(tab => {
+        const active = tab.getAttribute("data-cat") === catKey;
+        tab.className = active
+          ? "category-tab px-3 py-1.5 rounded-lg text-xs font-medium border transition tab-active"
+          : "category-tab px-3 py-1.5 rounded-lg text-xs font-medium border border-slate-700 bg-slate-900 text-slate-400 hover:text-slate-200 transition";
+      });
+      if (document.getElementById("endpoints-grid")) renderEndpointsList();
     }
 
     // 按当前分类动态填充下方 API 模板下拉框
@@ -904,6 +1024,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         else if (currentCategory === "chatgpt") matchesCategory = ep.category === "chatgpt";
         else if (currentCategory === "openai") matchesCategory = ep.category === "openai";
         else if (currentCategory === "gemini") matchesCategory = ep.category === "gemini";
+        else if (currentCategory === "gpt") matchesCategory = ep.category === "chatgpt" || ep.category === "openai";
         else if (currentCategory === "aistudio") matchesCategory = ep.category === "aistudio";
         else if (currentCategory === "minimax") matchesCategory = ep.category === "minimax";
         else if (currentCategory === "system") matchesCategory = ep.category === "system";
@@ -1031,8 +1152,21 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const bodyStr = ep.body ? JSON.stringify(ep.body, null, 2) : "{}";
         document.getElementById("req-body").value = bodyStr;
 
-        if (ep.id === "gemini_chat" || ep.id === "openai_chat" || ep.id === "chatgpt_chat") {
+        if (ep.id === "gemini_chat" || ep.id === "aistudio_chat" || ep.id === "openai_chat" || ep.id === "chatgpt_chat") {
           if (controlsGrid) controlsGrid.style.display = "grid";
+          let preferredModel = "";
+          try { preferredModel = JSON.parse(bodyStr).model || ""; } catch (e) {}
+          if (epPlat === "gemini" && preferredModel) {
+            const reasoningEl = document.getElementById("reasoning-selector");
+            if (reasoningEl) {
+              if (/-thinking-medium$/.test(preferredModel)) reasoningEl.value = "medium";
+              else if (/-thinking$/.test(preferredModel)) reasoningEl.value = "high";
+            }
+          }
+          populateModelSelector(epPlat, preferredModel);
+          if (preferredModel && document.getElementById("model-selector").value !== preferredModel) {
+            onModelOrReasoningChange();
+          }
           const streamContainer = document.getElementById("stream-toggle-container");
           if (streamContainer) streamContainer.style.display = "flex";
           const streamToggle = document.getElementById("stream-toggle");
@@ -1077,18 +1211,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const data = JSON.parse(bodyEl.value);
         let targetModel = baseModel;
         if (baseModel.startsWith("gemini")) {
-          let raw = baseModel.replace("-thinking-medium", "").replace("-thinking", "").replace("-thinking-lite", "");
-          if (reasoning === "high") {
-            if (raw === "gemini-4-argon") targetModel = "gemini-4-argon-thinking";
-            else if (raw === "gemini-3.8-flash" || raw === "gemini-3.7-flash") targetModel = "gemini-3.8-flash-thinking";
-            else targetModel = raw + "-thinking";
-          } else if (reasoning === "medium") {
-            if (raw === "gemini-4-argon") targetModel = "gemini-4-argon-thinking-medium";
-            else if (raw === "gemini-3.6-flash") targetModel = "gemini-3.6-flash-thinking";
-            else targetModel = raw;
-          } else {
-            targetModel = raw;
-          }
+          targetModel = resolveGeminiModel(baseModel, reasoning);
         }
 
         data.model = targetModel;
@@ -1622,7 +1745,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             ? `<span class="inline-block w-2.5 h-2.5 rounded-full bg-emerald-400"></span> 扩展已连接`
             : `<span class="inline-block w-2.5 h-2.5 rounded-full bg-rose-400"></span> 扩展未连接`;
           document.getElementById("hub-clients").innerText = `客户端: ${sys.services?.cookie_hub?.clients || 0}`;
-          document.getElementById("gemini-status-text").innerText = `${sys.services?.gemini_pool?.active_accounts || 4} 账号就绪`;
+          const readyCount = sys.services?.gemini_pool?.active_accounts;
+          document.getElementById("gemini-status-text").innerText = readyCount ? `${readyCount} 账号就绪` : "正在同步账号";
 
           const ais = sys.services?.aistudio;
           const aisText = document.getElementById("aistudio-status-text");
@@ -1671,7 +1795,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           const data = await acctRes.json();
           const tbody = document.getElementById("accounts-tbody");
           tbody.innerHTML = "";
-          (data.accounts || []).forEach(a => {
+          const accounts = (data.accounts || []).filter(a => a.visible);
+          const named = [];
+          accounts.forEach(a => {
+            if (a.email && !named.includes(a.email)) named.push(a.email);
+          });
+          const summary = document.getElementById("accounts-summary");
+          if (summary) {
+            summary.innerText = named.length
+              ? `当前浏览器共 ${named.length} 个 Google 账号：${named.join("、")}`
+              : "正在按当前浏览器的登录账号同步，没有独立登录的槽位不会显示…";
+          }
+          const navCount = document.getElementById("nav-account-count");
+          if (navCount) navCount.innerText = named.length ? `${named.length}账号` : "同步中";
+          accounts.forEach(a => {
             const tr = document.createElement("tr");
             tr.className = "hover:bg-slate-900/40 transition";
             
@@ -1702,6 +1839,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     </div>
                     <div class="text-xs text-slate-400 font-mono flex items-center gap-1.5 mt-0.5">
                       <i class="fa-regular fa-envelope text-[11px] text-cyan-400"></i> ${displayEmail}
+                      ${(a.note || "").includes("同一登录") ? `<span class="text-amber-300/80">· 与更早槽位同一登录</span>` : ""}
                     </div>
                   </div>
                 </div>
@@ -1776,6 +1914,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const data = await res.json();
       showToast("保活完成: " + (data.status || "OK"));
       refreshDashboard();
+    }
+
+    async function exportToOpenCode() {
+      if (!confirm("把当前 API 的对话模型写入 OpenCode 配置？已有的其他供应商会保留。")) return;
+      const res = await fetch("/api/export/opencode", { method: "POST" });
+      const data = await res.json();
+      if (!res.ok) {
+        showToast(data.detail || "导入失败");
+        return;
+      }
+      showToast(data.message || "已写入 OpenCode");
     }
 
     async function refreshAllCookies() {
