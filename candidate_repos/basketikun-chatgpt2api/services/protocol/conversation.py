@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
+import os
 import re
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -223,14 +226,57 @@ def build_image_prompt(prompt: str, size: str | None, quality: str = "auto") -> 
     return f"{prompt.strip()}\n\n{''.join(hints)}" if hints else prompt
 
 
+_TIKTOKEN_BLOB_URLS = {
+    "o200k_base": "https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken",
+    "cl100k_base": "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken",
+}
+_ENCODING_CACHE: dict[str, Any] = {}
+
+
+class _ApproxEncoding:
+    def encode(self, text: str) -> list[int]:
+        if not text:
+            return []
+        approx_len = max(1, (len(text.encode("utf-8", errors="ignore")) + 3) // 4)
+        return [0] * approx_len
+
+
+_APPROX_ENCODING = _ApproxEncoding()
+
+
+def _tiktoken_cache_exists(encoding_name: str) -> bool:
+    blob_url = _TIKTOKEN_BLOB_URLS.get(encoding_name)
+    if not blob_url:
+        return True
+    cache_dir = (
+        os.environ.get("TIKTOKEN_CACHE_DIR")
+        or os.environ.get("DATA_GYM_CACHE_DIR")
+        or os.path.join(tempfile.gettempdir(), "data-gym-cache")
+    )
+    if not cache_dir:
+        return False
+    cache_key = hashlib.sha1(blob_url.encode()).hexdigest()
+    return os.path.isfile(os.path.join(cache_dir, cache_key))
+
+
 def encoding_for_model(model: str):
+    preferred = "o200k_base"
     try:
-        return tiktoken.encoding_for_model(model)
-    except KeyError:
+        preferred = tiktoken.model.encoding_name_for_model(model)
+    except Exception:
+        pass
+    for candidate in dict.fromkeys([preferred, "o200k_base", "cl100k_base"]):
+        if candidate in _ENCODING_CACHE:
+            return _ENCODING_CACHE[candidate]
+        if not _tiktoken_cache_exists(candidate):
+            continue
         try:
-            return tiktoken.get_encoding("o200k_base")
-        except KeyError:
-            return tiktoken.get_encoding("cl100k_base")
+            enc = tiktoken.get_encoding(candidate)
+            _ENCODING_CACHE[candidate] = enc
+            return enc
+        except Exception:
+            continue
+    return _APPROX_ENCODING
 
 
 def count_message_image_tokens(messages: list[dict[str, Any]], model: str) -> int:

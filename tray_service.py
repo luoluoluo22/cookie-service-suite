@@ -20,6 +20,8 @@ import webbrowser
 import subprocess
 import shutil
 import urllib.request
+import urllib.error
+import urllib.parse
 import json
 import ctypes
 import traceback
@@ -130,6 +132,8 @@ class TrayAppServer:
         self.is_running = False
         self.start_time = time.time()
         self.monitor_thread: Optional[threading.Thread] = None
+        self._api_start_lock = threading.Lock()
+        self._extension_task_lock = threading.Lock()
 
         # 实时服务状态缓存 (线程安全)
         self.status_cache: Dict[str, Any] = {
@@ -232,34 +236,57 @@ class TrayAppServer:
             time.sleep(1.5)
 
     def start_api_server(self):
-        """在后台守护线程中启动 FastAPI + Uvicorn 统一本地 API 服务 (18800)"""
-        self._ensure_port_available(SERVER_PORT)
-        config = uvicorn.Config(
-            app=app,
-            host=SERVER_HOST,
-            port=SERVER_PORT,
-            log_level="warning",
-            access_log=False,
-            use_colors=False,
-        )
-        self.uvicorn_server = uvicorn.Server(config)
-
-        def _run():
-            try:
-                print(f"🚀 [API 服务] 正在监听: http://{SERVER_HOST}:{SERVER_PORT}", flush=True)
-                self.uvicorn_server.run()
-            except Exception as e:
-                print(f"❌ [API 服务] 运行异常退出: {e}", flush=True)
-
-        self.server_thread = threading.Thread(target=_run, daemon=True)
-        self.server_thread.start()
-
-        # 等待服务就绪
-        for _ in range(20):
-            time.sleep(0.2)
-            if self.uvicorn_server.started:
+        """幂等启动 FastAPI；启动线程存活或已就绪时绝不再创建第二个 Uvicorn。"""
+        with self._api_start_lock:
+            if self.uvicorn_server is not None and getattr(self.uvicorn_server, "started", False):
                 self.status_cache["api_ok"] = True
-                break
+                return True
+
+            if self.server_thread is not None and self.server_thread.is_alive():
+                # 另一个启动调用已创建线程；只等待它完成，不重复 bind 18800。
+                for _ in range(75):
+                    if self.uvicorn_server is not None and getattr(self.uvicorn_server, "started", False):
+                        self.status_cache["api_ok"] = True
+                        return True
+                    if not self.server_thread.is_alive():
+                        break
+                    time.sleep(0.2)
+                return bool(
+                    self.uvicorn_server is not None
+                    and getattr(self.uvicorn_server, "started", False)
+                )
+
+            self._ensure_port_available(SERVER_PORT)
+            config = uvicorn.Config(
+                app=app,
+                host=SERVER_HOST,
+                port=SERVER_PORT,
+                log_level="warning",
+                access_log=False,
+                use_colors=False,
+            )
+            self.uvicorn_server = uvicorn.Server(config)
+
+            def _run():
+                try:
+                    print(f"🚀 [API 服务] 正在监听: http://{SERVER_HOST}:{SERVER_PORT}", flush=True)
+                    self.uvicorn_server.run()
+                except Exception as e:
+                    print(f"❌ [API 服务] 运行异常退出: {e}", flush=True)
+
+            self.server_thread = threading.Thread(target=_run, daemon=True)
+            self.server_thread.start()
+
+            for _ in range(75):
+                if self.uvicorn_server.started:
+                    self.status_cache["api_ok"] = True
+                    return True
+                if not self.server_thread.is_alive():
+                    break
+                time.sleep(0.2)
+
+            self.status_cache["api_ok"] = False
+            return False
 
     def ensure_gemini_pool(self, icon=None, item=None):
         """启动或健康检查 Gemini 多账号统一代理服务 (18083)"""
@@ -459,8 +486,9 @@ class TrayAppServer:
                 self._update_service_status()
                 # 若主 API 服务未就绪且未在启动中，自动执行自愈拉起
                 if not self.status_cache["api_ok"]:
-                    if self.uvicorn_server is None or not getattr(self.uvicorn_server, "started", False):
-                        print("⚠️ [系统守护] 检测到本地 API 服务离线，正在自动执行自愈拉起...", flush=True)
+                    thread_alive = self.server_thread is not None and self.server_thread.is_alive()
+                    if not thread_alive:
+                        print("⚠️ [系统守护] 检测到本地 API 服务离线且启动线程已退出，正在自愈拉起...", flush=True)
                         self.start_api_server()
             except Exception:
                 pass
@@ -629,6 +657,156 @@ class TrayAppServer:
                 self.tray_icon.notify(f"刷新失败: {e}", "异常通知")
             print("❌ [系统托盘] 刷新异常:", e, flush=True)
 
+    # ==========================================
+    # Cookie Hub 扩展数据读取（仅在显式点击托盘菜单时触发）
+    # ==========================================
+
+    @staticmethod
+    def _local_json_request(url: str, timeout: int = 12, method: str = "GET") -> Dict[str, Any]:
+        """只请求本机固定服务；数据不会写入日志，尤其不记录 Cookie 值。"""
+        req = urllib.request.Request(
+            url,
+            data=b"{}" if method == "POST" else None,
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            method=method,
+        )
+        try:
+            with _LOCAL_OPENER.open(req, timeout=timeout) as response:
+                result = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            route = urllib.parse.urlsplit(url).path
+            if route == "/api/aistudio/sync-cookies":
+                msg = (
+                    f"AI Studio 凭证同步未完成（HTTP {exc.code}）。"
+                    "如果浏览器打开了 Google 登录页，请登录后重新点击该菜单。"
+                )
+            elif exc.code == 503:
+                msg = "浏览器扩展未连接，请在浏览器中启用 Cookie Hub，然后重试。"
+            else:
+                msg = f"本地服务返回 HTTP {exc.code}，请检查 Cookie Hub 服务。"
+            raise RuntimeError(msg) from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError("无法连接本地 Cookie Hub / AI Studio 服务，请确认后台服务已启动。") from exc
+        if not isinstance(result, dict):
+            raise RuntimeError("本地服务返回的数据格式不正确")
+        if result.get("success") is False:
+            reason = result.get("message") or result.get("error") or "扩展未能获取网页数据"
+            raise RuntimeError(str(reason)[:300])
+        return result
+
+    def get_active_extension_summary(self) -> Dict[str, Any]:
+        """从扩展直接读取当前标签页的 Cookie，返回不包含凭证值的概要信息。"""
+        data = self._local_json_request(f"http://{SERVER_HOST}:{HUB_PORT}/active", timeout=18)
+        page_url = str(data.get("activeTabUrl") or "")
+        parsed = urllib.parse.urlsplit(page_url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise RuntimeError("当前标签页不是普通网页，请在浏览器里切换到需要查看的网站。")
+        cookies = data.get("cookies") or []
+        if not isinstance(cookies, list):
+            raise RuntimeError("浏览器扩展返回的 Cookie 列表格式不正确")
+        names = sorted({str(c.get("name", "")) for c in cookies if isinstance(c, dict) and c.get("name")})
+        return {
+            "domain": parsed.hostname,
+            "title": str(data.get("activeTabTitle") or "")[:90],
+            "count": len(cookies),
+            "cookie_names": names,
+        }
+
+    def sync_aistudio_extension_summary(self) -> Dict[str, Any]:
+        """走现有同步 API：扩展自动打开 AI Studio -> 读取 HttpOnly Cookie -> 验证与同步。"""
+        result = self._local_json_request(
+            f"http://{SERVER_HOST}:{SERVER_PORT}/api/aistudio/sync-cookies",
+            timeout=65,
+            method="POST",
+        )
+        if not result.get("success"):
+            raise RuntimeError("AI Studio 同步未报告成功，请查看本地服务日志。")
+        status = {}
+        for retry in range(9):
+            status = self._local_json_request(
+                f"http://{SERVER_HOST}:{SERVER_PORT}/api/aistudio/status",
+                timeout=7,
+            )
+            if status.get("data_plane_ready") and int(status.get("accounts_ready") or 0) > 0:
+                break
+            if retry < 8:
+                time.sleep(1.5)
+        if not status.get("data_plane_ready") or int(status.get("accounts_ready") or 0) <= 0:
+            raise RuntimeError("Cookie 已同步，但 AI Studio 暂未恢复可用，请稍后查看服务状态。")
+        return {
+            "accounts_ready": int(status.get("accounts_ready") or 0),
+            "accounts_total": int(status.get("accounts_total") or 0),
+        }
+
+    def _extension_feedback(self, title: str, message: str, dialog: bool = False, error: bool = False):
+        """反馈显示不包含 Cookie 值；对已点击的操作才展示详细弹窗。"""
+        try:
+            if self.tray_icon:
+                self.tray_icon.notify(message[:200], title)
+        except Exception:
+            pass
+        if dialog and sys.platform == "win32":
+            try:
+                ctypes.windll.user32.MessageBoxW(0, message, title, 0x10 if error else 0x40)
+            except Exception:
+                pass
+
+    def _start_extension_task(self, title: str, worker):
+        """扩展读取和 AI Studio 同步可能耗时，绝不阻塞托盘右键菜单。"""
+        if not self._extension_task_lock.acquire(blocking=False):
+            self._extension_feedback("扩展任务正在执行", "上一项扩展操作尚未结束，请稍后再试。")
+            return
+
+        def _run():
+            try:
+                self._extension_feedback(title, "正在从浏览器扩展读取数据，请留意浏览器页面。")
+                worker()
+            except Exception as exc:
+                self._extension_feedback(title + "失败", str(exc)[:350], dialog=True, error=True)
+            finally:
+                self._extension_task_lock.release()
+        try:
+            threading.Thread(target=_run, name="TrayExtensionTask", daemon=True).start()
+        except Exception:
+            self._extension_task_lock.release()
+            raise
+
+    def inspect_active_extension_cookies(self, icon=None, item=None):
+        """托盘菜单：读取当前网页的扩展 Cookie，只显示名称和数量。"""
+        def _worker():
+            info = self.get_active_extension_summary()
+            cookie_names = ", ".join(info["cookie_names"][:35]) or "（暂无 Cookie）"
+            if len(info["cookie_names"]) > 35:
+                cookie_names += f" ……及其余 {len(info['cookie_names']) - 35} 个名称"
+            message = (
+                f"网站：{info['domain']}\n"
+                f"页面：{info['title']}\n"
+                f"Cookie 数量：{info['count']}\n\n"
+                f"Cookie 名称（不展示敏感值）：\n{cookie_names}"
+            )
+            self._extension_feedback("浏览器扩展数据", message, dialog=True)
+            print(f"[托盘/扩展] 当前页面 {info['domain']}，Cookie {info['count']} 条（已隐藏凭证值）", flush=True)
+
+        self._start_extension_task("获取当前网页 Cookie", _worker)
+
+    def sync_aistudio_from_extension(self, icon=None, item=None):
+        """托盘菜单：直接触发已验收的 AI Studio 自动打开 + Cookie 同步闭环。"""
+        def _worker():
+            status = self.sync_aistudio_extension_summary()
+            message = (
+                "已通过 Cookie Hub 扩展自动打开 AI Studio，读取并同步登录凭证。\n\n"
+                f"AI Studio 可用账号：{status['accounts_ready']}/{status['accounts_total']}\n"
+                "Cookie 值不会显示在托盘或日志中。"
+            )
+            self._extension_feedback("AI Studio 扩展同步成功", message, dialog=True)
+            print(
+                f"[托盘/扩展] AI Studio 同步成功，可用账号 "
+                f"{status['accounts_ready']}/{status['accounts_total']}",
+                flush=True,
+            )
+
+        self._start_extension_task("同步 AI Studio 登录态", _worker)
+
     def toggle_autostart_action(self, icon=None, item=None):
         """切换开机自启动开关"""
         ok, msg = toggle_autostart()
@@ -698,7 +876,9 @@ class TrayAppServer:
             # 诊断与运维操作
             pystray.MenuItem("📋 查看服务运行详细诊断报告", self.show_status_dialog),
             pystray.MenuItem("🔄 一键自愈 / 重启异常子服务", self.restart_subservices),
-            pystray.MenuItem("🔄 刷新 Google 会话凭证", self.refresh_cookies),
+            pystray.MenuItem("🧩 从浏览器扩展读取当前网页数据", self.inspect_active_extension_cookies),
+            pystray.MenuItem("🪄 从浏览器扩展同步 AI Studio 登录态", self.sync_aistudio_from_extension),
+            pystray.MenuItem("🔄 刷新 Gemini 池 Google 会话凭证", self.refresh_cookies),
             pystray.Menu.SEPARATOR,
             # 开机自启控制
             pystray.MenuItem(

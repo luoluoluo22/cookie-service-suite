@@ -16,20 +16,24 @@ import sys
 import time
 import json
 import subprocess
+import shutil
+from pathlib import Path
 import urllib.request
 import urllib.error
+import urllib.parse
 from typing import Generator, Dict, Any, Union, List, Optional
 
 os.environ["NO_PROXY"] = "127.0.0.1,localhost,::1"
 _LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 DEFAULT_AISTUDIO_PORT = 2048
-
-
 def _detect_default_proxy() -> str:
-    """动态探测本机可用科学上网代理端口 (优先 7890 / 7897 / 10808)"""
+    """动态探测本机可用科学上网代理端口 (优先环境变量 / Windows 系统代理 / 7890 / 7897 / 10808)"""
     if os.environ.get("HTTP_PROXY"):
         return os.environ["HTTP_PROXY"]
+    sys_proxy = _system_http_proxy("")
+    if sys_proxy:
+        return sys_proxy
     import socket
     for p in [7890, 7897, 10808, 10809]:
         try:
@@ -40,7 +44,44 @@ def _detect_default_proxy() -> str:
     return "http://127.0.0.1:7890"
 
 
+def _system_http_proxy(fallback: str) -> str:
+    """Prefer the reachable Windows system proxy to a stale hardcoded port."""
+    if sys.platform != "win32":
+        return fallback
+    try:
+        import socket
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Internet Settings") as key:
+            enabled = int(winreg.QueryValueEx(key, "ProxyEnable")[0])
+            raw = str(winreg.QueryValueEx(key, "ProxyServer")[0]).strip()
+        if not enabled or not raw:
+            return fallback
+        parts = [p.strip() for p in raw.split(";") if p.strip()]
+        choice = next((p.split("=", 1)[1] for p in parts if p.lower().startswith("https=")), None)
+        if choice is None:
+            choice = next((p.split("=", 1)[1] for p in parts if p.lower().startswith("http=")), None)
+        choice = choice or parts[0]
+        if "=" in choice:
+            return fallback
+        if not choice.startswith(("http://", "https://")):
+            choice = "http://" + choice
+        parsed = urllib.parse.urlsplit(choice)
+        if parsed.hostname not in ("127.0.0.1", "localhost") or not parsed.port:
+            return fallback
+        with socket.create_connection((parsed.hostname, parsed.port), timeout=0.6):
+            return choice
+    except Exception:
+        return fallback
+
+
 DEFAULT_PROXY = _detect_default_proxy()
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Expose Google login redirects instead of silently following them."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 class AIStudioService:
@@ -96,8 +137,45 @@ class AIStudioService:
         except Exception:
             return False
 
+    def _repair_stale_account_proxies(self) -> None:
+        """Replace only unreachable loopback proxies in account metadata; preserve cookies."""
+        import socket
+        auth_dir = os.path.join(self.base_dir, "auth")
+        if not os.path.isdir(auth_dir):
+            return
+        for folder in os.listdir(auth_dir):
+            if folder.startswith("."):
+                continue
+            path = os.path.join(auth_dir, folder, "account.json")
+            if not os.path.isfile(path):
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                original = str(data.get("proxy") or "")
+                if original == self.proxy:
+                    continue
+                parsed = urllib.parse.urlsplit(original)
+                if parsed.hostname not in ("127.0.0.1", "localhost") or not parsed.port:
+                    continue
+                try:
+                    with socket.create_connection((parsed.hostname, parsed.port), timeout=0.5):
+                        continue
+                except OSError:
+                    pass
+                data["proxy"] = self.proxy
+                temp = path + ".proxy.tmp"
+                with open(temp, "w", encoding="utf-8") as fh:
+                    json.dump(data, fh, ensure_ascii=False, indent=2)
+                os.replace(temp, path)
+                print(f"[AIStudio] Repaired stale account proxy {original} -> {self.proxy}", flush=True)
+            except Exception as exc:
+                print(f"[AIStudio] Account proxy repair failed: {exc}", flush=True)
+
     def start(self, timeout: int = 15) -> bool:
         """启动 aistudio2api 进程并激活数据面。"""
+        self.proxy = _system_http_proxy(self.proxy)
+        self._repair_stale_account_proxies()
         if not os.path.isfile(self.exe_path):
             raise FileNotFoundError(f"未找到 aistudio2api 核心程序: {self.exe_path}")
 
@@ -131,7 +209,7 @@ class AIStudioService:
             if not started:
                 return False
 
-        # 如果管理端在线，但数据面未就绪，调用 /api/control/start 启动并探测模型
+        # 管理端在线不等于生成数据面可用；启动后必须等到 RUNNING。
         if not self.is_data_plane_ready():
             try:
                 start_req = urllib.request.Request(
@@ -144,7 +222,13 @@ class AIStudioService:
             except Exception as e:
                 print(f"[AIStudio] 激活数据面通知: {e}", flush=True)
 
-        return True
+            deadline = time.time() + max(3, timeout)
+            while time.time() < deadline:
+                if self.is_data_plane_ready():
+                    return True
+                time.sleep(0.5)
+
+        return self.is_data_plane_ready()
 
     def stop(self) -> bool:
         """停止数据面与核心进程。"""
@@ -316,15 +400,151 @@ class AIStudioService:
             "sameSite": samesite,
         }
 
+    @staticmethod
+    def _cookie_header_for_url(cookies_list: List[Dict[str, Any]], url: str) -> str:
+        """按浏览器规则筛选目标 URL 可发送的 Cookie，避免混入其他 Google 子域的同名项。"""
+        parsed = urllib.parse.urlparse(url)
+        host = (parsed.hostname or "").lower()
+        path = parsed.path or "/"
+        now = time.time()
+        selected = {}
+
+        for cookie in cookies_list:
+            name = str(cookie.get("name") or "")
+            value = str(cookie.get("value") or "")
+            domain = str(cookie.get("domain") or "").lstrip(".").lower()
+            cookie_path = str(cookie.get("path") or "/")
+            if not name or not value or not domain:
+                continue
+            if not (host == domain or host.endswith("." + domain)):
+                continue
+            if not path.startswith(cookie_path):
+                continue
+            if cookie.get("secure") is True and parsed.scheme != "https":
+                continue
+            expiry = cookie.get("expirationDate", cookie.get("expires"))
+            try:
+                expiry = float(expiry) if expiry is not None else 0
+            except (TypeError, ValueError):
+                expiry = 0
+            if expiry > 0 and expiry <= now:
+                continue
+
+            specificity = (len(domain), len(cookie_path))
+            previous = selected.get(name)
+            if previous is None or specificity > previous[0]:
+                selected[name] = (specificity, value)
+
+        return "; ".join(f"{name}={item[1]}" for name, item in selected.items())
+
+    def _validate_hub_cookie_session(self, cookies_list: List[Dict[str, Any]]) -> None:
+        """写入账号文件前，先用目标站点验证 Cookie；登录跳转时不改动任何账号文件。"""
+        test_url = "https://aistudio.google.com/prompts/new_chat?model=gemini-flash-latest"
+        cookie_header = self._cookie_header_for_url(cookies_list, test_url)
+        if not cookie_header:
+            raise RuntimeError("Cookie Hub 没有提供适用于 AI Studio 的有效 Cookie；未修改账号文件。")
+
+        proxy_handler = (
+            urllib.request.ProxyHandler({"http": self.proxy, "https": self.proxy})
+            if self.proxy
+            else urllib.request.ProxyHandler({})
+        )
+        opener = urllib.request.build_opener(proxy_handler, _NoRedirectHandler())
+        req = urllib.request.Request(
+            test_url,
+            headers={
+                "Cookie": cookie_header,
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/131.0.0.0 Safari/537.36"
+                ),
+                "Accept": "text/html,application/xhtml+xml",
+            },
+        )
+        try:
+            with opener.open(req, timeout=15) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(
+                        f"AI Studio 登录态预检返回 HTTP {resp.status}；未修改账号文件。"
+                    )
+        except urllib.error.HTTPError as exc:
+            location = str(exc.headers.get("Location") or "")
+            if "accounts.google.com" in location or "ServiceLogin" in location:
+                raise RuntimeError(
+                    "浏览器中的 Google 登录态未通过 AI Studio 验证（被重定向到登录页）；"
+                    "未修改任何账号文件。请先在 Cookie Hub 所连接的浏览器登录目标 Google 账号。"
+                ) from exc
+            raise RuntimeError(
+                f"AI Studio 登录态预检失败，HTTP {exc.code}；未修改任何账号文件。"
+            ) from exc
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(
+                f"AI Studio 登录态预检无法完成（{type(exc).__name__}）；未修改任何账号文件。"
+            ) from exc
+
+    def _fetch_ego_browser_cookies(self) -> Dict[str, Any]:
+        """Open AI Studio in ego-browser and retrieve its own Google cookies.
+
+        Never log the captured subprocess output: it contains authentication data.
+        """
+        executable = (
+            os.environ.get("EGO_BROWSER_EXE")
+            or shutil.which("ego-browser.exe")
+            or shutil.which("ego-browser")
+            or str(Path.home() / ".local" / "share" / "ego" / "active_version_dir" / "ego-browser.exe")
+        )
+        if not os.path.isfile(executable):
+            raise RuntimeError("未找到 ego-browser.exe，请先安装并注册 ego-browser。")
+        script = Path(__file__).resolve().parent / "scripts" / "ego_aistudio_cookie_fetch.mjs"
+        if not script.is_file():
+            raise RuntimeError("缺少 ego-browser AI Studio 自动登录态脚本。")
+        cmd = [executable, "nodejs", "-e", f"await import('{script.as_uri()}')"]
+        try:
+            proc = subprocess.run(
+                cmd, cwd=str(script.parent), capture_output=True,
+                encoding="utf-8", errors="replace", timeout=100,
+                creationflags=(subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("ego-browser 打开 AI Studio 超时，请检查浏览器或网络。") from exc
+        if proc.returncode:
+            raise RuntimeError(f"ego-browser 登录态采集失败（退出码 {proc.returncode}），没有导入任何 Cookie。")
+        marker = "EGO_AISTUDIO_COOKIE_RESULT:"
+        combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
+        data_line = next(
+            (line.split(marker, 1)[1] for line in reversed(combined.splitlines()) if marker in line),
+            None,
+        )
+        if data_line is None:
+            raise RuntimeError("ego-browser 未返回登录态采集结果。")
+        try:
+            return json.loads(data_line)
+        except (ValueError, TypeError) as exc:
+            raise RuntimeError("ego-browser 登录态采集结果格式错误。") from exc
+
     def sync_cookies_from_hub(self) -> Dict[str, Any]:
         """从本地 Cookie Hub 提取浏览器已登录的 Google Cookie 并一键导入/更新 AI Studio 号池"""
-        hub_url = f"{self.bridge_url}/cookies?domain=google.com"
-        req = urllib.request.Request(hub_url)
-        try:
-            with _LOCAL_OPENER.open(req, timeout=5) as resp:
-                hub_data = json.loads(resp.read().decode("utf-8"))
-        except Exception as e:
-            raise RuntimeError(f"连接本地 Cookie Hub 失败: {e}，请确保扩展正常运行。")
+        # Cookie Hub is the default source for AI Studio authentication; it opens the signed-in browser tab before reading HttpOnly cookies.
+        if os.environ.get("AI_STUDIO_BROWSER", "hub").strip().lower() == "hub":
+            hub_url = f"{self.bridge_url}/aistudio/auto_fetch"
+            req = urllib.request.Request(hub_url)
+            try:
+                with _LOCAL_OPENER.open(req, timeout=45) as resp:
+                    hub_data = json.loads(resp.read().decode("utf-8"))
+            except Exception as exc:
+                raise RuntimeError(f"连接本地 Cookie Hub 失败: {type(exc).__name__}") from exc
+        else:
+            hub_data = self._fetch_ego_browser_cookies()
+
+        if hub_data.get("loginRequired"):
+            raise RuntimeError(
+                "已自动打开 AI Studio，但 Google 当前要求重新登录。请在刚打开的浏览器标签页完成登录，然后再次运行 /sync。"
+            )
+        if not hub_data.get("success"):
+            raise RuntimeError(str(hub_data.get("error") or hub_data.get("message") or "Cookie Hub 自动打开 AI Studio 或读取 Cookie 失败"))
 
         cookies_list = hub_data.get("cookies", [])
         if not cookies_list:
@@ -337,6 +557,13 @@ class AIStudioService:
             item for item in os.listdir(auth_dir)
             if os.path.isdir(os.path.join(auth_dir, item)) and not item.startswith(".") and not item.endswith(".bak")
         ]
+
+        if len(existing_accs) > 1:
+            raise RuntimeError(
+                "Cookie Hub 当前只提供浏览器当前配置的一套登录态；检测到多个 AI Studio 隔离账号，"
+                "为避免把同一会话覆盖到多个账号，已拒绝批量同步。"
+            )
+        self._validate_hub_cookie_session(cookies_list)
 
         converted_cookies = [self._hub_to_storage_cookie(c) for c in cookies_list]
         saved_accounts = []
@@ -372,7 +599,6 @@ class AIStudioService:
                             acc_data = json.load(af)
                     except Exception:
                         pass
-                acc_data["enabled"] = True
                 acc_data["proxy"] = self.proxy
                 with open(acc_file, "w", encoding="utf-8") as af:
                     json.dump(acc_data, af, indent=2)
@@ -405,6 +631,10 @@ class AIStudioService:
             cmd = [self.exe_path, "setup", "-cookie-file", "cookies.json"]
             proc = subprocess.run(cmd, cwd=self.base_dir, env=env, capture_output=True, text=True, timeout=15)
             raw_output = (proc.stdout or "") + (proc.stderr or "")
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"AI Studio setup 失败，退出码 {proc.returncode}；未报告 Cookie 同步成功。"
+                )
 
             if os.path.exists(auth_dir):
                 for item in os.listdir(auth_dir):
@@ -420,11 +650,13 @@ class AIStudioService:
                         except Exception:
                             pass
 
-        # 重启 aistudio2api 进程并激活数据面，确保内存中加载新凭证
-        if self.is_running():
-            self.restart()
-        else:
-            self.start()
+        # 重启 aistudio2api 进程并激活数据面；管理端在线不代表生成服务已恢复。
+        started = self.restart() if self.is_running() else self.start()
+        if not started or not self.is_data_plane_ready():
+            raise RuntimeError(
+                "Cookie 已通过预检并写入，但 AI Studio 生成数据面未进入 RUNNING；"
+                "本次不报告同步成功，请检查 aistudio2api.log。"
+            )
 
         return {
             "success": True,
@@ -436,12 +668,16 @@ class AIStudioService:
     # -------------------------------------------------------------
     # 对话生成（支持流式 SSE 与完整非流式，内置凭证失效自愈重试）
     # -------------------------------------------------------------
-    def _build_request(self, model: str, messages: List[Dict[str, str]], stream: bool) -> urllib.request.Request:
+    def _build_request(self, model: str, messages: List[Dict[str, Any]], stream: bool, tools: Optional[List[Dict[str, Any]]] = None, tool_choice: Optional[Any] = None) -> urllib.request.Request:
         req_payload = {
             "model": model or "gemini-4-argon",
             "messages": messages,
             "stream": stream,
         }
+        if tools is not None:
+            req_payload["tools"] = tools
+        if tool_choice is not None:
+            req_payload["tool_choice"] = tool_choice
         url = f"http://127.0.0.1:{self.port}/v1/chat/completions"
         return urllib.request.Request(
             url,
@@ -454,9 +690,11 @@ class AIStudioService:
         prompt: str,
         model: str = "gemini-4-argon",
         stream: bool = False,
-        messages: Optional[List[Dict[str, str]]] = None,
+        messages: Optional[List[Dict[str, Any]]] = None,
         timeout: int = 120,
         _retry_auth: bool = True,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Any] = None,
     ) -> Union[Dict[str, Any], Generator[str, None, None]]:
         """
         调用 Google AI Studio 逆向接口发起推理。
@@ -472,10 +710,10 @@ class AIStudioService:
         if not messages:
             messages = [{"role": "user", "content": prompt}]
 
-        req = self._build_request(model, messages, stream)
+        req = self._build_request(model, messages, stream, tools=tools, tool_choice=tool_choice)
 
         if stream:
-            return self._stream_generator(req, model=model, messages=messages, timeout=timeout, _retry_auth=_retry_auth)
+            return self._stream_generator(req, model=model, messages=messages, timeout=timeout, _retry_auth=_retry_auth, tools=tools, tool_choice=tool_choice)
         else:
             t0 = time.time()
             try:
@@ -499,6 +737,8 @@ class AIStudioService:
                             messages=messages,
                             timeout=timeout,
                             _retry_auth=False,
+                            tools=tools,
+                            tool_choice=tool_choice,
                         )
                     except Exception as sync_err:
                         print(f"[AIStudio] 凭证自愈重试失败: {sync_err}", flush=True)
@@ -510,9 +750,11 @@ class AIStudioService:
         self,
         req: urllib.request.Request,
         model: str = "gemini-4-argon",
-        messages: Optional[List[Dict[str, str]]] = None,
+        messages: Optional[List[Dict[str, Any]]] = None,
         timeout: int = 120,
         _retry_auth: bool = True,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Any] = None,
     ) -> Generator[str, None, None]:
         """流式生成器：直接转发并产出上游 SSE 事件流（内置 401 自动同步重试）"""
         try:
@@ -525,8 +767,8 @@ class AIStudioService:
                 try:
                     self.sync_cookies_from_hub()
                     time.sleep(1)
-                    retry_req = self._build_request(model, messages or [], True)
-                    retry_gen = self._stream_generator(retry_req, model=model, messages=messages, timeout=timeout, _retry_auth=False)
+                    retry_req = self._build_request(model, messages or [], True, tools=tools, tool_choice=tool_choice)
+                    retry_gen = self._stream_generator(retry_req, model=model, messages=messages, timeout=timeout, _retry_auth=False, tools=tools, tool_choice=tool_choice)
                     for chunk in retry_gen:
                         yield chunk
                     return

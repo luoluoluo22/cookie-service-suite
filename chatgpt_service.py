@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import urllib.request
 import urllib.parse
+import urllib.error
 from typing import Generator, Dict, Any, Union, List, Optional
 
 # 强制本地 127.0.0.1 回环通信不走外部代理
@@ -32,6 +33,105 @@ _LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 DEFAULT_BRIDGE_URL = "http://127.0.0.1:18888"
 DEFAULT_REVERSE_PORT = 18084
+
+def _proxy_is_open(proxy_url: str) -> bool:
+    raw = (proxy_url or "").strip()
+    if not raw:
+        return False
+    if "://" not in raw:
+        raw = "http://" + raw
+    parsed = urllib.parse.urlsplit(raw)
+    if not parsed.hostname or not parsed.port:
+        return False
+    try:
+        import socket
+        with socket.create_connection((parsed.hostname, parsed.port), timeout=0.25):
+            return True
+    except Exception:
+        return False
+
+
+def _system_http_proxy(fallback: str = "") -> str:
+    """Prefer the reachable Windows system proxy to a stale hardcoded port."""
+    if sys.platform != "win32":
+        return fallback
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Internet Settings") as key:
+            enabled = int(winreg.QueryValueEx(key, "ProxyEnable")[0])
+            raw = str(winreg.QueryValueEx(key, "ProxyServer")[0]).strip()
+        if not enabled or not raw:
+            return fallback
+        parts = [part.strip() for part in raw.split(";") if part.strip()]
+        choice = next((part.split("=", 1)[1] for part in parts if part.lower().startswith("https=")), None)
+        if choice is None:
+            choice = next((part.split("=", 1)[1] for part in parts if part.lower().startswith("http=")), None)
+        choice = choice or parts[0]
+        if "=" in choice:
+            return fallback
+        if not choice.startswith(("http://", "https://")):
+            choice = "http://" + choice
+        parsed = urllib.parse.urlsplit(choice)
+        if parsed.hostname not in ("127.0.0.1", "localhost") or not parsed.port:
+            return fallback
+        if _proxy_is_open(choice):
+            return choice
+        return fallback
+    except Exception:
+        return fallback
+
+
+def _detect_local_proxy(fallback: str = "") -> str:
+    """Detect the currently open local proxy (Windows system proxy -> env -> common ports)."""
+    candidates: List[str] = []
+    sys_proxy = _system_http_proxy("")
+    if sys_proxy:
+        candidates.append(sys_proxy)
+    for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "all_proxy"):
+        val = (os.environ.get(key) or "").strip()
+        if val:
+            candidates.append(val if "://" in val else "http://" + val)
+    for port in (7900, 7890, 7897, 10808, 10809, 1080, 7891):
+        candidates.append(f"http://127.0.0.1:{port}")
+    seen = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if _proxy_is_open(candidate):
+            return candidate
+    return fallback
+
+
+def _find_pids_on_port(port: int) -> List[int]:
+    """Find TCP listening PIDs bound to the given local port (excluding current PID)."""
+    if sys.platform != "win32":
+        return []
+    try:
+        out = subprocess.check_output(
+            ["netstat", "-ano", "-p", "TCP"],
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    except Exception:
+        return []
+    pids: List[int] = []
+    suffix = f":{port}"
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 5 and parts[0].upper() == "TCP" and parts[3].upper() == "LISTENING":
+            if parts[1].endswith(suffix):
+                try:
+                    pid = int(parts[4])
+                    if pid > 0 and pid != os.getpid() and pid not in pids:
+                        pids.append(pid)
+                except ValueError:
+                    pass
+    return pids
+
+
 def _load_reverse_auth_key() -> str:
     """Load a private, per-user local key; never commit or log its value."""
     override = os.getenv("CHATGPT2API_AUTH_KEY", "").strip()
@@ -158,12 +258,14 @@ class ChatGPTReverseEngine:
         self,
         port: int = DEFAULT_REVERSE_PORT,
         auth_key: str = DEFAULT_REVERSE_AUTH_KEY,
-        proxy: str = "http://127.0.0.1:7890",
+        proxy: Optional[str] = None,
     ):
         self.port = port
         self.base_url = f"http://127.0.0.1:{port}"
         self.auth_key = auth_key
-        self.proxy = proxy
+        self._explicit_proxy = proxy
+        self.proxy = proxy or _detect_local_proxy("http://127.0.0.1:7890")
+        self._last_applied_proxy = ""
         self.base_dir = os.path.join(
             os.path.dirname(__file__), "candidate_repos", "basketikun-chatgpt2api"
         )
@@ -189,9 +291,10 @@ class ChatGPTReverseEngine:
         except Exception:
             return False
 
-    def start(self, wait_timeout: int = 15) -> bool:
+    def start(self, wait_timeout: int = 45) -> bool:
         """启动独立逆向后台服务进程"""
         if self.is_running():
+            self.apply_proxy()
             return True
 
         env = os.environ.copy()
@@ -263,7 +366,7 @@ class ChatGPTReverseEngine:
         raise TimeoutError(f"ChatGPT 逆向后台服务启动超时（等待 {wait_timeout} 秒后端口 {self.port} 未响应）")
 
     def stop(self) -> None:
-        """停止逆向服务进程"""
+        """停止逆向服务进程（包括外部遗留占用端口的旧进程）"""
         if self.proc:
             try:
                 if sys.platform == "win32":
@@ -271,6 +374,7 @@ class ChatGPTReverseEngine:
                         ["taskkill", "/F", "/T", "/PID", str(self.proc.pid)],
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
+                        creationflags=subprocess.CREATE_NO_WINDOW,
                     )
                 else:
                     self.proc.terminate()
@@ -281,6 +385,57 @@ class ChatGPTReverseEngine:
                 except Exception:
                     pass
             self.proc = None
+
+        if sys.platform == "win32":
+            for pid in _find_pids_on_port(self.port):
+                try:
+                    subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(pid)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=subprocess.CREATE_NO_WINDOW,
+                    )
+                except Exception:
+                    pass
+        self._last_applied_proxy = ""
+        deadline = time.time() + 3.0
+        while time.time() < deadline and self.is_running():
+            time.sleep(0.2)
+
+    def restart(self, wait_timeout: int = 45) -> bool:
+        """重启逆向服务进程，确保最新代理环境变量与配置生效。"""
+        if not self._explicit_proxy:
+            detected = _detect_local_proxy(self.proxy)
+            if detected:
+                self.proxy = detected
+        self.stop()
+        return self.start(wait_timeout=wait_timeout)
+
+    @staticmethod
+    def _format_http_error(exc: urllib.error.HTTPError) -> str:
+        body = ""
+        try:
+            raw = exc.read()
+            if raw:
+                body = raw.decode("utf-8", errors="replace").strip()
+        except Exception:
+            pass
+        if body:
+            try:
+                parsed = json.loads(body)
+                if isinstance(parsed, dict):
+                    err = parsed.get("error")
+                    if isinstance(err, dict) and err.get("message"):
+                        body = str(err["message"])
+                    elif parsed.get("detail"):
+                        detail = parsed["detail"]
+                        if isinstance(detail, dict) and detail.get("error"):
+                            body = str(detail["error"])
+                        else:
+                            body = str(detail)
+            except Exception:
+                pass
+        return f"HTTP {exc.code}: {body}" if body else f"HTTP {exc.code}: {exc.reason}"
 
     def get_health(self) -> dict:
         """获取逆向服务号池监控状态（健康度、账号统计等）"""
@@ -323,20 +478,50 @@ class ChatGPTReverseEngine:
         with self.opener.open(req, timeout=10) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
-    def apply_proxy(self) -> bool:
-        """把本地代理写进逆向引擎自己的出口配置。仅设置环境变量不会改变它的直连模式。"""
+    def apply_proxy(self, force: bool = False) -> bool:
+        """同步最新可用代理到逆向引擎的 legacy proxy 与 proxy_runtime，避免沿用旧端口。"""
+        if not self._explicit_proxy:
+            detected = _detect_local_proxy(self.proxy)
+            if detected:
+                self.proxy = detected
         if not self.proxy or not self.is_running():
             return False
-        url = f"{self.base_url}/api/proxy/runtime"
+        if not force and self._last_applied_proxy == self.proxy:
+            return True
+
+        # 同时更新 legacy `proxy` 与 `proxy_runtime.proxy_url`，因为部分内部请求未传 upstream=True
+        settings_url = f"{self.base_url}/api/settings"
         payload = json.dumps({
+            "proxy": self.proxy,
+            "proxy_runtime": {
+                "enabled": True,
+                "egress_mode": "single_proxy",
+                "proxy_url": self.proxy,
+            },
+        }).encode("utf-8")
+        req = urllib.request.Request(settings_url, data=payload, headers=self._auth_headers())
+        try:
+            with self.opener.open(req, timeout=8) as resp:
+                if resp.status == 200:
+                    self._last_applied_proxy = self.proxy
+                    return True
+        except Exception:
+            pass
+
+        # 兜底仅更新 /api/proxy/runtime
+        runtime_url = f"{self.base_url}/api/proxy/runtime"
+        runtime_payload = json.dumps({
             "enabled": True,
             "egress_mode": "single_proxy",
             "proxy_url": self.proxy,
         }).encode("utf-8")
-        req = urllib.request.Request(url, data=payload, headers=self._auth_headers())
+        req = urllib.request.Request(runtime_url, data=runtime_payload, headers=self._auth_headers())
         try:
             with self.opener.open(req, timeout=8) as resp:
-                return resp.status == 200
+                if resp.status == 200:
+                    self._last_applied_proxy = self.proxy
+                    return True
+                return False
         except Exception:
             return False
 
@@ -371,8 +556,11 @@ class ChatGPTReverseEngine:
 
         payload = json.dumps(payload_dict).encode("utf-8")
         req = urllib.request.Request(url, data=payload, headers=self._auth_headers())
-        with self.opener.open(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        try:
+            with self.opener.open(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(self._format_http_error(exc)) from exc
 
     def _stream_generator(
         self,
@@ -392,19 +580,27 @@ class ChatGPTReverseEngine:
 
         payload = json.dumps(payload_dict).encode("utf-8")
         req = urllib.request.Request(url, data=payload, headers=self._auth_headers())
-        with self.opener.open(req, timeout=timeout) as resp:
-            for raw_line in resp:
-                line = raw_line.decode("utf-8").strip()
-                if not line or not line.startswith("data:"):
-                    continue
-                data_str = line[5:].strip()
-                if data_str == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data_str)
-                    yield chunk
-                except Exception:
-                    continue
+        try:
+            resp = self.opener.open(req, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(self._format_http_error(exc)) from exc
+
+        def _iter_stream():
+            with resp:
+                for raw_line in resp:
+                    line = raw_line.decode("utf-8").strip()
+                    if not line or not line.startswith("data:"):
+                        continue
+                    data_str = line[5:].strip()
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                        yield chunk
+                    except Exception:
+                        continue
+
+        return _iter_stream()
 
     def generate_image(
         self,
@@ -423,8 +619,11 @@ class ChatGPTReverseEngine:
             "response_format": response_format,
         }).encode("utf-8")
         req = urllib.request.Request(url, data=payload, headers=self._auth_headers())
-        with self.opener.open(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        try:
+            with self.opener.open(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(self._format_http_error(exc)) from exc
 
 
 class UnifiedChatGPTService:
@@ -434,7 +633,7 @@ class UnifiedChatGPTService:
         self,
         reverse_port: int = DEFAULT_REVERSE_PORT,
         bridge_url: str = DEFAULT_BRIDGE_URL,
-        proxy: str = "http://127.0.0.1:7890",
+        proxy: Optional[str] = None,
     ):
         self.reverse = ChatGPTReverseEngine(port=reverse_port, proxy=proxy)
         self.bridge = ChatGPTBridgeClient(base_url=bridge_url)
@@ -721,6 +920,33 @@ class UnifiedChatGPTService:
             return self.reverse.chat(messages, model=model, stream=stream, thinking_effort=thinking_effort)
         except Exception as first_err:
             err_msg = str(first_err).lower()
+            is_env_proxy_err = any(
+                k in err_msg for k in ("proxyerror", "unable to connect to proxy", "winerror 10061", "tiktoken")
+            )
+            is_proxy_err = is_env_proxy_err or any(
+                k in err_msg for k in ("failed to connect", "proxyconnect", "curl: (7)", "connection refused")
+            )
+            if is_env_proxy_err:
+                if self.reverse.restart():
+                    try:
+                        return self.reverse.chat(messages, model=model, stream=stream, thinking_effort=thinking_effort)
+                    except Exception as restart_retry_err:
+                        first_err = restart_retry_err
+                        err_msg = str(restart_retry_err).lower()
+            elif is_proxy_err or "502" in err_msg:
+                if self.reverse.apply_proxy(force=True):
+                    try:
+                        return self.reverse.chat(messages, model=model, stream=stream, thinking_effort=thinking_effort)
+                    except Exception as proxy_retry_err:
+                        first_err = proxy_retry_err
+                        err_msg = str(proxy_retry_err).lower()
+                        if any(k in err_msg for k in ("proxyerror", "unable to connect to proxy", "winerror 10061", "failed to connect", "proxyconnect", "curl: (7)")):
+                            if self.reverse.restart():
+                                try:
+                                    return self.reverse.chat(messages, model=model, stream=stream, thinking_effort=thinking_effort)
+                                except Exception as restart_retry_err:
+                                    first_err = restart_retry_err
+                                    err_msg = str(restart_retry_err).lower()
             retryable = any(k in err_msg for k in ("429", "401", "403", "502", "quota", "token", "unauthorized", "anon", "invalid"))
             if retryable and not self._resyncing:
                 self._resyncing = True
@@ -742,12 +968,32 @@ class UnifiedChatGPTService:
         """文生图接口 (支持自动从浏览器同步 Token 并自愈重试)"""
         if not self.reverse.is_running():
             self.reverse.start()
+        else:
+            self.reverse.apply_proxy()
         try:
             return self.reverse.generate_image(
                 prompt, model=model, n=n, response_format=response_format, timeout=timeout
             )
         except Exception as first_err:
             err_msg = str(first_err).lower()
+            if any(k in err_msg for k in ("proxyerror", "unable to connect to proxy", "winerror 10061")):
+                if self.reverse.restart():
+                    try:
+                        return self.reverse.generate_image(
+                            prompt, model=model, n=n, response_format=response_format, timeout=timeout
+                        )
+                    except Exception as restart_retry_err:
+                        first_err = restart_retry_err
+                        err_msg = str(restart_retry_err).lower()
+            elif any(k in err_msg for k in ("failed to connect", "proxyconnect", "curl: (7)", "connection refused")):
+                if self.reverse.apply_proxy(force=True):
+                    try:
+                        return self.reverse.generate_image(
+                            prompt, model=model, n=n, response_format=response_format, timeout=timeout
+                        )
+                    except Exception as proxy_retry_err:
+                        first_err = proxy_retry_err
+                        err_msg = str(proxy_retry_err).lower()
             if any(k in err_msg for k in ("429", "401", "quota", "token", "unauthorized", "too many requests")):
                 try:
                     sync_res = self.sync_token_from_browser()

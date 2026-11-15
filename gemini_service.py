@@ -14,6 +14,7 @@ import subprocess
 import threading
 import urllib.parse
 import urllib.request
+import urllib.parse
 import re
 import ssl
 import asyncio
@@ -22,7 +23,6 @@ from typing import Optional, Dict, Any, List, Tuple
 # 保证本地回环网络请求不走外部代理（Clash 等），避免 502 Bad Gateway
 os.environ["NO_PROXY"] = "127.0.0.1,localhost,::1"
 _LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-
 
 def _proxy_is_open(proxy_url: str) -> bool:
     raw = (proxy_url or "").strip()
@@ -469,7 +469,7 @@ class MultiAccountGeminiPool:
         self._web_models_at = 0.0
 
     def _extract_cookie_header(self) -> str:
-        """从 Cookie Hub 提取组装 Google 必要会话鉴权串。"""
+        """从 Cookie Hub 提取实际适用于 gemini.google.com 的 Google 会话 Cookie。"""
         url = f"{self.bridge.bridge_url}/cookies?domain=google.com"
         try:
             with _LOCAL_OPENER.open(url, timeout=15) as resp:
@@ -478,24 +478,46 @@ class MultiAccountGeminiPool:
         except Exception as e:
             raise ConnectionError(f"无法连接本地 Cookie Hub 提取凭证 ({self.bridge.bridge_url}): {e}")
 
-        target_keys = [
-            "SID",
-            "HSID",
-            "SSID",
-            "APISID",
-            "SAPISID",
-            "__Secure-1PSID",
-            "__Secure-1PSIDTS",
-            "__Secure-1PSIDCC",
-        ]
-        parts = []
-        for k in target_keys:
-            v = next((c["value"] for c in cookies if c.get("name") == k), "")
-            if v:
-                parts.append(f"{k}={v}")
+        target_keys = (
+            "SID", "HSID", "SSID", "APISID", "SAPISID",
+            "__Secure-1PSID", "__Secure-1PSIDTS", "__Secure-1PSIDCC",
+        )
+        host = "gemini.google.com"
+        request_path = "/u/0/app"
+        now = time.time()
+        selected = {}
 
-        if not parts:
-            raise RuntimeError("未能提取到有效的 Google 鉴权 Cookie！")
+        for cookie in cookies:
+            name = str(cookie.get("name") or "")
+            if name not in target_keys:
+                continue
+            domain = str(cookie.get("domain") or "").lstrip(".").lower()
+            if not domain or not (host == domain or host.endswith("." + domain)):
+                continue
+            cookie_path = str(cookie.get("path") or "/")
+            if not request_path.startswith(cookie_path):
+                continue
+            expiry = cookie.get("expirationDate", cookie.get("expires"))
+            try:
+                expiry = float(expiry) if expiry is not None else 0
+            except (TypeError, ValueError):
+                expiry = 0
+            if expiry > 0 and expiry <= now:
+                continue
+            value = str(cookie.get("value") or "")
+            if not value:
+                continue
+
+            # 同名 Cookie 可能同时存在于 accounts.google.com 与 .google.com；
+            # 只保留能发给 Gemini 的项，并优先更具体的域/路径。
+            specificity = (len(domain), len(cookie_path))
+            previous = selected.get(name)
+            if previous is None or specificity > previous[0]:
+                selected[name] = (specificity, value)
+
+        parts = [f"{name}={selected[name][1]}" for name in target_keys if name in selected]
+        if "__Secure-1PSID" not in selected or "SAPISID" not in selected:
+            raise RuntimeError("Cookie Hub 未提供适用于 Gemini 的完整登录 Cookie；请先在已连接浏览器登录 Google。")
         return "; ".join(parts)
 
     def init_database(self, force_refresh: bool = False, cookie_str: Optional[str] = None):
@@ -1421,16 +1443,74 @@ class MultiAccountGeminiPool:
                 pass
         return True
 
-    def refresh_pool_cookies(self, reload: bool = False) -> str:
-        """从前台 Cookie Hub 重新拉取最新凭证并更新多账号数据库。"""
-        self.reset_proxies()
+    def refresh_pool_cookies(self, account_id: Optional[int] = None, reload: bool = False) -> str:
+        """验证当前浏览器会话对应的 authuser/邮箱，只刷新身份匹配的账号。"""
         self.proxy = _detect_local_proxy()
         cookie_str = self._extract_cookie_header()
-        self._write_cookies(cookie_str)
         conn = sqlite3.connect(self.db_path)
-        conn.execute("UPDATE proxies SET fail_count=0, last_error=''")
-        conn.commit()
+        conn.row_factory = sqlite3.Row
+        if account_id is None:
+            rows = conn.execute(
+                "SELECT id, authuser, label, note FROM accounts WHERE status!='deleted' ORDER BY authuser"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, authuser, label, note FROM accounts WHERE id=? AND status!='deleted'",
+                (account_id,),
+            ).fetchall()
         conn.close()
+
+        if not rows:
+            raise RuntimeError("没有找到可刷新的 Gemini 账号；数据库未修改。")
+
+        validated = []
+        for row in rows:
+            authuser = int(row["authuser"] or 0)
+            name, email = self.fetch_account_profile(authuser, cookie_override=cookie_str)
+            email = str(email or "").strip().lower()
+            if not email:
+                continue
+
+            expected_match = re.search(
+                r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+                f"{row['label'] or ''} {row['note'] or ''}",
+                re.I,
+            )
+            expected_email = expected_match.group(0).lower() if expected_match else ""
+            if expected_email and email != expected_email:
+                continue
+            if not expected_email and len(rows) > 1:
+                # 多账号池中没有已登记邮箱，不能猜测这份浏览器会话属于谁。
+                continue
+            validated.append((int(row["id"]), authuser, name, email, bool(expected_email)))
+
+        if not validated:
+            raise RuntimeError(
+                "当前 Cookie Hub 会话未能匹配任何已登记 Gemini 账号；未覆盖或启用任何账号。"
+                "请先在 Cookie Hub 所连接的浏览器登录对应 Google 账号，再按账号刷新。"
+            )
+
+        conn = sqlite3.connect(self.db_path)
+        try:
+            for row_id, authuser, name, email, had_expected_email in validated:
+                if had_expected_email:
+                    conn.execute(
+                        "UPDATE accounts SET cookie=?, status='enabled', fail_count=0, last_error='' WHERE id=?",
+                        (cookie_str, row_id),
+                    )
+                else:
+                    label = f"{name} ({email})" if name else email
+                    note = f"authuser={authuser} | {email}"
+                    conn.execute(
+                        "UPDATE accounts SET cookie=?, label=?, note=?, status='enabled', fail_count=0, last_error='' WHERE id=?",
+                        (cookie_str, label, note, row_id),
+                    )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # 仅在至少一个账号完成身份匹配并成功更新后，才清理代理熔断状态。
+        self.reset_proxies()
         if reload:
             with self._lifecycle_lock:
                 if self.is_running():

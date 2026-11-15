@@ -132,6 +132,10 @@ class OpenAIMessage(BaseModel):
     model_config = ConfigDict(extra="allow")
     role: str = Field(..., example="user")
     content: Optional[Any] = Field(None, example="Hello!")
+    tool_calls: Optional[List[Dict[str, Any]]] = None
+    tool_call_id: Optional[str] = None
+    name: Optional[str] = None
+    extra_content: Optional[Dict[str, Any]] = None
 
 
 class OpenAIChatRequest(BaseModel):
@@ -142,6 +146,9 @@ class OpenAIChatRequest(BaseModel):
     reasoning_level: Optional[str] = Field(None, description="推理级别: 'off', 'medium', 'high'", example="off")
     stream: Optional[bool] = Field(True, description="是否启用流式输出，默认为 True (首字秒级直出)")
     temperature: Optional[float] = Field(0.7, example=0.7)
+    tools: Optional[List[Dict[str, Any]]] = None
+    tool_choice: Optional[Any] = None
+    timeout: Optional[int] = None
 
 
 class SunoGenerateRequest(BaseModel):
@@ -478,22 +485,16 @@ def gemini_chat(req: ChatRequest):
     except Exception as first_err:
         if not gemini_failure_should_retry(str(first_err)):
             _gemini_stop(str(first_err))
-        print(f"⚠️ [Gemini Chat] 调度异常: {first_err}，尝试自愈并轮换至下一账号重试...", flush=True)
-        # 自动故障自愈：重置代理熔断计数 + 刷新最新 Cookie 凭证后重试一次
+        print(f"⚠️ [Gemini Chat] 调度异常: {first_err}，仅重置代理熔断并使用现有账号状态重试；不自动覆盖 Cookie 池。", flush=True)
         try:
             gemini_pool.reset_proxies()
-            gemini_pool.refresh_pool_cookies()
             res = gemini_pool.ask_with_details(
                 prompt=req.prompt, model=req.model, reasoning_level=reasoning, timeout=effective_timeout
             )
-            # 若重试仍然返回通用拒绝，再次尝试轮换
             if is_upstream_refusal(res.get("reply")):
-                print(f"⚠️ [Gemini Chat] 账号 {res.get('account_label')} 依然返回拒绝，发起备用轮转...", flush=True)
-                res = gemini_pool.ask_with_details(
-                    prompt=req.prompt, model=req.model, reasoning_level=reasoning, timeout=effective_timeout
-                )
+                _service_error(502, f"Gemini 上游拒绝请求: {res.get('reply')}", "gemini")
         except Exception as retry_err:
-            detail_msg = f"Gemini 调度调用失败: {first_err} (自愈重试亦未成功: {retry_err})"
+            detail_msg = f"Gemini 调度调用失败: {first_err} (不修改 Cookie 的重试亦未成功: {retry_err})"
             _service_error(502, detail_msg, "gemini")
 
     return {
@@ -532,16 +533,16 @@ def rotate_gemini_account(account_id: int = Path(..., description="账号自增 
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/gemini/refresh", summary="从前台浏览器提取最新凭证并热更新账号池", tags=["Gemini 多账号调度"])
-def refresh_gemini_cookies():
-    """从 Cookie Hub (18888) 提取浏览器内最新鉴权 Cookie 并批量写入 SQLite 数据库。"""
+@app.post("/api/gemini/refresh", summary="按 Google 登录身份验证后刷新匹配的 Gemini 账号", tags=["Gemini 多账号调度"])
+def refresh_gemini_cookies(account_id: Optional[int] = Query(None, ge=1, description="可选：只验证并刷新指定账号 ID")):
+    """先按 authuser 读取真实邮箱；仅更新与已登记邮箱匹配的账号，不批量覆盖账号池。"""
     try:
-        cookie_str = gemini_pool.refresh_pool_cookies(reload=True)
+        cookie_str = gemini_pool.refresh_pool_cookies(account_id=account_id, reload=True)
         accounts = gemini_pool.list_accounts()
         named = [item for item in accounts if item.get("email")]
         return {
             "success": True,
-            "message": f"已同步浏览器凭证，识别到 {len(named)} 个 Google 账号。",
+            "message": f"浏览器登录态已验证；已刷新匹配的 Gemini 账号，当前识别 {len(named)} 个 Google 账号。",
             "cookie_length": len(cookie_str),
             "accounts": [
                 {"id": item.get("id"), "name": item.get("name"), "email": item.get("email"), "auth_user": item.get("auth_user")}
@@ -1098,7 +1099,7 @@ def openai_chat_completions(req: OpenAIChatRequest):
         model_name.startswith("aistudio") or model_name.startswith("gemini-4") or "argon" in model_name
     ):
         actual_model = req.model.replace("aistudio/", "").replace("aistudio-", "") if req.model else "gemini-4-argon"
-        messages_payload = [{"role": m.role, "content": m.content} for m in req.messages]
+        messages_payload = [m.model_dump(exclude_none=True) for m in req.messages]
         req_timeout = getattr(req, "timeout", None) or 120
         if req.stream:
             return StreamingResponse(
@@ -1108,6 +1109,8 @@ def openai_chat_completions(req: OpenAIChatRequest):
                     stream=True,
                     messages=messages_payload,
                     timeout=req_timeout,
+                    tools=req.tools,
+                    tool_choice=req.tool_choice,
                 ),
                 media_type="text/event-stream",
                 headers={
@@ -1124,6 +1127,8 @@ def openai_chat_completions(req: OpenAIChatRequest):
                     stream=False,
                     messages=messages_payload,
                     timeout=req_timeout,
+                    tools=req.tools,
+                    tool_choice=req.tool_choice,
                 )
                 return res
             except Exception as e:
@@ -1136,8 +1141,10 @@ def openai_chat_completions(req: OpenAIChatRequest):
 
         target_model = req.model if req.model and "gemini" in req.model else "gemini-4-hydrogen"
         reasoning = req.reasoning_effort or req.reasoning_level or "off"
-        messages_payload = [m.model_dump() for m in req.messages]
+        messages_payload = [m.model_dump(exclude_none=True) for m in req.messages]
         extra = req.model_extra or {}
+        tools_payload = req.tools if req.tools is not None else extra.get("tools")
+        tool_choice_payload = req.tool_choice if req.tool_choice is not None else extra.get("tool_choice")
 
         if req.stream:
             return StreamingResponse(
@@ -1145,8 +1152,8 @@ def openai_chat_completions(req: OpenAIChatRequest):
                     messages=messages_payload,
                     model=target_model,
                     reasoning_level=reasoning,
-                    tools=extra.get("tools"),
-                    tool_choice=extra.get("tool_choice"),
+                    tools=tools_payload,
+                    tool_choice=tool_choice_payload,
                 ),
                 media_type="text/event-stream",
                 headers={
@@ -1164,12 +1171,16 @@ def openai_chat_completions(req: OpenAIChatRequest):
             if not gemini_failure_should_retry(str(first_err)):
                 _gemini_stop(str(first_err))
             try:
-                gemini_pool.refresh_pool_cookies()
+                gemini_pool.reset_proxies()
                 res = gemini_pool.ask_with_details(
                     prompt=last_user_msg, model=target_model, reasoning_level=reasoning
                 )
             except Exception as retry_err:
-                _service_error(502, f"Gemini 兼容接口调用失败: {str(retry_err)}", "gemini")
+                _service_error(
+                    502,
+                    f"Gemini 兼容接口调用失败: {first_err} (未自动刷新或覆盖 Cookie): {retry_err}",
+                    "gemini",
+                )
 
         cid = f"chatcmpl-gemini-{int(time.time()*1000)}"
         return {

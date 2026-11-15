@@ -145,7 +145,7 @@ def append_history(data):
         f.write(json.dumps(summary, ensure_ascii=False) + "\n")
     fields = [k for k in summary if k != "errors"]
     write_header = not HISTORY_CSV.exists() or HISTORY_CSV.stat().st_size == 0
-    with HISTORY_CSV.open("a", newline="", encoding="utf-8-sig") as f:
+    with HISTORY_CSV.open("a", newline="", encoding="utf-8-sig" if write_header else "utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         if write_header:
             w.writeheader()

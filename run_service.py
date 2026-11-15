@@ -97,6 +97,61 @@ if "--status-autostart" in sys.argv or "--autostart-status" in sys.argv:
     print("==================================================")
     sys.exit(0)
 
+# 同一 Windows 登录会话只允许一个 Cookie Service Suite 主服务实例，避免重复绑定 18800。
+_SINGLE_INSTANCE_MUTEX = None
+
+
+def _acquire_single_instance() -> bool:
+    global _SINGLE_INSTANCE_MUTEX
+    if sys.platform != "win32":
+        return True
+    try:
+        import ctypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_mutex = kernel32.CreateMutexW
+        create_mutex.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
+        create_mutex.restype = ctypes.c_void_p
+        handle = create_mutex(None, False, "Local\\CookieServiceSuite_18800")
+        if not handle:
+            raise OSError(ctypes.get_last_error(), "CreateMutexW failed")
+        _SINGLE_INSTANCE_MUTEX = handle
+        return ctypes.get_last_error() != 183  # ERROR_ALREADY_EXISTS
+    except Exception as exc:
+        print(f"⚠️ 单实例锁不可用，继续启动并记录警告: {type(exc).__name__}", flush=True)
+        return True
+
+
+if not _acquire_single_instance():
+    print("Cookie Service Suite 已有实例运行，跳过重复启动。", flush=True)
+    sys.exit(0)
+
+
+def _start_aistudio_remote_sync():
+    """Start the optional SSH synchronizer; its own mutex prevents duplicates."""
+    import json
+    import subprocess
+    config_path = os.path.join(BASE_DIR, "runtime_state", "aistudio_remote_sync.json")
+    try:
+        with open(config_path, "r", encoding="utf-8") as stream:
+            if not json.load(stream).get("enabled"):
+                return
+        executable = sys.executable
+        if sys.platform == "win32":
+            candidate = os.path.join(os.path.dirname(executable), "pythonw.exe")
+            if os.path.isfile(candidate):
+                executable = candidate
+        subprocess.Popen(
+            [executable, os.path.join(BASE_DIR, "aistudio_remote_sync.py")],
+            cwd=BASE_DIR, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception as exc:
+        print(f"[AIStudio] 远端同步启动失败: {type(exc).__name__}", flush=True)
+
+
+_start_aistudio_remote_sync()
+
+
 # 运行模式选择
 if "--no-tray" in sys.argv:
     import uvicorn

@@ -20,6 +20,7 @@ const pendingRequests = new Map();
 // Map to route SSE streaming events to active HTTP responses: reqId -> { onChunk, onDone }
 const activeStreams = new Map();
 let currentBridgeTabId = null;
+let aiStudioAuthTabId = null;
 
 // Create HTTP Server
 const server = http.createServer(async (req, res) => {
@@ -56,6 +57,7 @@ const server = http.createServer(async (req, res) => {
       autoReloadWatching: true,
       endpoints: {
         cookies: '/cookies?domain=bilibili.com',
+        aistudioAutoFetch: '/aistudio/auto_fetch',
         activeTab: '/active',
         reload: '/reload',
         status: '/status'
@@ -299,7 +301,8 @@ const server = http.createServer(async (req, res) => {
     try {
       const tabId = Number(parsedUrl.searchParams.get('tabId') || currentBridgeTabId);
       const code = parsedUrl.searchParams.get('code') || 'document.title';
-      const data = await dispatchToExtension('tab_eval', { tabId, code }, 15000);
+      const timeout = Number(parsedUrl.searchParams.get('timeout')) || 45000;
+      const data = await dispatchToExtension('tab_eval', { tabId, code }, timeout);
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify(data, null, 2));
     } catch (err) {
@@ -540,6 +543,104 @@ const server = http.createServer(async (req, res) => {
   }
 
   // 3. Fetch Cookies by Domain / URL
+  // AI Studio session bootstrap: open the connected browser profile and collect cookies via the extension.
+  // Cookie values are returned only to the local AI Studio service; they are never written to bridge logs.
+  if (pathname === '/aistudio/auto_fetch') {
+    if (extensionSockets.size === 0) {
+      res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify({ success: false, error: 'Cookie Hub 浏览器扩展未连接' }));
+      return;
+    }
+    try {
+      const targetUrl = 'https://aistudio.google.com/prompts/new_chat?model=gemini-flash-latest';
+      const getTabs = () => dispatchToExtension('list_tabs', {}, 8000);
+      let tabsData = await getTabs();
+      let tabs = tabsData.tabs || [];
+      let tab = aiStudioAuthTabId ? tabs.find(t => Number(t.id) === Number(aiStudioAuthTabId)) : null;
+      if (!tab) {
+        const candidates = tabs.filter(t => {
+          try { return new URL(t.url || '').hostname === 'aistudio.google.com'; }
+          catch (e) { return false; }
+        });
+        tab = candidates.length ? candidates[candidates.length - 1] : null;
+      }
+      if (!tab) {
+        const opened = await dispatchToExtension('open_tab', { url: targetUrl, active: true }, 12000);
+        if (!opened.success || !opened.tabId) throw new Error(opened.error || '浏览器未能打开 AI Studio');
+        aiStudioAuthTabId = Number(opened.tabId);
+      } else {
+        aiStudioAuthTabId = Number(tab.id);
+        let host = '';
+        try { host = new URL(tab.url || '').hostname; } catch (e) {}
+        if (host === 'accounts.google.com' || host.endsWith('.accounts.google.com')) {
+          await dispatchToExtension('navigate_tab', { tabId: tab.id, url: tab.url, active: true }, 10000);
+        } else {
+          await dispatchToExtension('navigate_tab', { tabId: tab.id, url: targetUrl, active: true }, 10000);
+        }
+      }
+
+      let finalTab = null;
+      let lastState = '';
+      let stableCount = 0;
+      for (let attempt = 0; attempt < 22; attempt++) {
+        tabsData = await getTabs();
+        tabs = tabsData.tabs || [];
+        finalTab = tabs.find(t => Number(t.id) === Number(aiStudioAuthTabId)) || null;
+        if (finalTab && finalTab.url) {
+          let host = '';
+          try { host = new URL(finalTab.url).hostname; } catch (e) {}
+          if (host === 'accounts.google.com' || host.endsWith('.accounts.google.com')) {
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+            res.end(JSON.stringify({
+              success: false, loginRequired: true, tabId: aiStudioAuthTabId,
+              pageHost: host, message: '已自动打开 Google 登录页，请在浏览器中完成登录，然后再次同步。'
+            }));
+            return;
+          }
+          if (host === 'aistudio.google.com' && finalTab.title) {
+            const state = finalTab.url + '|' + finalTab.title;
+            stableCount = state === lastState ? stableCount + 1 : 0;
+            lastState = state;
+            if (stableCount >= 1) break;
+          }
+        }
+        await new Promise(resolve => setTimeout(resolve, 750));
+      }
+
+      let finalHost = '';
+      try { finalHost = new URL((finalTab && finalTab.url) || '').hostname; } catch (e) {}
+      if (!finalTab || finalHost !== 'aistudio.google.com' || !finalTab.title) {
+        throw new Error('AI Studio 页面未能在等待时间内完成加载；已保留浏览器标签页，可稍后重试。');
+      }
+
+      const results = await Promise.all([
+        dispatchToExtension('get_cookies', { domain: 'google.com' }, 15000),
+        dispatchToExtension('get_cookies', { url: 'https://aistudio.google.com/' }, 15000)
+      ]);
+      const googleResult = results[0];
+      const studioResult = results[1];
+      if (!googleResult.success || !studioResult.success) {
+        throw new Error(googleResult.error || studioResult.error || '读取 Google Cookie 失败');
+      }
+      const cookieMap = new Map();
+      [...(googleResult.cookies || []), ...(studioResult.cookies || [])].forEach(cookie => {
+        const key = cookie.name + '@' + cookie.domain + cookie.path;
+        if (!cookieMap.has(key)) cookieMap.set(key, cookie);
+      });
+      const cookies = Array.from(cookieMap.values());
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify({
+        success: cookies.length > 0, loginRequired: false, tabId: aiStudioAuthTabId,
+        pageHost: finalHost, count: cookies.length,
+        cookieNames: [...new Set(cookies.map(c => c.name))].sort(), cookies
+      }));
+    } catch (err) {
+      res.writeHead(502, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify({ success: false, error: err.message }));
+    }
+    return;
+  }
+
   if (pathname === '/cookies') {
     let domain = parsedUrl.searchParams.get('domain') || parsedUrl.searchParams.get('url');
     let format = parsedUrl.searchParams.get('format') || 'full';

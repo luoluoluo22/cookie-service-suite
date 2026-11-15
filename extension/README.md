@@ -21,8 +21,24 @@
 * **文件保存自动刷新**：修改项目里的任意代码文件（`.js`、`.html`、`.css`），扩展在后台 0.3 秒内自动重启生效。
 * **命令一键触发**：终端执行 `npm run reload` 或 `node reload.js` 即可直接让前台浏览器扩展重启。
 * **按需按域读取**：需要哪个网站的 Cookie，本地接口秒级提取回传。
+* **AI Studio 自动登录态引导**：默认通过 Cookie Hub 连接的浏览器打开 AI Studio，并通过 `chrome.cookies` 获取 HttpOnly Cookie；仅显式设置 `AI_STUDIO_BROWSER=ego` 时才切换到 ego-browser 的独立登录资料。两套浏览器的登录态不应混用。
+
+### AI Studio 本机与 SSH 远端同步
+
+本机定制版 AIStudio2API 在认证失效时优先从已连接的 Cookie Hub 读取登录态，验证会话序号对应的邮箱后才更新账号。浏览器中未登录、扩展断开或身份不匹配时不会覆盖账号；已失效账号会定期重试。
+
+`aistudio_remote_sync.py` 随 Cookie Service Suite 启动后每 5 分钟检查一次，通过 SSH 加密隧道调用远端 AIStudio2API 的账号导入接口。它只同步本机和远端都已存在、已启用且没有活动请求的账号，先核验邮箱，再等待远端任务完成；Google 登录 Cookie 的指纹未变化时不会重复导入。同步设置位于被 Git 忽略的 `runtime_state/aistudio_remote_sync.json`，运行日志在 `logs/aistudio_remote_sync.log`，不记录 Cookie 值。关闭同步可将配置里的 `enabled` 改为 `false`；下次检查时生效。
 
 ---
+
+## 🖥️ Windows 系统托盘快捷入口
+
+Cookie Service Suite 的系统托盘右键菜单已提供两个直接调用扩展的选项，无需运行终端命令：
+
+- **🧩 从浏览器扩展读取当前网页数据**：从当前活动网页读取 Cookie，并弹窗展示网站、Cookie 数量及名称；**不展示 Cookie 值**。
+- **🪄 从浏览器扩展同步 AI Studio 登录态**：自动打开或复用 AI Studio 标签页，读取已登录的 Google Cookie，同步到本地 AI Studio 并验证可用账号数量。
+
+原来的「刷新 Gemini 池 Google 会话凭证」保留为独立功能，不会误操作 AI Studio。若 Google 打开登录页，请在浏览器中登录后再次点击同步。
 
 ## 🚀 启动与首次激活
 
@@ -68,6 +84,9 @@ node get_cookie.js music.163.com --json
 
 # 获取当前浏览器正在浏览页面的 Cookie
 node get_cookie.js --active
+
+# 自动打开 AI Studio，等待登录态初始化并读取 Google Cookie（不会在终端打印 Cookie 值）
+curl http://127.0.0.1:18888/aistudio/auto_fetch
 ```
 
 ### 2. HTTP API 接口

@@ -6,7 +6,7 @@
   "admin_token": "admin_gemini_pool",
   "impersonate": "chrome_146",
   "default_model": "gemini-3.5-flash-lite",
-  "proxy": "http://127.0.0.1:7897",
+  "proxy": "http://127.0.0.1:7900",
   "web_channel": false,
   "log_requests": true,
   "request_timeout_sec": 120,
