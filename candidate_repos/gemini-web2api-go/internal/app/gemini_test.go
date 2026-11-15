@@ -229,6 +229,44 @@ func TestDeltaTrackerAccumulates(t *testing.T) {
 	}
 }
 
+func TestDeltaTrackerAutoLinkURLResync(t *testing.T) {
+	// 场景 1：流式过程中尾部自动补全的 URL 链接，先扣住再一次性吐出，不触发前缀失配
+	d := &deltaTracker{}
+	frames := []string{
+		"Google 在 Gemini 网页版上线了用量页：\n`[https://gemini.google](https://gemini.google)",
+		"Google 在 Gemini 网页版上线了用量页：\n`[https://gemini.google.com/u/0/usage](https://gemini.google.com/u/0/usage)`\n\n接下来说明步骤：1. 打开页面。",
+		"Google 在 Gemini 网页版上线了用量页：\n`[https://gemini.google.com/u/0/usage](https://gemini.google.com/u/0/usage)`\n\n接下来说明步骤：1. 打开页面。2. 读取配额。",
+	}
+	var streamed strings.Builder
+	for _, f := range frames {
+		streamed.WriteString(d.Push(f))
+	}
+	final := frames[len(frames)-1]
+	if rest := remainingOf(final, d.emitted); rest != "" {
+		streamed.WriteString(rest)
+	}
+	if streamed.String() != final {
+		t.Fatalf("URL 流式改写场景未完整输出:\ngot:  %q\nwant: %q", streamed.String(), final)
+	}
+
+	// 场景 2：流式结尾恰好停在 URL 上，由 remainingOf 在流结束时补齐
+	d2 := &deltaTracker{}
+	s1 := d2.Push("请访问 `[http://127.0.0.1:18888](http://127.0.0.1:18888)")
+	finalEnd := "请访问 `[http://127.0.0.1:18888](http://127.0.0.1:18888)"
+	s1 += remainingOf(finalEnd, d2.emitted)
+	if s1 != finalEnd {
+		t.Fatalf("结尾 URL 未在结束时补齐:\ngot:  %q\nwant: %q", s1, finalEnd)
+	}
+
+	// 场景 3：即使已发出的文本中途发生了 URL 扩写或前段微调，remainingOf 与 Push 也能重对齐并续发后半段
+	emitted := "利用本地扩展桥接（`[http://127.0](http://127.0)"
+	rewrittenFull := "利用本地扩展桥接（`[http://127.0.0.1:18888](http://127.0.0.1:18888)`）继续抓取。"
+	tail := remainingOf(rewrittenFull, emitted)
+	if tail != "`）继续抓取。" {
+		t.Fatalf("URL 扩写后 remainingOf 对齐失败: got %q, want %q", tail, "`）继续抓取。")
+	}
+}
+
 // 服务端会静默降级（匿名请求 3.1 Pro 实际给 3.5 Flash-Lite），只看请求名发现
 // 不了，所以要从响应帧里把它自报的模型名取出来单独记录。
 func TestExtractUpstreamModel(t *testing.T) {

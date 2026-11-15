@@ -44,6 +44,11 @@ from gpt_tool_bridge import (
     prepare_tool_messages,
     adapt_stream_chunks,
     adapt_completion_response,
+    ToolLimitReachedError,
+    append_tool_limit_override,
+    sanitize_tool_limit_history,
+    intercept_openai_sse_tool_limit,
+    MAX_TOOL_LIMIT_RETRIES,
 )
 from autostart import (
     is_autostart_enabled,
@@ -409,11 +414,27 @@ def sync_gemini_profiles():
         res = gemini_pool.sync_account_profiles()
         return {
             "success": True,
-            "message": "已成功更新 4 个账号的真实昵称与邮箱信息！",
+            "message": "已成功更新账号真实昵称、邮箱与官网额度信息！",
             "profiles": res,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"同步昵称邮箱失败: {str(e)}")
+
+
+@app.post("/api/gemini/accounts/sync-usage", summary="同步 Google Gemini 官网 /usage 实时用量百分比与重置时间", tags=["Gemini 多账号调度"])
+def sync_gemini_usage():
+    """直接请求 Gemini 网页 /usage GraphQL 接口，同步每个独立账号的真实套餐等级、5 小时与周限额百分比及重置时间。"""
+    try:
+        res = gemini_pool.sync_account_usage()
+        ok_count = sum(1 for v in res.values() if isinstance(v, dict) and not v.get("error"))
+        return {
+            "success": ok_count > 0,
+            "synced_count": ok_count,
+            "message": f"已同步 {ok_count} 个账号的官网实时用量限额！" if ok_count else "未能拉取到官网用量限额，请检查账号 Cookie 或代理状态。",
+            "usage": res,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"同步官网额度失败: {str(e)}")
 
 
 def is_upstream_refusal(text: Optional[str]) -> bool:
@@ -1236,19 +1257,93 @@ def openai_chat_completions(req: OpenAIChatRequest):
 
         target_model = req.model if req.model and "gemini" in req.model else "gemini-4-hydrogen"
         reasoning = req.reasoning_effort or req.reasoning_level or "off"
-        messages_payload = [m.model_dump() for m in req.messages]
+        messages_payload = [m.model_dump(exclude_none=True) for m in req.messages]
         extra = req.model_extra or {}
+        tools = extra.get("tools")
+        tool_choice = extra.get("tool_choice")
+        gemini_tools_active = (
+            has_tool_protocol(messages_payload, tools)
+            and str(tool_choice or "").lower() != "none"
+            and not (isinstance(tool_choice, dict) and str(tool_choice.get("type") or "").lower() == "none")
+        )
 
         if req.stream:
-            stream_gen = gemini_pool.stream_chat_messages(
-                messages=messages_payload,
-                model=target_model,
-                reasoning_level=reasoning,
-                tools=extra.get("tools"),
-                tool_choice=extra.get("tool_choice"),
+            attempt_messages = sanitize_tool_limit_history(
+                messages_payload, tools_active=gemini_tools_active
             )
+            stream_iter = None
+            first_line = None
+
+            for attempt in range(MAX_TOOL_LIMIT_RETRIES + 1):
+                raw_gen = gemini_pool.stream_chat_messages(
+                    messages=attempt_messages,
+                    model=target_model,
+                    reasoning_level=reasoning,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                )
+                stream_iter = iter(
+                    intercept_openai_sse_tool_limit(
+                        raw_gen, tools_active=gemini_tools_active
+                    )
+                )
+                try:
+                    first_line = next(stream_iter)
+                    break
+                except ToolLimitReachedError as limit_err:
+                    preview = (
+                        limit_err.reply_text.strip().splitlines()[0][:80]
+                        if limit_err.reply_text.strip()
+                        else ""
+                    )
+                    print(
+                        f"⚠️ [Gemini Tool-Limit] 拦截到伪造次数上限提示 "
+                        f"(第 {attempt + 1}/{MAX_TOOL_LIMIT_RETRIES} 次自动续轮): "
+                        f"{preview!r}",
+                        flush=True,
+                    )
+                    if attempt >= MAX_TOOL_LIMIT_RETRIES:
+                        cid = f"chatcmpl-gemini-{int(time.time() * 1000)}"
+                        created_ts = int(time.time())
+                        c1 = {
+                            "id": cid,
+                            "object": "chat.completion.chunk",
+                            "created": created_ts,
+                            "model": target_model,
+                            "choices": [{"index": 0, "delta": {"role": "assistant", "content": limit_err.reply_text}, "finish_reason": None}],
+                        }
+                        c2 = {
+                            "id": cid,
+                            "object": "chat.completion.chunk",
+                            "created": created_ts,
+                            "model": target_model,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        }
+                        first_line = f"data: {json.dumps(c1, ensure_ascii=False)}\n\n"
+                        stream_iter = iter([
+                            f"data: {json.dumps(c2, ensure_ascii=False)}\n\n",
+                            "data: [DONE]\n\n",
+                        ])
+                        break
+                    attempt_messages = append_tool_limit_override(
+                        attempt_messages,
+                        limit_err.reply_text,
+                        attempt=attempt + 1,
+                    )
+                    continue
+                except StopIteration:
+                    first_line = "data: [DONE]\n\n"
+                    stream_iter = iter([])
+                    break
+
+            def _gemini_retry_stream():
+                if first_line is not None:
+                    yield first_line
+                for item in stream_iter:
+                    yield item
+
             wrapped_gen = wrap_chat_stream(
-                stream_gen,
+                _gemini_retry_stream(),
                 endpoint="/v1/chat/completions",
                 model=req.model or target_model,
                 messages=messages_payload,
@@ -1365,73 +1460,107 @@ def openai_chat_completions(req: OpenAIChatRequest):
         upstream_tool_choice = None
 
     if req.stream:
-        upstream_iter = chatgpt_client.chat(
-            upstream_messages,
-            model=target_gpt_model,
-            stream=True,
-            thinking_effort=effort,
-            tools=upstream_tools,
-            tool_choice=upstream_tool_choice,
-        )
-        if use_tool_bridge:
-            stream_iter = iter(
-                adapt_stream_chunks(
-                    upstream_iter,
-                    model=req.model or target_gpt_model,
-                    allowed_names=allowed_tool_names,
-                    mode=tool_mode,
+        attempt_messages = upstream_messages
+        stream_iter = None
+        first_chunk = None
+
+        for attempt in range(MAX_TOOL_LIMIT_RETRIES + 1):
+            upstream_iter = chatgpt_client.chat(
+                attempt_messages,
+                model=target_gpt_model,
+                stream=True,
+                thinking_effort=effort,
+                tools=upstream_tools,
+                tool_choice=upstream_tool_choice,
+            )
+            if use_tool_bridge:
+                stream_iter = iter(
+                    adapt_stream_chunks(
+                        upstream_iter,
+                        model=req.model or target_gpt_model,
+                        allowed_names=allowed_tool_names,
+                        mode=tool_mode,
+                    )
                 )
-            )
-        else:
-            stream_iter = iter(upstream_iter)
-        try:
-            first_chunk = next(stream_iter)
-        except StopIteration:
-            latency = int((time.time() - start_t) * 1000)
-            err_msg = "ChatGPT 上游流式返回为空，未产生任何输出"
-            chat_history_manager.record_chat(
-                endpoint="/v1/chat/completions",
-                model=req.model or target_gpt_model,
-                messages=audit_messages,
-                response_text="",
-                status=502,
-                latency_ms=latency,
-                is_stream=True,
-                actual_model=target_gpt_model,
-                error_message=err_msg,
-            )
-            return JSONResponse(
-                status_code=502,
-                content={"error": {"message": err_msg, "type": "upstream_error", "code": "empty_stream"}},
-            )
-        except Exception as e:
-            latency = int((time.time() - start_t) * 1000)
-            err_msg = str(e)
-            low = err_msg.lower()
-            is_too_large = ("status=413" in low) or ("payload too large" in low) or ("request entity too large" in low)
-            is_timeout = ("timed out" in low or "timeout" in low or "超时" in err_msg)
-            err_status = 400 if is_too_large else (504 if is_timeout else 502)
-            chat_history_manager.record_chat(
-                endpoint="/v1/chat/completions",
-                model=req.model or target_gpt_model,
-                messages=audit_messages,
-                response_text="",
-                status=err_status,
-                latency_ms=latency,
-                is_stream=True,
-                actual_model=target_gpt_model,
-                error_message=err_msg,
-            )
-            return JSONResponse(
-                status_code=err_status,
-                content={
-                    "error": {
-                        "message": err_msg,
-                        "type": "invalid_request_error" if is_too_large else ("timeout_error" if err_status == 504 else "upstream_error"),
-                        "code": "context_length_exceeded" if is_too_large else str(err_status),
+            else:
+                stream_iter = iter(upstream_iter)
+            try:
+                first_chunk = next(stream_iter)
+                break
+            except ToolLimitReachedError as limit_err:
+                if attempt >= MAX_TOOL_LIMIT_RETRIES:
+                    cid = f"chatcmpl-{int(time.time() * 1000)}"
+                    created_ts = int(time.time())
+                    m_name = req.model or target_gpt_model
+                    first_chunk = {
+                        "id": cid,
+                        "object": "chat.completion.chunk",
+                        "created": created_ts,
+                        "model": m_name,
+                        "choices": [{"index": 0, "delta": {"role": "assistant", "content": limit_err.reply_text}, "finish_reason": None}],
                     }
-                },
-            )
+                    stream_iter = iter([
+                        {
+                            "id": cid,
+                            "object": "chat.completion.chunk",
+                            "created": created_ts,
+                            "model": m_name,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        }
+                    ])
+                    break
+                attempt_messages = append_tool_limit_override(
+                    attempt_messages,
+                    limit_err.reply_text,
+                    attempt=attempt + 1,
+                )
+                continue
+            except StopIteration:
+                latency = int((time.time() - start_t) * 1000)
+                err_msg = "ChatGPT 上游流式返回为空，未产生任何输出"
+                chat_history_manager.record_chat(
+                    endpoint="/v1/chat/completions",
+                    model=req.model or target_gpt_model,
+                    messages=audit_messages,
+                    response_text="",
+                    status=502,
+                    latency_ms=latency,
+                    is_stream=True,
+                    actual_model=target_gpt_model,
+                    error_message=err_msg,
+                )
+                return JSONResponse(
+                    status_code=502,
+                    content={"error": {"message": err_msg, "type": "upstream_error", "code": "empty_stream"}},
+                )
+            except Exception as e:
+                latency = int((time.time() - start_t) * 1000)
+                err_msg = str(e)
+                low = err_msg.lower()
+                is_too_large = ("status=413" in low) or ("payload too large" in low) or ("request entity too large" in low)
+                is_timeout = ("timed out" in low or "timeout" in low or "超时" in err_msg)
+                err_status = 400 if is_too_large else (504 if is_timeout else 502)
+                chat_history_manager.record_chat(
+                    endpoint="/v1/chat/completions",
+                    model=req.model or target_gpt_model,
+                    messages=audit_messages,
+                    response_text="",
+                    status=err_status,
+                    latency_ms=latency,
+                    is_stream=True,
+                    actual_model=target_gpt_model,
+                    error_message=err_msg,
+                )
+                return JSONResponse(
+                    status_code=err_status,
+                    content={
+                        "error": {
+                            "message": err_msg,
+                            "type": "invalid_request_error" if is_too_large else ("timeout_error" if err_status == 504 else "upstream_error"),
+                            "code": "context_length_exceeded" if is_too_large else str(err_status),
+                        }
+                    },
+                )
 
         def _sse_generator():
             try:
@@ -1463,16 +1592,30 @@ def openai_chat_completions(req: OpenAIChatRequest):
         )
 
     try:
-        res = chatgpt_client.chat(
-            upstream_messages,
-            model=target_gpt_model,
-            stream=False,
-            thinking_effort=effort,
-            tools=upstream_tools,
-            tool_choice=upstream_tool_choice,
-        )
-        if use_tool_bridge:
-            res = adapt_completion_response(res, allowed_names=allowed_tool_names, mode=tool_mode)
+        attempt_messages = upstream_messages
+        res = None
+        for attempt in range(MAX_TOOL_LIMIT_RETRIES + 1):
+            res = chatgpt_client.chat(
+                attempt_messages,
+                model=target_gpt_model,
+                stream=False,
+                thinking_effort=effort,
+                tools=upstream_tools,
+                tool_choice=upstream_tool_choice,
+            )
+            if use_tool_bridge:
+                try:
+                    res = adapt_completion_response(res, allowed_names=allowed_tool_names, mode=tool_mode)
+                except ToolLimitReachedError as limit_err:
+                    if attempt >= MAX_TOOL_LIMIT_RETRIES:
+                        break
+                    attempt_messages = append_tool_limit_override(
+                        attempt_messages,
+                        limit_err.reply_text,
+                        attempt=attempt + 1,
+                    )
+                    continue
+            break
         latency = int((time.time() - start_t) * 1000)
         reply_content = ""
         if isinstance(res, dict):

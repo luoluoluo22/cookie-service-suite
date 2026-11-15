@@ -539,6 +539,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
               <p class="text-xs text-slate-400 mt-0.5" id="accounts-summary">正在从浏览器同步 Google 账号...</p>
             </div>
             <div class="flex flex-wrap items-center gap-2">
+              <button type="button" onclick="syncUsage()" id="btn-sync-usage" class="px-3 py-1.5 rounded-lg text-xs font-medium bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/30 transition flex items-center gap-1.5 cursor-pointer">
+                <i class="fa-solid fa-chart-pie"></i> 同步官网额度
+              </button>
               <button type="button" onclick="syncProfiles()" id="btn-sync-profiles" class="px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition flex items-center gap-1.5 cursor-pointer">
                 <i class="fa-solid fa-id-card text-sky-400"></i> 同步真实名称与邮箱
               </button>
@@ -2048,6 +2051,24 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             const qWeekPct = Math.min(100, Math.round((qWeekUsed / qWeekLimit) * 100));
             const qStatus = (a.quota_status || "充裕").replace(/[\u{1F300}-\u{1FAFF}]/gu, "").trim() || "充裕";
 
+            const isOfficial = a.usage_source === "official";
+            const tier = (a.plan_tier || "").toUpperCase();
+            const tierBadge = tier ? (
+              tier === "ULTRA" ? `<span class="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30 font-semibold shrink-0">ULTRA</span>` :
+              tier === "PRO" ? `<span class="text-[10px] px-1.5 py-0.5 rounded bg-indigo-500/15 text-indigo-300 border border-indigo-500/30 font-semibold shrink-0">PRO</span>` :
+              tier === "PLUS" ? `<span class="text-[10px] px-1.5 py-0.5 rounded bg-sky-500/15 text-sky-300 border border-sky-500/30 font-semibold shrink-0">PLUS</span>` :
+              `<span class="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700 font-medium shrink-0">FREE</span>`
+            ) : "";
+
+            const real5hPct = (isOfficial && a.real_5h_pct !== null && a.real_5h_pct !== undefined) ? a.real_5h_pct : q5hPct;
+            const real5hLeftPct = Math.max(0, 100 - real5hPct);
+            const real5hReset = (isOfficial && a.real_5h_reset_str) ? a.real_5h_reset_str : q5hReset;
+            const real5hBarColor = real5hPct >= 85 ? "bg-rose-400/90" : (real5hPct >= 50 ? "bg-amber-400/85" : "bg-emerald-400/80");
+
+            const realWeekPct = (isOfficial && a.real_weekly_pct !== null && a.real_weekly_pct !== undefined) ? a.real_weekly_pct : qWeekPct;
+            const realWeekReset = (isOfficial && a.real_weekly_reset_str) ? a.real_weekly_reset_str : "";
+            const statusToneClass = a.quota_status_color === "rose" ? "text-rose-400" : (a.quota_status_color === "amber" ? "text-amber-400" : "text-emerald-400");
+
             const enabled = a.status === "enabled";
 
             tr.innerHTML = `
@@ -2060,6 +2081,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
                     <div class="font-medium text-slate-100 flex items-center gap-1.5">
                       <span class="truncate">${escapeHtml(displayName)}</span>
                       <span class="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 font-mono shrink-0">#${a.id} · u/${a.auth_user}</span>
+                      ${tierBadge}
                     </div>
                     <div class="text-[11px] text-slate-400 font-mono mt-0.5 truncate">
                       ${escapeHtml(displayEmail)}${(a.note || "").includes("同一登录") ? ` <span class="text-amber-300/80">· 重复登录</span>` : ""}
@@ -2068,26 +2090,30 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
                 </div>
               </td>
               <td class="py-3 px-3">
-                <div class="w-32 space-y-1">
+                <div class="w-40 space-y-1" title="${isOfficial ? `官网实时用量 ${a.real_5h_pct_exact ?? real5hPct}% | 本地统计 ${q5hUsed} 次` : "本地滑动窗口估算"}">
                   <div class="flex items-center justify-between text-[11px] font-mono">
-                    <span class="text-slate-200">${q5hUsed}/${q5hLimit}</span>
-                    <span class="text-slate-500">余 ${q5hRemaining}</span>
+                    <span class="text-slate-200">${isOfficial ? `已用 ${real5hPct}%` : `${q5hUsed}/${q5hLimit}`}</span>
+                    <span class="text-slate-400">${isOfficial ? `余 ${real5hLeftPct}%` : `余 ${q5hRemaining}`}</span>
                   </div>
                   <div class="h-1.5 bg-slate-800 rounded-full overflow-hidden">
-                    <div class="h-full bg-amber-400/80 rounded-full" style="width: ${q5hPct}%"></div>
+                    <div class="h-full ${isOfficial ? real5hBarColor : "bg-amber-400/80"} rounded-full" style="width: ${real5hPct}%"></div>
                   </div>
-                  <div class="text-[10px] text-slate-500 whitespace-nowrap">${escapeHtml(q5hReset)}</div>
+                  <div class="text-[10px] text-slate-400 whitespace-nowrap flex items-center justify-between gap-1">
+                    <span class="truncate">${escapeHtml(real5hReset)}</span>
+                    <span class="px-1 rounded ${isOfficial ? "bg-emerald-500/10 text-emerald-400/90" : "bg-slate-800 text-slate-500"} text-[9px] shrink-0">${isOfficial ? "官网" : "估算"}</span>
+                  </div>
                 </div>
               </td>
               <td class="py-3 px-3">
-                <div class="w-28 space-y-1">
+                <div class="w-36 space-y-1" title="${isOfficial ? `官网周用量 ${a.real_weekly_pct_exact ?? realWeekPct}% | 本地本周 ${qWeekUsed} 次` : "本地周累计估算"}">
                   <div class="flex items-center justify-between text-[11px] font-mono">
-                    <span class="text-slate-200">${qWeekUsed}/${qWeekLimit}</span>
-                    <span class="text-emerald-400 font-sans">${escapeHtml(qStatus)}</span>
+                    <span class="text-slate-200">${isOfficial ? `已用 ${realWeekPct}%` : `${qWeekUsed}/${qWeekLimit}`}</span>
+                    <span class="${statusToneClass} font-sans">${escapeHtml(qStatus)}</span>
                   </div>
                   <div class="h-1.5 bg-slate-800 rounded-full overflow-hidden">
-                    <div class="h-full bg-sky-400/80 rounded-full" style="width: ${qWeekPct}%"></div>
+                    <div class="h-full bg-sky-400/80 rounded-full" style="width: ${realWeekPct}%"></div>
                   </div>
+                  ${realWeekReset ? `<div class="text-[10px] text-slate-500 whitespace-nowrap">${escapeHtml(realWeekReset)}</div>` : ""}
                 </div>
               </td>
               <td class="py-3 px-3 whitespace-nowrap">
@@ -2111,6 +2137,23 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         console.error("刷新失败:", e);
       } finally {
         if (icon) icon.classList.remove("fa-spin");
+      }
+    }
+
+    async function syncUsage() {
+      const btn = document.getElementById("btn-sync-usage");
+      btn.disabled = true;
+      btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> <span>正在同步额度...</span>`;
+      try {
+        const res = await fetch("/api/gemini/accounts/sync-usage", { method: "POST" });
+        const data = await res.json();
+        showToast(data.message || "已同步官网实时额度");
+        await refreshDashboard();
+      } catch (err) {
+        showToast("同步官网额度异常: " + err.message);
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = `<i class="fa-solid fa-chart-pie"></i> 同步官网额度`;
       }
     }
 

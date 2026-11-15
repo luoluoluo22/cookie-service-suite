@@ -140,6 +140,25 @@ def _skip_model(model: Dict[str, Any], plan: str = "free") -> bool:
     return False
 
 
+THINKING_MODEL_PREFIXES = (
+    "gemini-4-hydrogen",
+    "gemini-4-argon",
+    "gemini-3.8-flash",
+    "gemini-3.6-flash",
+    "gemini-3.1-pro",
+    "gemini-decision-1",
+    "gpt-6-t-mini",
+    "gpt-6-thinking",
+    "gpt-5-6",
+)
+
+
+def _supports_reasoning(model_id: str) -> bool:
+    if model_id == "gpt-5-6-instant":
+        return False
+    return model_id.startswith(THINKING_MODEL_PREFIXES)
+
+
 def models_for_opencode(raw_models: List[Dict[str, Any]], plan: str = "free") -> Dict[str, Dict[str, Any]]:
     catalog: Dict[str, Dict[str, Any]] = {}
     for item in raw_models:
@@ -148,10 +167,18 @@ def models_for_opencode(raw_models: List[Dict[str, Any]], plan: str = "free") ->
         mid = str(item["id"]).strip()
         if mid in catalog:
             continue
-        catalog[mid] = {
+        entry: Dict[str, Any] = {
             "name": _display_name(item),
             "limit": _limits(mid),
         }
+        if _supports_reasoning(mid):
+            entry["reasoning"] = True
+            entry["variants"] = {
+                "low": {"reasoningEffort": "low"},
+                "medium": {"reasoningEffort": "medium"},
+                "high": {"reasoningEffort": "high"},
+            }
+        catalog[mid] = entry
     return catalog
 
 

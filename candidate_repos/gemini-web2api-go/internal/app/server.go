@@ -303,8 +303,8 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	var text string
 	var toolCalls []ToolCall
 	var res *StreamResult
-	if rtCfg().MultiTurn && len(images) == 0 && modelCfg.Tool == 0 {
-		// 多轮：按历史前缀识别续接，命中就只发新消息、历史留服务端。带 tools 也走这条。
+	if rtCfg().MultiTurn && len(images) == 0 && len(tools) == 0 && modelCfg.Tool == 0 {
+		// 多轮：按历史前缀识别续接，命中就只发新消息、历史留服务端。带 tools 走无状态单轮避免累加会话工具上限。
 		text, toolCalls, res, err = callGeminiConv(messages, modelCfg, tools, req["tool_choice"], onDelta, onReasoning)
 	} else {
 		text, toolCalls, res, err = callGemini(prompt, latest, modelCfg, tools, images, onDelta, onReasoning)
@@ -439,7 +439,13 @@ func remainingOf(full, emitted string) string {
 	if strings.HasPrefix(full, emitted) {
 		return full[len(emitted):]
 	}
-	// 前缀对不上（上游中途改写过），已发的收不回，不再补发以免重复。
+	if pos, ok := findResyncOffset(full, emitted); ok {
+		if pos >= len(full) {
+			return ""
+		}
+		return full[pos:]
+	}
+	// 前缀完全无关（无法安全对齐），已发的收不回，不再补发以免重复。
 	return ""
 }
 
