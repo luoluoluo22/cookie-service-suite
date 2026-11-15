@@ -9,7 +9,7 @@
   "proxy": "http://127.0.0.1:7890",
   "web_channel": false,
   "log_requests": true,
-  "request_timeout_sec": 120,
+  "request_timeout_sec": 300,
   "proxy_cooldown_min": 1,
   "retry_attempts": 3,
   "retry_delay_sec": 2

@@ -64,11 +64,11 @@ def is_tool_limit_reply(
     tool_calls: Optional[List[Dict[str, Any]]] = None,
     tools_active: bool = True,
 ) -> bool:
-    """Return True when tools are enabled, no tool_call was emitted, and leading text hits a limit refusal."""
+    """Return True when tools are enabled, no tool_call was emitted, and a short reply hits a limit refusal."""
     if not tools_active or tool_calls:
         return False
     cleaned = (text or "").strip()
-    if not cleaned:
+    if not cleaned or len(cleaned) > 600:
         return False
     return bool(_TOOL_LIMIT_RE.search(cleaned[:400]))
 
@@ -786,9 +786,10 @@ def intercept_openai_sse_tool_limit(
     tools_active: bool = True,
 ) -> Iterator[str]:
     """
-    Buffer up to 350 leading prose chars on an OpenAI SSE stream:
-    - Once tool_calls appear or 350 leading chars pass without hitting a limit refusal, flush and pass through.
-    - If leading text hits a tool-call-limit refusal with no tool_calls, discard the turn and raise ToolLimitReachedError.
+    Stream role/reasoning chunks immediately while buffering up to 600 leading content chars:
+    - Once tool_calls appear or >600 leading content chars pass, flush and pass through.
+    - Only when the turn finishes without tool_calls and the short reply hits a limit refusal,
+      discard the trailing content buffer and raise ToolLimitReachedError.
     """
     if not tools_active:
         for line in sse_lines:
@@ -799,62 +800,95 @@ def intercept_openai_sse_tool_limit(
     text_buf = ""
     committed = False
     saw_tool_calls = False
+    awaiting_passthrough_blank = False
+
+    def _flush_buffer() -> Iterator[str]:
+        if buffered_lines:
+            for b in buffered_lines:
+                yield b
+            buffered_lines.clear()
 
     for line in sse_lines:
         if committed:
             yield line
             continue
 
-        buffered_lines.append(line)
         stripped = line.strip()
+        if not stripped:
+            if awaiting_passthrough_blank:
+                awaiting_passthrough_blank = False
+                yield line
+            elif buffered_lines:
+                buffered_lines.append(line)
+            else:
+                yield line
+            continue
+
+        if awaiting_passthrough_blank:
+            # Close a passthrough SSE event cleanly if upstream omitted the blank line.
+            awaiting_passthrough_blank = False
+            yield "\n"
+
         if not stripped.startswith("data:"):
+            buffered_lines.append(line)
             continue
         payload_str = stripped[5:].strip()
         if not payload_str or payload_str == "[DONE]":
+            buffered_lines.append(line)
             continue
 
         try:
             obj = json.loads(payload_str)
         except Exception:
+            buffered_lines.append(line)
             continue
         if not isinstance(obj, dict):
+            buffered_lines.append(line)
             continue
 
         if "error" in obj:
             committed = True
-            for b in buffered_lines:
-                yield b
-            buffered_lines.clear()
+            yield from _flush_buffer()
+            yield line
             continue
 
         choices = obj.get("choices") or []
         if not choices or not isinstance(choices[0], dict):
+            buffered_lines.append(line)
             continue
-        delta = choices[0].get("delta") or {}
+        choice0 = choices[0]
+        delta = choice0.get("delta") or {}
         if not isinstance(delta, dict):
+            buffered_lines.append(line)
             continue
 
         if delta.get("tool_calls"):
             saw_tool_calls = True
             committed = True
-            for b in buffered_lines:
-                yield b
-            buffered_lines.clear()
+            yield from _flush_buffer()
+            yield line
             continue
 
         piece = str(delta.get("content") or "")
+        finish_reason = choice0.get("finish_reason")
+        # Forward role/reasoning chunks with their trailing blank line so consecutive JSON lines never merge into one SSE event.
+        if not piece and finish_reason is None and not buffered_lines:
+            yield line
+            if not (line.endswith("\n\n") or line.endswith("\r\n\r\n")):
+                awaiting_passthrough_blank = True
+            continue
+
+        buffered_lines.append(line)
         if piece:
             text_buf += piece
-            if _TOOL_LIMIT_RE.search(text_buf[:400]):
-                raise ToolLimitReachedError(text_buf)
-            if len(text_buf) >= 350:
+            if len(text_buf) > 600:
                 committed = True
-                for b in buffered_lines:
-                    yield b
-                buffered_lines.clear()
+                yield from _flush_buffer()
+
+    if awaiting_passthrough_blank:
+        yield "\n"
 
     if not committed:
         if not saw_tool_calls and is_tool_limit_reply(text_buf, [], tools_active=True):
             raise ToolLimitReachedError(text_buf)
-        for b in buffered_lines:
-            yield b
+        yield from _flush_buffer()

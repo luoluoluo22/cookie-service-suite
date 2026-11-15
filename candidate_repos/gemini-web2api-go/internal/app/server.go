@@ -174,7 +174,11 @@ func callGemini(prompt, latest string, mc ModelConfig, tools []map[string]interf
 	}
 	var toolCalls []ToolCall
 	if len(tools) > 0 {
+		rawText := text
 		text, toolCalls = parseToolCalls(text)
+		if text == "" && len(toolCalls) == 0 {
+			return "", nil, res, fmt.Errorf("upstream returned malformed tool_call with empty text (raw %d bytes, preview %q)", len(res.Raw), truncate(rawText, 120))
+		}
 	}
 	return text, toolCalls, res, nil
 }

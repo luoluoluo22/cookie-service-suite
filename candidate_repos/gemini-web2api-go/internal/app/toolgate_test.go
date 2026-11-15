@@ -176,3 +176,28 @@ func TestPartialPrefixLen(t *testing.T) {
 		}
 	}
 }
+
+func TestParseToolCallsTolerantJSON(t *testing.T) {
+	raw := "```tool_call\n{\"name\": \"shell\", \"arguments\": \"{\\\"command\\\": \\\"git status\\\"}\",}\n```"
+	clean, calls := parseToolCalls(raw)
+	if clean != "" {
+		t.Fatalf("clean = %q, want empty", clean)
+	}
+	if len(calls) != 1 || calls[0].Function.Name != "shell" {
+		t.Fatalf("calls = %+v, want 1 shell call", calls)
+	}
+	var args map[string]string
+	if err := json.Unmarshal([]byte(calls[0].Function.Arguments), &args); err != nil || args["command"] != "git status" {
+		t.Fatalf("args = %q, err = %v", calls[0].Function.Arguments, err)
+	}
+
+	_, calls2 := parseToolCalls("```tool_call\n{\"name\": \"ping\"}\n```")
+	if len(calls2) != 1 || calls2[0].Function.Arguments != "{}" {
+		t.Fatalf("calls2 = %+v", calls2)
+	}
+
+	_, calls3 := parseToolCalls("```tool_call\n{\"name\": \"\", \"arguments\": {}}\n```")
+	if len(calls3) != 0 {
+		t.Fatalf("empty name should produce 0 calls, got %+v", calls3)
+	}
+}

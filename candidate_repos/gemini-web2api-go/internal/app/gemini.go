@@ -3,6 +3,7 @@ package app
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1141,7 +1142,19 @@ func doGeminiRequest(endpoint, body string, headers map[string]string, proxyURL 
 	sendAt := time.Now()
 	if proxyURL != "" {
 		// 走 stdlib 的 http.ProxyURL，已知能过 socks5/socks5h。
-		req, err := http.NewRequest("POST", endpoint, strings.NewReader(body))
+		// 流式请求改用 ResponseHeaderTimeout + 读流空闲超时，避免长思考/长生成被总 Client.Timeout 误杀。
+		idleTimeout := time.Duration(rtCfg().RequestTimeout) * time.Second
+		if idleTimeout <= 0 {
+			idleTimeout = 300 * time.Second
+		}
+		maxTotal := idleTimeout * 3
+		if maxTotal < 900*time.Second {
+			maxTotal = 900 * time.Second
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		req, err := http.NewRequestWithContext(ctx, "POST", endpoint, strings.NewReader(body))
 		if err != nil {
 			return 0, nil, 0, nil, err
 		}
@@ -1149,13 +1162,14 @@ func doGeminiRequest(endpoint, body string, headers map[string]string, proxyURL 
 		for k, v := range headers {
 			req.Header.Set(k, v)
 		}
-		client := getStdlibClient(proxyURL)
+		client := getStdlibStreamClient(proxyURL)
 		resp, err := client.Do(req)
 		if err != nil {
 			return 0, nil, 0, nil, err
 		}
-		defer resp.Body.Close()
-		raw, ttfb, err := readBody(resp.Body, onLine, sendAt)
+		wrappedBody := wrapIdleTimeoutReadCloser(resp.Body, cancel, idleTimeout, maxTotal)
+		defer wrappedBody.Close()
+		raw, ttfb, err := readBody(wrappedBody, onLine, sendAt)
 		if err != nil {
 			return resp.StatusCode, nil, ttfb, resp.Header.Values("Set-Cookie"), err
 		}

@@ -442,6 +442,57 @@ func toolFenceEnd(s string, final bool) (body, next int, ok bool) {
 	return from + j, from + j + len(toolFenceClose), true
 }
 
+var trailingJSONCommaRe = regexp.MustCompile(`,\s*([}\]])`)
+
+func decodeToolCallPayload(rawBody string) (string, string, bool) {
+	trimmed := strings.TrimSpace(rawBody)
+	if trimmed == "" {
+		return "", "", false
+	}
+	candidates := []string{trimmed}
+	if cleaned := trailingJSONCommaRe.ReplaceAllString(trimmed, "$1"); cleaned != trimmed {
+		candidates = append(candidates, cleaned)
+	}
+	for _, cand := range candidates {
+		var data struct {
+			Name      string          `json:"name"`
+			Arguments json.RawMessage `json:"arguments"`
+		}
+		if err := json.Unmarshal([]byte(cand), &data); err != nil {
+			continue
+		}
+		name := strings.TrimSpace(data.Name)
+		if name == "" {
+			continue
+		}
+		rawArgs := strings.TrimSpace(string(data.Arguments))
+		if rawArgs == "" || rawArgs == "null" {
+			return name, "{}", true
+		}
+		// Models occasionally serialize `arguments` as a JSON-encoded string instead of an object.
+		if strings.HasPrefix(rawArgs, `"`) {
+			var innerStr string
+			if err := json.Unmarshal([]byte(rawArgs), &innerStr); err == nil {
+				innerTrimmed := strings.TrimSpace(innerStr)
+				if innerTrimmed == "" {
+					return name, "{}", true
+				}
+				var obj map[string]interface{}
+				if err := json.Unmarshal([]byte(innerTrimmed), &obj); err == nil {
+					b, _ := json.Marshal(obj)
+					return name, string(b), true
+				}
+			}
+		}
+		var obj map[string]interface{}
+		if err := json.Unmarshal([]byte(rawArgs), &obj); err == nil {
+			b, _ := json.Marshal(obj)
+			return name, string(b), true
+		}
+	}
+	return "", "", false
+}
+
 // parseToolCalls extracts ```tool_call``` blocks. Returns clean text + tool_calls.
 //
 // 围栏内不强求前后换行——模型有时吐 ```tool_call\n{...}\n```、有时一行内；内容交给
@@ -462,20 +513,16 @@ func parseToolCalls(text string) (string, []ToolCall) {
 		}
 		clean.WriteString(rest[:i])
 		rest = after[next:]
-		var data struct {
-			Name      string                 `json:"name"`
-			Arguments map[string]interface{} `json:"arguments"`
-		}
-		if err := json.Unmarshal([]byte(strings.TrimSpace(after[:body])), &data); err != nil {
+		name, argsJSON, valid := decodeToolCallPayload(after[:body])
+		if !valid {
 			continue
 		}
-		argsJSON, _ := json.Marshal(data.Arguments)
 		toolCalls = append(toolCalls, ToolCall{
 			ID:   "call_" + randHex(8),
 			Type: "function",
 			Function: ToolCallFunction{
-				Name:      data.Name,
-				Arguments: string(argsJSON),
+				Name:      name,
+				Arguments: argsJSON,
 			},
 		})
 	}

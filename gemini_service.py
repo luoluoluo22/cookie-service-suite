@@ -628,7 +628,7 @@ class MultiAccountGeminiPool:
             "proxy": self.proxy,
             "web_channel": False,
             "log_requests": True,
-            "request_timeout_sec": 120,
+            "request_timeout_sec": 300,
             "proxy_cooldown_min": 1,
             "retry_attempts": 3,
             "retry_delay_sec": 2,
@@ -1570,7 +1570,7 @@ class MultiAccountGeminiPool:
         prompt: str,
         model: str = "gemini-3.8-flash",
         reasoning_level: str = "off",
-        timeout: int = 180,
+        timeout: int = 600,
     ):
         """
         通过统一池化通道发起实时流式提问 (SSE)，逐行 yield SSE 事件。
@@ -1667,7 +1667,7 @@ class MultiAccountGeminiPool:
         messages: List[Dict[str, Any]],
         model: str = "gemini-3.8-flash",
         reasoning_level: str = "off",
-        timeout: int = 180,
+        timeout: int = 600,
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Any = None,
     ):

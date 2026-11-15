@@ -459,6 +459,15 @@ def is_upstream_refusal(text: Optional[str]) -> bool:
     return any(k in blob for k in refusal_keywords)
 
 
+def _resolve_gemini_timeout(model_name: str, reasoning_level: str = "off", requested_timeout: Optional[int] = None) -> int:
+    """Calculate a safe timeout floor for Gemini requests based on model complexity and reasoning."""
+    is_complex = (reasoning_level or "off").lower() != "off" or any(
+        m in (model_name or "").lower() for m in ["3.8", "3.6", "4-", "pro", "thinking"]
+    )
+    min_timeout = 600 if is_complex else 300
+    return max(requested_timeout or min_timeout, min_timeout)
+
+
 @app.post("/api/gemini/chat", summary="向 Gemini 发起提问 (自动 LRU 负载均衡轮换)", tags=["Gemini 多账号调度"])
 def gemini_chat(req: ChatRequest):
     """
@@ -466,6 +475,7 @@ def gemini_chat(req: ChatRequest):
     支持指定推理级别 ('off' 快速直出, 'medium' 中等推理, 'high' 深度长思考链)，
     遇凭证过期或网络异常自动触发 Cookie Hub 热刷新与重试自愈。
     """
+    start_t = time.time()
     if not gemini_pool.is_running():
         gemini_pool.start()
 
@@ -475,12 +485,7 @@ def gemini_chat(req: ChatRequest):
         resolve_model_reasoning(model_name, reasoning)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    # 动态适配充足安全超时时间：根据模型复杂度智能调整下限，避免因客户端超时过短切断连接
-    if any(m in model_name for m in ["3.8", "3.6", "4-", "pro", "thinking"]):
-        min_timeout = 600
-    else:
-        min_timeout = 180
-    effective_timeout = max(req.timeout or min_timeout, min_timeout)
+    effective_timeout = _resolve_gemini_timeout(model_name, reasoning, req.timeout)
 
     # 1. 默认优先走实时流式输出 (SSE)：首字毫秒级直出，体验与真实网页端一致
     if req.stream:
@@ -493,7 +498,8 @@ def gemini_chat(req: ChatRequest):
             model=req.model or "gemini-4-hydrogen",
             messages=req.prompt,
             actual_model=req.model or "gemini-4-hydrogen",
-            meta={"reasoning_level": reasoning}
+            meta={"reasoning_level": reasoning},
+            start_time=start_t,
         )
         return StreamingResponse(
             wrapped_gen,
@@ -729,7 +735,8 @@ def chatgpt_ask(req: ChatRequest):
                 endpoint="/api/chatgpt/chat",
                 model=target_model,
                 messages=req.prompt,
-                actual_model=target_model
+                actual_model=target_model,
+                start_time=start_t,
             )
 
             return StreamingResponse(
@@ -878,7 +885,8 @@ def aistudio_chat(req: AIStudioChatRequest):
                 endpoint="/api/aistudio/chat",
                 model=target_model,
                 messages=req.prompt,
-                actual_model=target_model
+                actual_model=target_model,
+                start_time=start_t,
             )
             return StreamingResponse(
                 wrapped_gen,
@@ -1210,7 +1218,8 @@ def openai_chat_completions(req: OpenAIChatRequest):
                 endpoint="/v1/chat/completions",
                 model=req.model or "gemini-4-argon",
                 messages=messages_payload,
-                actual_model=actual_model
+                actual_model=actual_model,
+                start_time=start_t,
             )
             return StreamingResponse(
                 wrapped_gen,
@@ -1257,6 +1266,9 @@ def openai_chat_completions(req: OpenAIChatRequest):
 
         target_model = req.model if req.model and "gemini" in req.model else "gemini-4-hydrogen"
         reasoning = req.reasoning_effort or req.reasoning_level or "off"
+        effective_timeout = _resolve_gemini_timeout(
+            target_model, reasoning, getattr(req, "timeout", None)
+        )
         messages_payload = [m.model_dump(exclude_none=True) for m in req.messages]
         extra = req.model_extra or {}
         tools = extra.get("tools")
@@ -1268,79 +1280,90 @@ def openai_chat_completions(req: OpenAIChatRequest):
         )
 
         if req.stream:
-            attempt_messages = sanitize_tool_limit_history(
-                messages_payload, tools_active=gemini_tools_active
-            )
-            stream_iter = None
-            first_line = None
-
-            for attempt in range(MAX_TOOL_LIMIT_RETRIES + 1):
-                raw_gen = gemini_pool.stream_chat_messages(
-                    messages=attempt_messages,
-                    model=target_model,
-                    reasoning_level=reasoning,
-                    tools=tools,
-                    tool_choice=tool_choice,
+            def _gemini_retry_stream():
+                attempt_messages = sanitize_tool_limit_history(
+                    messages_payload, tools_active=gemini_tools_active
                 )
-                stream_iter = iter(
-                    intercept_openai_sse_tool_limit(
+                sent_role = False
+
+                for attempt in range(MAX_TOOL_LIMIT_RETRIES + 1):
+                    raw_gen = gemini_pool.stream_chat_messages(
+                        messages=attempt_messages,
+                        model=target_model,
+                        reasoning_level=reasoning,
+                        timeout=effective_timeout,
+                        tools=tools,
+                        tool_choice=tool_choice,
+                    )
+                    stream_iter = intercept_openai_sse_tool_limit(
                         raw_gen, tools_active=gemini_tools_active
                     )
-                )
-                try:
-                    first_line = next(stream_iter)
-                    break
-                except ToolLimitReachedError as limit_err:
-                    preview = (
-                        limit_err.reply_text.strip().splitlines()[0][:80]
-                        if limit_err.reply_text.strip()
-                        else ""
-                    )
-                    print(
-                        f"⚠️ [Gemini Tool-Limit] 拦截到伪造次数上限提示 "
-                        f"(第 {attempt + 1}/{MAX_TOOL_LIMIT_RETRIES} 次自动续轮): "
-                        f"{preview!r}",
-                        flush=True,
-                    )
-                    if attempt >= MAX_TOOL_LIMIT_RETRIES:
-                        cid = f"chatcmpl-gemini-{int(time.time() * 1000)}"
-                        created_ts = int(time.time())
-                        c1 = {
-                            "id": cid,
-                            "object": "chat.completion.chunk",
-                            "created": created_ts,
-                            "model": target_model,
-                            "choices": [{"index": 0, "delta": {"role": "assistant", "content": limit_err.reply_text}, "finish_reason": None}],
-                        }
-                        c2 = {
-                            "id": cid,
-                            "object": "chat.completion.chunk",
-                            "created": created_ts,
-                            "model": target_model,
-                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                        }
-                        first_line = f"data: {json.dumps(c1, ensure_ascii=False)}\n\n"
-                        stream_iter = iter([
-                            f"data: {json.dumps(c2, ensure_ascii=False)}\n\n",
-                            "data: [DONE]\n\n",
-                        ])
-                        break
-                    attempt_messages = append_tool_limit_override(
-                        attempt_messages,
-                        limit_err.reply_text,
-                        attempt=attempt + 1,
-                    )
-                    continue
-                except StopIteration:
-                    first_line = "data: [DONE]\n\n"
-                    stream_iter = iter([])
-                    break
-
-            def _gemini_retry_stream():
-                if first_line is not None:
-                    yield first_line
-                for item in stream_iter:
-                    yield item
+                    try:
+                        skip_next_blank = False
+                        for item in stream_iter:
+                            stripped = item.strip()
+                            if skip_next_blank:
+                                skip_next_blank = False
+                                if not stripped:
+                                    continue
+                            if stripped.startswith("data:") and stripped[5:].strip() not in ("", "[DONE]"):
+                                try:
+                                    obj = json.loads(stripped[5:].strip())
+                                    choices = obj.get("choices") or []
+                                    if choices and isinstance(choices[0], dict):
+                                        delta = choices[0].get("delta") or {}
+                                        if isinstance(delta, dict) and "role" in delta:
+                                            if sent_role and set(delta.keys()) == {"role"} and choices[0].get("finish_reason") is None:
+                                                if not (item.endswith("\n\n") or item.endswith("\r\n\r\n")):
+                                                    skip_next_blank = True
+                                                continue
+                                            sent_role = True
+                                except Exception:
+                                    pass
+                            yield item
+                        return
+                    except ToolLimitReachedError as limit_err:
+                        preview = (
+                            limit_err.reply_text.strip().splitlines()[0][:80]
+                            if limit_err.reply_text.strip()
+                            else ""
+                        )
+                        print(
+                            f"⚠️ [Gemini Tool-Limit] 拦截到伪造次数上限提示 "
+                            f"(第 {attempt + 1}/{MAX_TOOL_LIMIT_RETRIES} 次自动续轮): "
+                            f"{preview!r}",
+                            flush=True,
+                        )
+                        if attempt >= MAX_TOOL_LIMIT_RETRIES:
+                            cid = f"chatcmpl-gemini-{int(time.time() * 1000)}"
+                            created_ts = int(time.time())
+                            delta_payload = {"content": limit_err.reply_text}
+                            if not sent_role:
+                                delta_payload["role"] = "assistant"
+                                sent_role = True
+                            c1 = {
+                                "id": cid,
+                                "object": "chat.completion.chunk",
+                                "created": created_ts,
+                                "model": target_model,
+                                "choices": [{"index": 0, "delta": delta_payload, "finish_reason": None}],
+                            }
+                            c2 = {
+                                "id": cid,
+                                "object": "chat.completion.chunk",
+                                "created": created_ts,
+                                "model": target_model,
+                                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                            }
+                            yield f"data: {json.dumps(c1, ensure_ascii=False)}\n\n"
+                            yield f"data: {json.dumps(c2, ensure_ascii=False)}\n\n"
+                            yield "data: [DONE]\n\n"
+                            return
+                        attempt_messages = append_tool_limit_override(
+                            attempt_messages,
+                            limit_err.reply_text,
+                            attempt=attempt + 1,
+                        )
 
             wrapped_gen = wrap_chat_stream(
                 _gemini_retry_stream(),
@@ -1348,7 +1371,8 @@ def openai_chat_completions(req: OpenAIChatRequest):
                 model=req.model or target_model,
                 messages=messages_payload,
                 actual_model=target_model,
-                meta={"reasoning_level": reasoning}
+                meta={"reasoning_level": reasoning},
+                start_time=start_t,
             )
             return StreamingResponse(
                 wrapped_gen,
@@ -1362,7 +1386,10 @@ def openai_chat_completions(req: OpenAIChatRequest):
 
         try:
             res = gemini_pool.ask_with_details(
-                prompt=last_user_msg, model=target_model, reasoning_level=reasoning
+                prompt=last_user_msg,
+                model=target_model,
+                reasoning_level=reasoning,
+                timeout=effective_timeout,
             )
         except Exception as first_err:
             failure_kind = gemini_failure_kind(str(first_err))
@@ -1376,7 +1403,10 @@ def openai_chat_completions(req: OpenAIChatRequest):
                 else:
                     gemini_pool.reset_proxies()
                 res = gemini_pool.ask_with_details(
-                    prompt=last_user_msg, model=target_model, reasoning_level=reasoning
+                    prompt=last_user_msg,
+                    model=target_model,
+                    reasoning_level=reasoning,
+                    timeout=effective_timeout,
                 )
             except Exception as retry_err:
                 _service_error(502, f"Gemini 兼容接口调用失败: {str(retry_err)}", "gemini")
