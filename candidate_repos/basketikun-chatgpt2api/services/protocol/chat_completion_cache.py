@@ -145,9 +145,13 @@ class ChatCompletionCache:
                 owner = False
 
         if not owner:
+            deadline = time.monotonic() + 225.0
             with inflight.condition:
                 while not inflight.done:
-                    inflight.condition.wait()
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("inflight upstream request timed out")
+                    inflight.condition.wait(timeout=remaining)
                 if inflight.error:
                     raise inflight.error
                 return self._copy(inflight.value)
@@ -202,9 +206,13 @@ class ChatCompletionCache:
                 owner = False
 
         if not owner:
+            deadline = time.monotonic() + 225.0
             with inflight.condition:
                 while not inflight.done:
-                    inflight.condition.wait()
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("inflight upstream stream request timed out")
+                    inflight.condition.wait(timeout=remaining)
                 if inflight.error:
                     raise inflight.error
                 yield from self._copy(inflight.value)

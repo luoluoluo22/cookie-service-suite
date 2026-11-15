@@ -111,7 +111,22 @@ def gemini_failure_kind(message: str) -> str:
         or "出口被上游限流" in text
     ):
         return "blocked"
-    if "1psid" in lowered or "未能提取到有效的 google" in lowered:
+    if (
+        "1psid" in lowered
+        or "未能提取到有效的 google" in lowered
+        or "auth_required" in lowered
+        or "invalid authentication credentials" in lowered
+        or "unauthorized" in lowered
+        or "http error 401" in lowered
+        or "status code 401" in lowered
+        or "cookie expired" in lowered
+        or "session expired" in lowered
+        or "login required" in lowered
+        or "需要重新登录" in text
+        or "登录态已过期" in text
+        or "凭证失效" in text
+        or "认证已过期" in text
+    ):
         return "login"
     if "gemini.google.com/app" in lowered or (
         ("302" in text or "重定向" in text or "被重定向" in text)

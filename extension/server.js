@@ -296,12 +296,37 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // 2.87 Gemini 页面原生 DOM 探测 (/gemini/inspect)
+  if (pathname === '/gemini/inspect') {
+    try {
+      const data = await dispatchToExtension('gemini_inspect', {}, 15000);
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(data, null, 2));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
   // 2.88 Generic Tab Eval (/tab/eval)
   if (pathname === '/tab/eval') {
     try {
-      const tabId = Number(parsedUrl.searchParams.get('tabId') || currentBridgeTabId);
-      const code = parsedUrl.searchParams.get('code') || 'document.title';
-      const timeout = Number(parsedUrl.searchParams.get('timeout')) || 45000;
+      let tabId = Number(parsedUrl.searchParams.get('tabId') || currentBridgeTabId);
+      let code = parsedUrl.searchParams.get('code');
+      let timeout = Number(parsedUrl.searchParams.get('timeout')) || 45000;
+      if (req.method === 'POST') {
+        const rawBody = await readRequestBody(req);
+        if (rawBody) {
+          try {
+            const parsed = JSON.parse(rawBody);
+            if (parsed.tabId) tabId = Number(parsed.tabId);
+            if (parsed.code) code = parsed.code;
+            if (parsed.timeout) timeout = Number(parsed.timeout) || timeout;
+          } catch (e) {}
+        }
+      }
+      if (!code) code = 'document.title';
       const data = await dispatchToExtension('tab_eval', { tabId, code }, timeout);
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify(data, null, 2));

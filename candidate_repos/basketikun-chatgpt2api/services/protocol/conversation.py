@@ -95,6 +95,21 @@ def is_tls_connection_error(message: str) -> bool:
     )
 
 
+def is_retryable_transport_error(message: str) -> bool:
+    """检测可由新建会话重试恢复的底层网络/HTTP2传输错误。"""
+    if is_tls_connection_error(message):
+        return True
+    text = str(message or "").lower()
+    return (
+        "curl: (56)" in text
+        or "curl: (92)" in text
+        or "protocol_error" in text
+        or "http/2 stream" in text
+        or "stream 1 was not closed" in text
+        or "connection reset" in text
+    )
+
+
 def is_connection_timeout_error(message: str) -> bool:
     """检测连接超时错误（如 curl 28），这类错误可通过同账号短等待重试解决。"""
     text = str(message or "").lower()
@@ -760,9 +775,12 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
     attempted_tokens: set[str] = set()
     token = getattr(backend, "access_token", "")
     emitted = False
+    transport_retries = 0
+    allow_same_token = False
     while True:
-        if token and token in attempted_tokens:
+        if token and token in attempted_tokens and not allow_same_token:
             raise RuntimeError("no available text account")
+        allow_same_token = False
         if token:
             attempted_tokens.add(token)
         active_backend = None
@@ -785,6 +803,15 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
             return
         except Exception as exc:
             error_message = str(exc)
+            if not emitted and transport_retries < 1 and is_retryable_transport_error(error_message):
+                transport_retries += 1
+                allow_same_token = True
+                logger.warning({
+                    "event": "text_stream_transport_retry",
+                    "attempt": transport_retries,
+                    "error": error_message,
+                })
+                continue
             if token and not emitted and is_token_invalid_error(error_message):
                 refreshed_token = account_service.refresh_access_token(token, force=True, event="text_stream")
                 if refreshed_token and refreshed_token != token and refreshed_token not in attempted_tokens:

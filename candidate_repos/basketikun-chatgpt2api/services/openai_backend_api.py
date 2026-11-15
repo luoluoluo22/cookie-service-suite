@@ -181,12 +181,16 @@ class OpenAIBackendAPI:
         self.pow_script_sources: list[str] = []
         self.pow_data_build = ""
         self.progress_callback: Callable[[str], None] | None = None
-        self.session = requests.Session(**proxy_settings.build_session_kwargs(
+        self._closed = False
+        self.session = self._create_session()
+
+    def _create_session(self) -> requests.Session:
+        session = requests.Session(**proxy_settings.build_session_kwargs(
             account=self.account,
             impersonate=self.fp["impersonate"],
             verify=True,
         ))
-        self.session.headers.update({
+        session.headers.update({
             "User-Agent": self.user_agent,
             "Origin": self.base_url,
             "Referer": self.base_url + "/",
@@ -213,7 +217,37 @@ class OpenAIBackendAPI:
             "OAI-Client-Build-Number": self.client_build_number,
         })
         if self.access_token:
-            self.session.headers["Authorization"] = f"Bearer {self.access_token}"
+            session.headers["Authorization"] = f"Bearer {self.access_token}"
+        return session
+
+    def _rebuild_session(self) -> None:
+        try:
+            if getattr(self, "session", None) is not None:
+                self.session.close()
+        except Exception:
+            pass
+        self.session = self._create_session()
+
+    @staticmethod
+    def _is_retryable_transport_error(exc: Exception) -> bool:
+        msg = str(exc or "").lower()
+        return any(
+            token in msg
+            for token in (
+                "curl: (35)",
+                "curl: (56)",
+                "curl: (92)",
+                "tls connect error",
+                "openssl_internal",
+                "ssl:",
+                "protocol_error",
+                "http/2 stream",
+                "stream 1 was not closed",
+                "connection aborted",
+                "connection reset",
+                "remote disconnected",
+            )
+        )
 
     def close(self) -> None:
         if getattr(self, "_closed", False):
@@ -2570,22 +2604,35 @@ class OpenAIBackendAPI:
             return
 
         normalized = messages or [{"role": "user", "content": prompt}]
-        self._bootstrap()
-        requirements = self._get_chat_requirements()
-        path, timezone = self._chat_target()
-        payload = self._conversation_payload(normalized, model, timezone, thinking_effort=thinking_effort)
-        response = self.session.post(
-            self.base_url + path,
-            headers=self._conversation_headers(path, requirements),
-            json=payload,
-            timeout=300,
-            stream=True,
-        )
+        response = None
+        for attempt in range(3):
+            try:
+                self._bootstrap()
+                requirements = self._get_chat_requirements()
+                path, timezone = self._chat_target()
+                payload = self._conversation_payload(normalized, model, timezone, thinking_effort=thinking_effort)
+                response = self.session.post(
+                    self.base_url + path,
+                    headers=self._conversation_headers(path, requirements),
+                    json=payload,
+                    timeout=210,
+                    stream=True,
+                )
+                break
+            except Exception as exc:
+                if attempt < 2 and self._is_retryable_transport_error(exc):
+                    logger.warning({"event": "chat_transport_retry", "attempt": attempt + 1, "error": str(exc)})
+                    self._rebuild_session()
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise
+
         ensure_ok(response, path)
-        try:
-            yield from iter_sse_payloads(response)
-        finally:
-            response.close()
+        yield from self._iter_sse_payloads_with_deadline(
+            response,
+            hard_cap_secs=220.0,
+            timeout_message="对话 SSE 流读取已超过 220 秒硬上限，已强制中断（上游未返回可见回答或连接挂起）",
+        )
 
     def _report_progress(self, step: str) -> None:
         """Report progress step to the callback if set."""
@@ -2616,31 +2663,28 @@ class OpenAIBackendAPI:
         self._report_progress("generating")
         yield from self._iter_sse_payloads_capped(response, float(config.image_poll_timeout_secs))
 
-    def _iter_sse_payloads_capped(self, response: Any, hard_cap_secs: float) -> Iterator[str]:
-        """按墙钟硬上限消费图片 SSE 流，避免上游异常时长连接被无限挂起。
-
-        curl_cffi 在 stream=True + 标量 timeout 下不限制流式 body 的总读取时长，
-        上游未生成图片却保持连接时，读取会一直阻塞直到边缘重置（曾观测到单条流
-        挂起约 29.5 分钟才失败）。这里复用「图片轮询超时」作为硬上限：到点后关闭
-        底层连接以解除阻塞，并抛出明确错误，让任务快速失败而非长时间挂起。
-        """
+    def _iter_sse_payloads_with_deadline(
+        self,
+        response: Any,
+        hard_cap_secs: float,
+        timeout_message: str,
+        timeout_exc_cls: type[Exception] = RuntimeError,
+    ) -> Iterator[str]:
+        """按墙钟硬上限消费 SSE 流，避免 curl_cffi stream=True 时连接被无限挂起。"""
         deadline = time.monotonic() + hard_cap_secs
-        # 看门狗：SSE 读取可能阻塞在底层 curl 调用中，超时后关闭连接以强制解除阻塞
         watchdog = threading.Timer(hard_cap_secs, response.close)
         watchdog.daemon = True
         watchdog.start()
-        timeout_message = f"图片生成流已超过硬上限 {int(hard_cap_secs)} 秒，已强制中断（上游可能未生成图片）"
         try:
             for payload in iter_sse_payloads(response):
                 yield payload
                 if time.monotonic() >= deadline:
-                    raise ImageStreamHardTimeoutError(timeout_message)
-        except ImageStreamHardTimeoutError:
+                    raise timeout_exc_cls(timeout_message)
+        except timeout_exc_cls:
             raise
         except Exception as exc:
-            # 看门狗关闭连接后，底层读取会抛出 curl 错误，这里统一转成明确的硬上限错误
             if time.monotonic() >= deadline:
-                raise ImageStreamHardTimeoutError(timeout_message) from exc
+                raise timeout_exc_cls(timeout_message) from exc
             raise
         finally:
             watchdog.cancel()
@@ -2649,13 +2693,40 @@ class OpenAIBackendAPI:
             except Exception:
                 pass
 
+    def _iter_sse_payloads_capped(self, response: Any, hard_cap_secs: float) -> Iterator[str]:
+        """按墙钟硬上限消费图片 SSE 流，避免上游异常时长连接被无限挂起。
+
+        curl_cffi 在 stream=True + 标量 timeout 下不限制流式 body 的总读取时长，
+        上游未生成图片却保持连接时，读取会一直阻塞直到边缘重置（曾观测到单条流
+        挂起约 29.5 分钟才失败）。这里复用「图片轮询超时」作为硬上限：到点后关闭
+        底层连接以解除阻塞，并抛出明确错误，让任务快速失败而非长时间挂起。
+        """
+        timeout_message = f"图片生成流已超过硬上限 {int(hard_cap_secs)} 秒，已强制中断（上游可能未生成图片）"
+        yield from self._iter_sse_payloads_with_deadline(
+            response,
+            hard_cap_secs=hard_cap_secs,
+            timeout_message=timeout_message,
+            timeout_exc_cls=ImageStreamHardTimeoutError,
+        )
+
     def _bootstrap(self) -> None:
         """预热首页，并提取 PoW 相关脚本引用。"""
-        response = self.session.get(
-            self.base_url + "/",
-            headers=self._bootstrap_headers(),
-            timeout=30,
-        )
+        response = None
+        for attempt in range(3):
+            try:
+                response = self.session.get(
+                    self.base_url + "/",
+                    headers=self._bootstrap_headers(),
+                    timeout=30,
+                )
+                break
+            except Exception as exc:
+                if attempt < 2 and self._is_retryable_transport_error(exc):
+                    logger.warning({"event": "bootstrap_transport_retry", "attempt": attempt + 1, "error": str(exc)})
+                    self._rebuild_session()
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise
         ensure_ok(response, "bootstrap")
         self.pow_script_sources, self.pow_data_build = parse_pow_resources(response.text)
         if not self.pow_script_sources:

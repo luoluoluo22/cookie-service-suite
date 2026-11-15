@@ -1,14 +1,17 @@
 package app
 
 import (
+	"context"
 	"crypto/sha1"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	tls_client "github.com/bogdanfinn/tls-client"
@@ -106,8 +109,25 @@ func getTLSClient() tls_client.HttpClient {
 // 不走代理时仍然用 getTLSClient（保留 utls/chrome146 真指纹优势）。
 
 var (
-	stdlibClientCache sync.Map // proxyURL|超时秒数 -> *http.Client
+	stdlibClientCache       sync.Map // proxyURL|超时秒数 -> *http.Client
+	stdlibStreamClientCache sync.Map // proxyURL|超时秒数 -> *http.Client
 )
+
+func newStdlibTransport(proxyURL string, responseHeaderTimeout time.Duration) *http.Transport {
+	t := &http.Transport{
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   20,
+		IdleConnTimeout:       90 * time.Second,
+		ResponseHeaderTimeout: responseHeaderTimeout,
+		DisableCompression:    false,
+		// 走代理时不强求 HTTP/2，部分代理不支持。
+		ForceAttemptHTTP2: false,
+	}
+	if u, err := url.Parse(proxyURL); err == nil {
+		t.Proxy = http.ProxyURL(u)
+	}
+	return t
+}
 
 // getStdlibClient returns an http.Client routed through proxyURL.
 // proxyURL must not be empty (caller checks).
@@ -118,20 +138,9 @@ func getStdlibClient(proxyURL string) *http.Client {
 	if cached, ok := stdlibClientCache.Load(key); ok {
 		return cached.(*http.Client)
 	}
-	t := &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 20,
-		IdleConnTimeout:     90 * time.Second,
-		DisableCompression:  false,
-		// 走代理时不强求 HTTP/2，部分代理不支持。
-		ForceAttemptHTTP2: false,
-	}
-	if u, err := url.Parse(proxyURL); err == nil {
-		t.Proxy = http.ProxyURL(u)
-	}
 	c := &http.Client{
 		Timeout:   time.Duration(timeout) * time.Second,
-		Transport: t,
+		Transport: newStdlibTransport(proxyURL, 0),
 		// 跟 tls-client 一致：不自动跟随重定向（302 是诊断信号）
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
@@ -139,6 +148,98 @@ func getStdlibClient(proxyURL string) *http.Client {
 	}
 	stdlibClientCache.Store(key, c)
 	return c
+}
+
+// getStdlibStreamClient returns an http.Client for streaming requests through proxyURL.
+// Unlike getStdlibClient, it enforces ResponseHeaderTimeout instead of a whole-body Client.Timeout,
+// so long thinking/streaming responses are not killed mid-stream while still receiving frames.
+func getStdlibStreamClient(proxyURL string) *http.Client {
+	timeout := rtCfg().RequestTimeout
+	if timeout <= 0 {
+		timeout = 300
+	}
+	key := fmt.Sprintf("%s|%d", proxyURL, timeout)
+	if cached, ok := stdlibStreamClientCache.Load(key); ok {
+		return cached.(*http.Client)
+	}
+	c := &http.Client{
+		Transport: newStdlibTransport(proxyURL, time.Duration(timeout)*time.Second),
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	stdlibStreamClientCache.Store(key, c)
+	return c
+}
+
+type idleTimeoutReadCloser struct {
+	rc        io.ReadCloser
+	cancel    context.CancelFunc
+	idle      time.Duration
+	idleTimer *time.Timer
+	maxTimer  *time.Timer
+	reason    atomic.Value
+	closed    atomic.Bool
+}
+
+// wrapIdleTimeoutReadCloser enforces a per-read idle timeout and a hard max duration on a stream body.
+func wrapIdleTimeoutReadCloser(rc io.ReadCloser, cancel context.CancelFunc, idleTimeout, maxTotal time.Duration) *idleTimeoutReadCloser {
+	w := &idleTimeoutReadCloser{
+		rc:     rc,
+		cancel: cancel,
+		idle:   idleTimeout,
+	}
+	if idleTimeout > 0 {
+		w.idleTimer = time.AfterFunc(idleTimeout, func() {
+			w.triggerCancel(fmt.Sprintf("stream idle timeout after %s", idleTimeout))
+		})
+	}
+	if maxTotal > 0 {
+		w.maxTimer = time.AfterFunc(maxTotal, func() {
+			w.triggerCancel(fmt.Sprintf("stream max duration timeout after %s", maxTotal))
+		})
+	}
+	return w
+}
+
+func (w *idleTimeoutReadCloser) triggerCancel(msg string) {
+	if w.closed.Load() {
+		return
+	}
+	if w.reason.Load() == nil {
+		w.reason.Store(msg)
+	}
+	if w.cancel != nil {
+		w.cancel()
+	}
+}
+
+func (w *idleTimeoutReadCloser) Read(p []byte) (int, error) {
+	n, err := w.rc.Read(p)
+	if n > 0 && w.idleTimer != nil && !w.closed.Load() {
+		w.idleTimer.Reset(w.idle)
+	}
+	if err != nil {
+		if v := w.reason.Load(); v != nil {
+			return n, fmt.Errorf("%s: %w", v.(string), err)
+		}
+	}
+	return n, err
+}
+
+func (w *idleTimeoutReadCloser) Close() error {
+	w.closed.Store(true)
+	if w.idleTimer != nil {
+		w.idleTimer.Stop()
+	}
+	if w.maxTimer != nil {
+		w.maxTimer.Stop()
+	}
+	err := w.rc.Close()
+	if w.cancel != nil {
+		w.cancel()
+	}
+	return err
 }
 
 // loadCookie reads the cookie file (Netscape one-line format or JSON).

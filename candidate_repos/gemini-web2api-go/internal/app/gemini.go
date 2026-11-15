@@ -3,6 +3,7 @@ package app
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	fhttp "github.com/bogdanfinn/fhttp"
 	"github.com/google/uuid"
@@ -344,12 +346,143 @@ type deltaTracker struct{ emitted string }
 // Push 吃进一帧的累积全文，返回相对上一次的增量；没有新增或无法安全 diff 时返回 ""。
 func (d *deltaTracker) Push(fullText string) string {
 	cleaned := cleanGeminiText(fullText)
-	if len(cleaned) <= len(d.emitted) || !strings.HasPrefix(cleaned, d.emitted) {
+	safeLen := safeStreamPrefixLen(cleaned)
+	safe := cleaned[:safeLen]
+	if len(safe) <= len(d.emitted) {
 		return ""
 	}
-	delta := cleaned[len(d.emitted):]
-	d.emitted = cleaned
-	return delta
+	if strings.HasPrefix(safe, d.emitted) {
+		delta := safe[len(d.emitted):]
+		d.emitted = safe
+		return delta
+	}
+	if resumeAt, ok := findResyncOffset(safe, d.emitted); ok {
+		delta := ""
+		if resumeAt < len(safe) {
+			delta = safe[resumeAt:]
+		}
+		d.emitted = safe
+		return delta
+	}
+	return ""
+}
+
+// safeStreamPrefixLen 返回当前帧里可以安全立刻流式吐出的前缀长度。
+// Gemini 网页版会在流式生成 URL 时不断原地改写尾部的 `[https://...](https://...)`
+// 或把裸 URL 包成 markdown 链接；把尾部尚未完结的 URL 暂扣到下一个分隔符到来（或流结束由
+// remainingOf 补齐），可从源头避免前缀失配导致的后续整段丢失。
+func safeStreamPrefixLen(s string) int {
+	n := len(s)
+	if n == 0 {
+		return 0
+	}
+	windowStart := n - 512
+	if windowStart < 0 {
+		windowStart = 0
+	}
+	for windowStart < n && !utf8.RuneStart(s[windowStart]) {
+		windowStart++
+	}
+	tail := s[windowStart:]
+
+	// 1. 尾部正在生成的 `[http(s)://...` 或 `[http(s)://...](http(s)://...)`（尚无结束后的分隔符）
+	if lb := strings.LastIndexByte(tail, '['); lb >= 0 {
+		frag := tail[lb:]
+		if !strings.ContainsAny(frag, "\r\n") &&
+			(strings.HasPrefix(frag, "[http://") || strings.HasPrefix(frag, "[https://") ||
+				strings.HasPrefix(frag, "[http:") || strings.HasPrefix(frag, "[https:")) {
+			if !strings.Contains(frag, ")") || strings.HasSuffix(frag, ")") {
+				return windowStart + lb
+			}
+		}
+	}
+
+	// 2. 尾部裸 `https://...` / `http://...`，尚未遇到空白、括号、标点等边界
+	for _, scheme := range []string{"https://", "http://"} {
+		if idx := strings.LastIndex(tail, scheme); idx >= 0 {
+			frag := tail[idx:]
+			if !strings.ContainsAny(frag, " \t\r\n)`]>\"'，。；！？、）】") {
+				return windowStart + idx
+			}
+		}
+	}
+
+	return n
+}
+
+// findResyncOffset 在上游中途改写已发出文本（例如自动扩展 URL 链接或清理代码产物）时，
+// 重新定位 emitted 在 full 中对应的结束位置，避免后续整段回复被永久丢弃。
+func findResyncOffset(full, emitted string) (int, bool) {
+	if emitted == "" {
+		return 0, true
+	}
+	if strings.HasPrefix(full, emitted) {
+		return len(emitted), true
+	}
+
+	lcp := 0
+	limit := len(full)
+	if len(emitted) < limit {
+		limit = len(emitted)
+	}
+	for lcp < limit && full[lcp] == emitted[lcp] {
+		lcp++
+	}
+	if lcp == len(full) {
+		return len(full), true
+	}
+	for lcp > 0 && !utf8.RuneStart(full[lcp]) {
+		lcp--
+	}
+
+	// 1. 尾部锚点匹配：改写发生在 emitted 末尾之前，用 emitted 末尾切片在 full 中重新对齐
+	for _, win := range []int{48, 32, 20, 12} {
+		if len(emitted) < win {
+			continue
+		}
+		start := len(emitted) - win
+		for start < len(emitted) && !utf8.RuneStart(emitted[start]) {
+			start++
+		}
+		if len(emitted)-start < 10 {
+			continue
+		}
+		anchor := emitted[start:]
+		searchFrom := lcp - 16
+		if searchFrom < 0 {
+			searchFrom = 0
+		}
+		for searchFrom < len(full) && !utf8.RuneStart(full[searchFrom]) {
+			searchFrom++
+		}
+		if idx := strings.Index(full[searchFrom:], anchor); idx >= 0 {
+			pos := searchFrom + idx + len(anchor)
+			if pos == len(full) || utf8.RuneStart(full[pos]) {
+				return pos, true
+			}
+		}
+	}
+
+	// 2. 改写恰好落在 emitted 末尾（例如 `[https://gemini.google](https://gemini.google)`
+	//    被扩写为 `[https://gemini.google.com/u/0/usage](https://gemini.google.com/u/0/usage)`）
+	if lcp >= 12 || (lcp >= 6 && lcp*2 >= len(emitted)) {
+		remEmitted := emitted[lcp:]
+		if len(remEmitted) <= 256 && (strings.Contains(remEmitted, "](") || strings.HasSuffix(remEmitted, ")")) {
+			rest := full[lcp:]
+			if closeParen := strings.IndexByte(rest, ')'); closeParen >= 0 && closeParen <= 1024 {
+				if !strings.ContainsAny(rest[:closeParen], "\r\n") {
+					return lcp + closeParen + 1, true
+				}
+			}
+		}
+		if len(remEmitted) <= 32 && len(full) > len(emitted) {
+			if nl := strings.IndexByte(full[lcp:], '\n'); nl >= 0 && nl <= 256 {
+				return lcp + nl, true
+			}
+		}
+	}
+
+	return 0, false
 }
 
 // pinnedAccountError 表示 PinAccountID 指定的号用不了：Err 为 nil 是号被删 / 停用，
@@ -1009,7 +1142,19 @@ func doGeminiRequest(endpoint, body string, headers map[string]string, proxyURL 
 	sendAt := time.Now()
 	if proxyURL != "" {
 		// 走 stdlib 的 http.ProxyURL，已知能过 socks5/socks5h。
-		req, err := http.NewRequest("POST", endpoint, strings.NewReader(body))
+		// 流式请求改用 ResponseHeaderTimeout + 读流空闲超时，避免长思考/长生成被总 Client.Timeout 误杀。
+		idleTimeout := time.Duration(rtCfg().RequestTimeout) * time.Second
+		if idleTimeout <= 0 {
+			idleTimeout = 300 * time.Second
+		}
+		maxTotal := idleTimeout * 3
+		if maxTotal < 900*time.Second {
+			maxTotal = 900 * time.Second
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		req, err := http.NewRequestWithContext(ctx, "POST", endpoint, strings.NewReader(body))
 		if err != nil {
 			return 0, nil, 0, nil, err
 		}
@@ -1017,13 +1162,14 @@ func doGeminiRequest(endpoint, body string, headers map[string]string, proxyURL 
 		for k, v := range headers {
 			req.Header.Set(k, v)
 		}
-		client := getStdlibClient(proxyURL)
+		client := getStdlibStreamClient(proxyURL)
 		resp, err := client.Do(req)
 		if err != nil {
 			return 0, nil, 0, nil, err
 		}
-		defer resp.Body.Close()
-		raw, ttfb, err := readBody(resp.Body, onLine, sendAt)
+		wrappedBody := wrapIdleTimeoutReadCloser(resp.Body, cancel, idleTimeout, maxTotal)
+		defer wrappedBody.Close()
+		raw, ttfb, err := readBody(wrappedBody, onLine, sendAt)
 		if err != nil {
 			return resp.StatusCode, nil, ttfb, resp.Header.Values("Set-Cookie"), err
 		}

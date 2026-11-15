@@ -18,6 +18,7 @@ import urllib.parse
 import re
 import ssl
 import asyncio
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List, Tuple
 
 # 保证本地回环网络请求不走外部代理（Clash 等），避免 502 Bad Gateway
@@ -306,20 +307,17 @@ def resolve_model_reasoning(model: str, reasoning_level: str = "off") -> str:
         return base_model
 
     raw_base = base_model
-    for suffix in ("-thinking-medium", "-thinking", "-thinking-lite"):
+    for suffix in ("-thinking-medium", "-thinking-lite", "-thinking", "-search"):
         if raw_base.endswith(suffix):
             raw_base = raw_base[: -len(suffix)]
-            break
     if raw_base == "gemini-4-carbon":
         raise ValueError("4 Carbon（高难任务）在当前账号未开通")
     raw_base = _WEB_BASE_TO_POOL.get(raw_base, raw_base)
 
-    if clean_level in ("high", "extended", "deep"):
-        if raw_base == "gemini-4-argon":
-            return "gemini-4-argon-thinking"
+    if clean_level in ("low", "lite", "minimal", "medium", "high", "extended", "deep"):
+        if clean_level == "medium" and raw_base == "gemini-4-argon":
+            return "gemini-4-argon-thinking-medium"
         return f"{raw_base}-thinking"
-    if clean_level == "medium" and raw_base == "gemini-4-argon":
-        return "gemini-4-argon-thinking-medium"
     return raw_base
 
 
@@ -356,6 +354,10 @@ def _web_model_label(display: str, role: str, locked: bool) -> str:
     if role and role != display:
         return f"{display}（{role}）"
     return display
+
+
+# 任务模式（Task Mode）官方允许的模型集合（官方前端收窄，仅支持多工具协同与复杂任务的型号）
+TASK_MODE_MODEL_IDS = {"gemini-4-hydrogen", "gemini-4-argon"}
 
 
 def _parse_web_model_payload(body: str) -> List[Dict[str, Any]]:
@@ -402,12 +404,15 @@ def _parse_web_model_payload(body: str) -> List[Dict[str, Any]]:
             if not mid or mid in seen:
                 continue
             seen.add(mid)
+            is_task = mid in TASK_MODE_MODEL_IDS
             models.append({
                 "id": mid,
                 "name": display,
                 "role": role,
                 "label": _web_model_label(display, role, False),
                 "locked": False,
+                "modes": ["chat", "task"] if is_task else ["chat"],
+                "is_task_model": is_task,
             })
 
     catalog = inner[15] if len(inner) > 15 and isinstance(inner[15], list) else []
@@ -420,12 +425,15 @@ def _parse_web_model_payload(body: str) -> List[Dict[str, Any]]:
         if not mid or mid in seen:
             continue
         seen.add(mid)
+        is_task = mid in TASK_MODE_MODEL_IDS
         models.append({
             "id": mid,
             "name": display,
             "role": role,
             "label": _web_model_label(display, role, True),
             "locked": True,
+            "modes": ["chat", "task"] if is_task else ["chat"],
+            "is_task_model": is_task,
         })
     return models
 
@@ -465,18 +473,34 @@ class MultiAccountGeminiPool:
         self._pace = GeminiPace()
         self._lifecycle_lock = threading.Lock()
         self._sync_thread: Optional[threading.Thread] = None
+        self._usage_sync_thread: Optional[threading.Thread] = None
+        self._usage_sync_at = 0.0
         self._web_models_cache: List[Dict[str, Any]] = []
         self._web_models_at = 0.0
 
-    def _extract_cookie_header(self) -> str:
-        """从 Cookie Hub 提取实际适用于 gemini.google.com 的 Google 会话 Cookie。"""
-        url = f"{self.bridge.bridge_url}/cookies?domain=google.com"
+    def _extract_cookie_header(self, auto_fetch: bool = False) -> str:
+        """从 Cookie Hub 提取适用于 Gemini 的 Google 会话 Cookie；必要时可唤醒 AI Studio 标签页。"""
+        endpoint = "/aistudio/auto_fetch" if auto_fetch else "/cookies?domain=google.com"
+        url = f"{self.bridge.bridge_url}{endpoint}"
         try:
-            with _LOCAL_OPENER.open(url, timeout=15) as resp:
+            with _LOCAL_OPENER.open(url, timeout=45 if auto_fetch else 15) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
-                cookies = data.get("cookies", [])
-        except Exception as e:
-            raise ConnectionError(f"无法连接本地 Cookie Hub 提取凭证 ({self.bridge.bridge_url}): {e}")
+        except Exception as exc:
+            raise ConnectionError(
+                f"无法连接本地 Cookie Hub 获取凭证 ({type(exc).__name__})"
+            ) from exc
+
+        if auto_fetch:
+            if data.get("loginRequired"):
+                raise RuntimeError("Google 浏览器会话需要人工登录；未修改任何账号。")
+            if not data.get("success"):
+                raise RuntimeError(
+                    str(data.get("error") or "Cookie Hub 未能刷新浏览器登录态。")
+                )
+
+        cookies = data.get("cookies", [])
+        if not cookies:
+            raise RuntimeError("Cookie Hub 未返回 Google Cookie；未修改任何账号。")
 
         target_keys = (
             "SID", "HSID", "SSID", "APISID", "SAPISID",
@@ -517,7 +541,9 @@ class MultiAccountGeminiPool:
 
         parts = [f"{name}={selected[name][1]}" for name in target_keys if name in selected]
         if "__Secure-1PSID" not in selected or "SAPISID" not in selected:
-            raise RuntimeError("Cookie Hub 未提供适用于 Gemini 的完整登录 Cookie；请先在已连接浏览器登录 Google。")
+            raise RuntimeError(
+                "Cookie Hub 未提供适用于 Gemini 的完整登录 Cookie；请先在已连接浏览器登录 Google。"
+            )
         return "; ".join(parts)
 
     def init_database(self, force_refresh: bool = False, cookie_str: Optional[str] = None):
@@ -602,7 +628,7 @@ class MultiAccountGeminiPool:
             "proxy": self.proxy,
             "web_channel": False,
             "log_requests": True,
-            "request_timeout_sec": 120,
+            "request_timeout_sec": 300,
             "proxy_cooldown_min": 1,
             "retry_attempts": 3,
             "retry_delay_sec": 2,
@@ -651,6 +677,11 @@ class MultiAccountGeminiPool:
         self._web_models_cache = list(models)
         self._web_models_at = now if parsed else now - 540
         return list(models)
+
+    def list_task_models(self) -> List[Dict[str, Any]]:
+        """获取 Gemini 网页在「任务」模式下可用的模型（Hydrogen 与 Argon）。"""
+        all_models = self.list_web_models()
+        return [m for m in all_models if m.get("is_task_model") or m.get("id") in TASK_MODE_MODEL_IDS]
 
     def _fetch_web_models(self) -> List[Dict[str, Any]]:
         cookie = ""
@@ -841,6 +872,10 @@ class MultiAccountGeminiPool:
                 print(f"✅ [Gemini] 已识别 {len(named)} 个 Google 账号: {', '.join(named)}", flush=True)
             except Exception as exc:
                 print(f"⚠️ [Gemini] 账号资料同步失败: {exc}", flush=True)
+            try:
+                self.sync_account_usage()
+            except Exception as exc:
+                print(f"⚠️ [Gemini] 官网额度同步失败: {exc}", flush=True)
 
         self._sync_thread = threading.Thread(target=_worker, name="gemini-account-sync", daemon=True)
         self._sync_thread.start()
@@ -989,10 +1024,265 @@ class MultiAccountGeminiPool:
 
             results[u] = {"name": name, "email": email, "label": new_label, "note": note}
 
+        try:
+            self.sync_account_usage()
+        except Exception as exc:
+            print(f"[Gemini] 官网额度同步提示: {exc}", flush=True)
+
         return results
 
+    _USAGE_QUERY_SIGNATURE = "2/r9A7h8PGYFROeibFhACp9h3mHf72UWS3JhgYaQYlPoo="
+    _USAGE_QUERY_VARIABLES = {
+        "g1Request": {
+            "entrypoints": [
+                "GEMINI_USAGE_SETTINGS_UPGRADE_BANNER",
+                "GEMINI_USAGE_SETTINGS_AI_CREDITS_UPSELL_CARD",
+                "GEMINI_USAGE_SETTINGS_UPGRADE_AND_CREDITS_BANNER",
+            ]
+        },
+        "workspaceRequest": {
+            "recommendationsForSurfaceRequests": [
+                {
+                    "recommendationSurface": {
+                        "rpOnramp": "GEMINI_CHAT_USAGE_LIMITS_UPSELL",
+                        "version": "1",
+                    },
+                    "maxRecommendationCount": 1,
+                }
+            ]
+        },
+    }
+    _TIER_LABELS = {
+        "TIER1": "PRO",
+        "TIER2": "ULTRA",
+        "TIER_NEON": "ULTRA",
+        "TIER_HELIUM": "PLUS",
+        "TIER0": "FREE",
+    }
+
+    @staticmethod
+    def _format_reset_time(iso_str: str, is_weekly: bool = False) -> Tuple[str, str, int]:
+        if not iso_str:
+            return "", "", 0
+        try:
+            clean = iso_str.strip()
+            if clean.endswith("Z"):
+                clean = clean[:-1] + "+00:00"
+            dt = datetime.fromisoformat(clean)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            local_dt = dt.astimezone()
+            now_local = datetime.now().astimezone()
+            reset_epoch = int(local_dt.timestamp())
+            if local_dt.date() == now_local.date():
+                clock_str = local_dt.strftime("%H:%M")
+            else:
+                clock_str = f"{local_dt.month}月{local_dt.day}日 {local_dt.strftime('%H:%M')}"
+
+            if is_weekly:
+                return f"重置 {clock_str}", clock_str, reset_epoch
+
+            secs_left = max(0, reset_epoch - int(time.time()))
+            if secs_left <= 0:
+                return f"重置 {clock_str} (已刷新)", clock_str, reset_epoch
+            hours = secs_left // 3600
+            mins = (secs_left % 3600) // 60
+            return f"重置 {clock_str} ({hours:02d}h {mins:02d}m)", clock_str, reset_epoch
+        except Exception:
+            return "", "", 0
+
+    def fetch_account_usage(
+        self, authuser: int, cookie_override: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """直接调用 Gemini 网页 /usage 页面同款 GraphQL 接口，获取真实百分比与重置时间。"""
+        cookie = cookie_override
+        if not cookie:
+            try:
+                conn = sqlite3.connect(self.db_path)
+                row = conn.execute(
+                    "SELECT cookie FROM accounts WHERE authuser = ?", (authuser,)
+                ).fetchone()
+                conn.close()
+                if row and row[0]:
+                    cookie = row[0]
+            except Exception:
+                pass
+        if not cookie:
+            return {}
+
+        params = urllib.parse.urlencode(
+            {
+                "query_signature": self._USAGE_QUERY_SIGNATURE,
+                "variables": json.dumps(self._USAGE_QUERY_VARIABLES, separators=(",", ":")),
+            }
+        )
+        url = (
+            f"https://gemini.google.com/u/{authuser}"
+            f"/_/BardChatUi/graphql/schemas/GEMINI_WEB_GRAPHQL/executeQuery?{params}"
+        )
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Cookie": cookie,
+                "Accept": "application/json",
+                "Referer": f"https://gemini.google.com/u/{authuser}/usage",
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+                ),
+            },
+        )
+        proxy_handler = (
+            urllib.request.ProxyHandler({"http": self.proxy, "https": self.proxy})
+            if self.proxy
+            else urllib.request.ProxyHandler({})
+        )
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        opener = urllib.request.build_opener(proxy_handler, urllib.request.HTTPSHandler(context=ctx))
+
+        raw = ""
+        last_error = None
+        for attempt in range(2):
+            try:
+                with opener.open(req, timeout=15) as resp:
+                    raw = resp.read().decode("utf-8", errors="ignore")
+                last_error = None
+                break
+            except Exception as exc:
+                last_error = exc
+                time.sleep(0.8 * (attempt + 1))
+
+        if last_error is not None or not raw:
+            return {"error": str(last_error or "empty response")}
+
+        if raw.startswith(")]}'"):
+            raw = raw.split("\n", 1)[1] if "\n" in raw else raw[4:]
+
+        try:
+            frames = json.loads(raw)
+        except Exception as exc:
+            return {"error": f"json parse failed: {exc}"}
+
+        if not isinstance(frames, list):
+            return {"error": "unexpected graphql response"}
+
+        usage_info = None
+        for item in frames:
+            if not isinstance(item, dict):
+                continue
+            rpcs = ((item.get("data") or {}).get("viewer") or {}).get("rpcs")
+            if isinstance(rpcs, dict) and isinstance(rpcs.get("getUsageInfo"), dict):
+                usage_info = rpcs["getUsageInfo"]
+                break
+
+        if not usage_info:
+            return {"error": "missing getUsageInfo"}
+
+        raw_tier = str(usage_info.get("subscriptionTier") or "").strip()
+        plan_tier = self._TIER_LABELS.get(raw_tier, raw_tier or "FREE")
+
+        parsed: Dict[str, Any] = {
+            "auth_user": authuser,
+            "plan_tier": plan_tier,
+            "raw_tier": raw_tier,
+            "fetched_at": int(time.time()),
+        }
+        for pool in usage_info.get("pools") or []:
+            if not isinstance(pool, dict):
+                continue
+            ptype = str(pool.get("poolType") or "")
+            pct_raw = pool.get("percentageUsed")
+            if not isinstance(pct_raw, (int, float)) or pct_raw < 0:
+                continue
+            pct_int = min(100, max(0, int(round(float(pct_raw) * 100))))
+            pct_float = round(float(pct_raw) * 100, 2)
+            refresh_iso = str(((pool.get("gxu") or {}).get("windowRefreshesAt")) or "")
+            if ptype == "GXU_FIVE_HOURLY":
+                reset_str, clock_str, reset_epoch = self._format_reset_time(refresh_iso, is_weekly=False)
+                parsed["five_hourly"] = {
+                    "pct": pct_int,
+                    "pct_exact": pct_float,
+                    "reset_iso": refresh_iso,
+                    "reset_str": reset_str,
+                    "reset_clock": clock_str,
+                    "reset_epoch": reset_epoch,
+                }
+            elif ptype == "GXU_WEEKLY":
+                reset_str, clock_str, reset_epoch = self._format_reset_time(refresh_iso, is_weekly=True)
+                parsed["weekly"] = {
+                    "pct": pct_int,
+                    "pct_exact": pct_float,
+                    "reset_iso": refresh_iso,
+                    "reset_str": reset_str,
+                    "reset_clock": clock_str,
+                    "reset_epoch": reset_epoch,
+                }
+        return parsed
+
+    def _load_usage_cache(self, conn: sqlite3.Connection) -> Dict[str, Dict[str, Any]]:
+        try:
+            row = conn.execute("SELECT v FROM kv WHERE k = 'web_usage_cache'").fetchone()
+            if row and row[0]:
+                data = json.loads(row[0])
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
+        return {}
+
+    def sync_account_usage(self) -> Dict[int, Dict[str, Any]]:
+        """批量抓取所有有效独立 Google 账号的官方 /usage 实时百分比与重置时间，并写入 kv 缓存。"""
+        if not os.path.exists(self.db_path):
+            self.init_database()
+
+        self.proxy = _detect_local_proxy() or self.proxy
+        conn = sqlite3.connect(self.db_path)
+        rows = conn.execute(
+            "SELECT authuser, cookie, note, status FROM accounts ORDER BY authuser ASC"
+        ).fetchall()
+        cache = self._load_usage_cache(conn)
+        conn.close()
+
+        results: Dict[int, Dict[str, Any]] = {}
+        for authuser, cookie, note, status in rows:
+            if not cookie or "同一登录" in (note or "") or status == "deleted":
+                continue
+            info = self.fetch_account_usage(authuser, cookie_override=cookie)
+            if info and not info.get("error") and ("five_hourly" in info or "weekly" in info):
+                cache[str(authuser)] = info
+                results[authuser] = info
+            else:
+                results[authuser] = info or {"error": "unknown"}
+
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "INSERT OR REPLACE INTO kv (k, v) VALUES ('web_usage_cache', ?)",
+            (json.dumps(cache, ensure_ascii=False),),
+        )
+        conn.commit()
+        conn.close()
+        self._usage_sync_at = time.time()
+        return results
+
+    def _schedule_usage_sync(self) -> None:
+        if self._usage_sync_thread and self._usage_sync_thread.is_alive():
+            return
+
+        def _worker():
+            try:
+                self.sync_account_usage()
+            except Exception as exc:
+                print(f"[Gemini] 官网额度后台刷新失败: {exc}", flush=True)
+
+        self._usage_sync_thread = threading.Thread(
+            target=_worker, name="gemini-usage-sync", daemon=True
+        )
+        self._usage_sync_thread.start()
+
     def list_accounts(self) -> List[Dict[str, Any]]:
-        """获取账号池内所有账号的状态、真实名称与 5 小时 / 周度额度统计。"""
+        """获取账号池内所有账号的状态、真实名称与 5 小时 / 周度额度统计（优先使用官网真实 /usage 数据）。"""
         if not os.path.exists(self.db_path):
             self.init_database()
 
@@ -1002,15 +1292,18 @@ class MultiAccountGeminiPool:
             """SELECT id, label, authuser, status, last_used_at, fail_count, note 
                FROM accounts ORDER BY authuser ASC"""
         ).fetchall()
+        usage_cache = self._load_usage_cache(conn)
 
         now = int(time.time())
         five_hours_ago = now - 5 * 3600
         one_week_ago = now - 7 * 86400
 
         res = []
+        needs_usage_sync = False
         for r in rows:
             acc_id = r[0]
             label_val = r[1]
+            auth_user = r[2]
             name = ""
             email = ""
             if "(" in label_val and label_val.endswith(")"):
@@ -1021,7 +1314,7 @@ class MultiAccountGeminiPool:
                 email = label_val.strip()
             note = r[6] or ""
 
-            # 查询该账号 5 小时内与本周内的精确调用轨迹
+            # 查询该账号 5 小时内与本周内的本地调用轨迹
             row_5h = cur.execute(
                 """SELECT COUNT(1), MIN(ts), MAX(ts) 
                    FROM requests WHERE account_id = ? AND ts >= ?""",
@@ -1035,7 +1328,7 @@ class MultiAccountGeminiPool:
                 (acc_id, one_week_ago),
             ).fetchone()[0]
 
-            # 计算 5 小时滚动重置倒计时
+            # 计算 5 小时滚动重置倒计时（本地回退值）
             reset_str = "滚动窗口充裕"
             if count_5h > 0 and earliest_5h:
                 secs_left = max(0, (earliest_5h + 5 * 3600) - now)
@@ -1051,16 +1344,69 @@ class MultiAccountGeminiPool:
             limit_weekly = 500
             rem_weekly = max(0, limit_weekly - count_weekly)
 
-            # 额度健康度状态判定
-            if count_5h >= 45:
-                quota_status = "高负荷 🔴"
-                status_color = "rose"
-            elif count_5h >= 25:
-                quota_status = "适中 🟡"
-                status_color = "amber"
+            # 读取官网真实 /usage 缓存
+            official = usage_cache.get(str(auth_user))
+            usage_source = "estimated"
+            plan_tier = ""
+            real_5h_pct = None
+            real_5h_pct_exact = None
+            real_5h_reset_str = ""
+            real_5h_reset_epoch = 0
+            real_weekly_pct = None
+            real_weekly_pct_exact = None
+            real_weekly_reset_str = ""
+            real_weekly_reset_epoch = 0
+            usage_fetched_at = 0
+
+            is_dup = "同一登录" in note
+            if isinstance(official, dict) and ("five_hourly" in official or "weekly" in official):
+                usage_fetched_at = int(official.get("fetched_at") or 0)
+                plan_tier = str(official.get("plan_tier") or "")
+                fh = official.get("five_hourly") or {}
+                wk = official.get("weekly") or {}
+                if fh:
+                    real_5h_pct = int(fh.get("pct") or 0)
+                    real_5h_pct_exact = float(fh.get("pct_exact") or 0.0)
+                    real_5h_reset_epoch = int(fh.get("reset_epoch") or 0)
+                    if fh.get("reset_iso"):
+                        real_5h_reset_str, _, _ = self._format_reset_time(str(fh["reset_iso"]), is_weekly=False)
+                    else:
+                        real_5h_reset_str = str(fh.get("reset_str") or "")
+                if wk:
+                    real_weekly_pct = int(wk.get("pct") or 0)
+                    real_weekly_pct_exact = float(wk.get("pct_exact") or 0.0)
+                    real_weekly_reset_epoch = int(wk.get("reset_epoch") or 0)
+                    if wk.get("reset_iso"):
+                        real_weekly_reset_str, _, _ = self._format_reset_time(str(wk["reset_iso"]), is_weekly=True)
+                    else:
+                        real_weekly_reset_str = str(wk.get("reset_str") or "")
+                usage_source = "official"
+                if (now - usage_fetched_at) > 120:
+                    needs_usage_sync = True
+            elif not is_dup and r[3] == "enabled":
+                needs_usage_sync = True
+
+            # 额度健康度状态判定（优先使用官网百分比）
+            if usage_source == "official" and real_5h_pct is not None:
+                if real_5h_pct >= 85 or (real_weekly_pct is not None and real_weekly_pct >= 85):
+                    quota_status = "高负荷"
+                    status_color = "rose"
+                elif real_5h_pct >= 50 or (real_weekly_pct is not None and real_weekly_pct >= 50):
+                    quota_status = "适中"
+                    status_color = "amber"
+                else:
+                    quota_status = "充裕"
+                    status_color = "emerald"
             else:
-                quota_status = "充裕 🟢"
-                status_color = "emerald"
+                if count_5h >= 45:
+                    quota_status = "高负荷 🔴"
+                    status_color = "rose"
+                elif count_5h >= 25:
+                    quota_status = "适中 🟡"
+                    status_color = "amber"
+                else:
+                    quota_status = "充裕 🟢"
+                    status_color = "emerald"
 
             res.append(
                 {
@@ -1068,8 +1414,8 @@ class MultiAccountGeminiPool:
                     "label": label_val,
                     "name": name,
                     "email": email,
-                    "auth_user": r[2],
-                    "url_prefix": f"https://gemini.google.com/u/{r[2]}",
+                    "auth_user": auth_user,
+                    "url_prefix": f"https://gemini.google.com/u/{auth_user}",
                     "status": r[3],
                     "last_used_at": r[4],
                     "fail_count": r[5],
@@ -1083,6 +1429,17 @@ class MultiAccountGeminiPool:
                     "quota_weekly_remaining": rem_weekly,
                     "quota_status": quota_status,
                     "quota_status_color": status_color,
+                    "usage_source": usage_source,
+                    "plan_tier": plan_tier,
+                    "real_5h_pct": real_5h_pct,
+                    "real_5h_pct_exact": real_5h_pct_exact,
+                    "real_5h_reset_str": real_5h_reset_str,
+                    "real_5h_reset_epoch": real_5h_reset_epoch,
+                    "real_weekly_pct": real_weekly_pct,
+                    "real_weekly_pct_exact": real_weekly_pct_exact,
+                    "real_weekly_reset_str": real_weekly_reset_str,
+                    "real_weekly_reset_epoch": real_weekly_reset_epoch,
+                    "usage_fetched_at": usage_fetched_at,
                 }
             )
         seen_emails = set()
@@ -1095,6 +1452,8 @@ class MultiAccountGeminiPool:
             else:
                 item["visible"] = False
         conn.close()
+        if needs_usage_sync and (time.time() - self._usage_sync_at > 60):
+            self._schedule_usage_sync()
         return res
 
     def ask(
@@ -1211,7 +1570,7 @@ class MultiAccountGeminiPool:
         prompt: str,
         model: str = "gemini-3.8-flash",
         reasoning_level: str = "off",
-        timeout: int = 180,
+        timeout: int = 600,
     ):
         """
         通过统一池化通道发起实时流式提问 (SSE)，逐行 yield SSE 事件。
@@ -1246,10 +1605,17 @@ class MultiAccountGeminiPool:
             try:
                 resp = _LOCAL_OPENER.open(req, timeout=timeout)
             except Exception as first_err:
-                print(f"⚠️ [Gemini Stream] 连接 Go 核心池异常: {first_err}，尝试自愈刷新凭证并重试...", flush=True)
+                first_message = describe_upstream_error(first_err)
+                failure_kind = gemini_failure_kind(first_message)
+                print(
+                    f"⚠️ [Gemini Stream] 上游异常 ({failure_kind})，准备安全自愈并重试...",
+                    flush=True,
+                )
                 try:
-                    self.reset_proxies()
-                    self.refresh_pool_cookies()
+                    if failure_kind == "login":
+                        self.refresh_pool_cookies()
+                    else:
+                        self.reset_proxies()
                     resp = _LOCAL_OPENER.open(req, timeout=timeout)
                 except Exception as retry_err:
                     described = describe_upstream_error(retry_err)
@@ -1301,7 +1667,7 @@ class MultiAccountGeminiPool:
         messages: List[Dict[str, Any]],
         model: str = "gemini-3.8-flash",
         reasoning_level: str = "off",
-        timeout: int = 180,
+        timeout: int = 600,
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Any = None,
     ):
@@ -1342,10 +1708,17 @@ class MultiAccountGeminiPool:
             try:
                 resp = _LOCAL_OPENER.open(req, timeout=timeout)
             except Exception as first_err:
-                print(f"⚠️ [Gemini Stream] 连接 Go 核心池异常: {first_err}，尝试自愈刷新凭证并重试...", flush=True)
+                first_message = describe_upstream_error(first_err)
+                failure_kind = gemini_failure_kind(first_message)
+                print(
+                    f"⚠️ [Gemini Stream] 上游异常 ({failure_kind})，准备安全自愈并重试...",
+                    flush=True,
+                )
                 try:
-                    self.reset_proxies()
-                    self.refresh_pool_cookies()
+                    if failure_kind == "login":
+                        self.refresh_pool_cookies()
+                    else:
+                        self.reset_proxies()
                     resp = _LOCAL_OPENER.open(req, timeout=timeout)
                 except Exception as retry_err:
                     described = describe_upstream_error(retry_err)
@@ -1369,15 +1742,16 @@ class MultiAccountGeminiPool:
                         break
             if buffer and not stream_done:
                 yield buffer.decode("utf-8", errors="replace") + "\n"
-            try:
-                resp.close()
-            except Exception:
-                pass
         except Exception as e:
             described = describe_upstream_error(e)
             yield self._stream_error_event(RuntimeError(described))
             yield "data: [DONE]\n\n"
         finally:
+            if resp is not None:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
             self._pace.release(described)
 
     def pace_status(self) -> Dict[str, Any]:
@@ -1443,80 +1817,111 @@ class MultiAccountGeminiPool:
                 pass
         return True
 
-    def refresh_pool_cookies(self, account_id: Optional[int] = None, reload: bool = False) -> str:
-        """验证当前浏览器会话对应的 authuser/邮箱，只刷新身份匹配的账号。"""
+    def refresh_pool_cookies(self, account_id: Optional[int] = None) -> str:
+        """按 Google authuser 与已登记邮箱逐个验证，只刷新身份匹配的启用账号。"""
         self.proxy = _detect_local_proxy()
-        cookie_str = self._extract_cookie_header()
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         if account_id is None:
             rows = conn.execute(
-                "SELECT id, authuser, label, note FROM accounts WHERE status!='deleted' ORDER BY authuser"
+                "SELECT id, authuser, label, note FROM accounts "
+                "WHERE status='enabled' ORDER BY authuser"
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT id, authuser, label, note FROM accounts WHERE id=? AND status!='deleted'",
+                "SELECT id, authuser, label, note FROM accounts "
+                "WHERE id=? AND status='enabled'",
                 (account_id,),
             ).fetchall()
         conn.close()
 
         if not rows:
-            raise RuntimeError("没有找到可刷新的 Gemini 账号；数据库未修改。")
+            raise RuntimeError("没有找到可刷新的启用 Gemini 账号；数据库未修改。")
 
+        def validate_cookie(cookie_value: str):
+            validated = []
+            for row in rows:
+                authuser = int(row["authuser"] or 0)
+                try:
+                    _name, email = self.fetch_account_profile(
+                        authuser, cookie_override=cookie_value
+                    )
+                except Exception:
+                    continue
+                email = str(email or "").strip().lower()
+                if not email:
+                    continue
+
+                expected_match = re.search(
+                    r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+                    f"{row['label'] or ''} {row['note'] or ''}",
+                    re.I,
+                )
+                expected_email = expected_match.group(0).lower() if expected_match else ""
+                if expected_email and email != expected_email:
+                    continue
+                if not expected_email and len(rows) > 1:
+                    # 多账号池没有登记邮箱时，不能猜测浏览器会话属于哪个账号。
+                    continue
+                validated.append((int(row["id"]), authuser))
+            return validated
+
+        direct_error = None
+        cookie_str = ""
         validated = []
-        for row in rows:
-            authuser = int(row["authuser"] or 0)
-            name, email = self.fetch_account_profile(authuser, cookie_override=cookie_str)
-            email = str(email or "").strip().lower()
-            if not email:
-                continue
+        try:
+            cookie_str = self._extract_cookie_header()
+            validated = validate_cookie(cookie_str)
+        except Exception as exc:
+            direct_error = exc
 
-            expected_match = re.search(
-                r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
-                f"{row['label'] or ''} {row['note'] or ''}",
-                re.I,
-            )
-            expected_email = expected_match.group(0).lower() if expected_match else ""
-            if expected_email and email != expected_email:
-                continue
-            if not expected_email and len(rows) > 1:
-                # 多账号池中没有已登记邮箱，不能猜测这份浏览器会话属于谁。
-                continue
-            validated.append((int(row["id"]), authuser, name, email, bool(expected_email)))
+        # 当前 Cookie 无法匹配全部启用账号时，唤醒浏览器中的 AI Studio 页面，
+        # 让 Google 有机会续期会话，再重新读取扩展 Cookie 并逐个核验身份。
+        if len(validated) < len(rows):
+            try:
+                fresh_cookie = self._extract_cookie_header(auto_fetch=True)
+                fresh_validated = validate_cookie(fresh_cookie)
+                if fresh_validated and len(fresh_validated) >= len(validated):
+                    cookie_str = fresh_cookie
+                    validated = fresh_validated
+            except Exception as exc:
+                print(
+                    f"[Gemini Cookie Refresh] 浏览器会话唤醒未完成: {type(exc).__name__}",
+                    flush=True,
+                )
 
         if not validated:
+            reason = type(direct_error).__name__ if direct_error else "identity_mismatch"
             raise RuntimeError(
-                "当前 Cookie Hub 会话未能匹配任何已登记 Gemini 账号；未覆盖或启用任何账号。"
-                "请先在 Cookie Hub 所连接的浏览器登录对应 Google 账号，再按账号刷新。"
+                "当前 Cookie Hub 登录态未能匹配任何已登记的启用 Gemini 账号；"
+                f"未覆盖任何账号（原因: {reason}）。请确认浏览器已登录对应 Google 账号。"
             )
 
+        updated_ids = []
         conn = sqlite3.connect(self.db_path)
         try:
-            for row_id, authuser, name, email, had_expected_email in validated:
-                if had_expected_email:
-                    conn.execute(
-                        "UPDATE accounts SET cookie=?, status='enabled', fail_count=0, last_error='' WHERE id=?",
-                        (cookie_str, row_id),
-                    )
-                else:
-                    label = f"{name} ({email})" if name else email
-                    note = f"authuser={authuser} | {email}"
-                    conn.execute(
-                        "UPDATE accounts SET cookie=?, label=?, note=?, status='enabled', fail_count=0, last_error='' WHERE id=?",
-                        (cookie_str, label, note, row_id),
-                    )
+            for row_id, _authuser in validated:
+                cursor = conn.execute(
+                    "UPDATE accounts SET cookie=?, fail_count=0, last_error='', last_ok_at=? "
+                    "WHERE id=? AND status='enabled'",
+                    (cookie_str, int(time.time()), row_id),
+                )
+                if cursor.rowcount:
+                    updated_ids.append(row_id)
             conn.commit()
         finally:
             conn.close()
 
-        # 仅在至少一个账号完成身份匹配并成功更新后，才清理代理熔断状态。
+        if not updated_ids:
+            raise RuntimeError("身份核验通过，但没有启用账号完成更新；未报告同步成功。")
+
+        self._last_cookie_refresh_ids = updated_ids
         self.reset_proxies()
-        if reload:
-            with self._lifecycle_lock:
-                if self.is_running():
-                    self._release_port()
-                self._launch_process()
-            self.sync_account_profiles()
+        print(
+            f"[Gemini Cookie Refresh] 已验证并更新 {len(updated_ids)} 个启用账号 "
+            f"(IDs: {','.join(str(x) for x in updated_ids)})；未记录 Cookie 值。",
+            flush=True,
+        )
         return cookie_str
 
     def list_recent_requests(self, limit: int = 10) -> List[Dict[str, Any]]:

@@ -533,26 +533,62 @@ class ChatGPTReverseEngine:
         with self.opener.open(req, timeout=15) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
+    @staticmethod
+    def _extract_http_error(exc: urllib.error.HTTPError) -> RuntimeError:
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", errors="replace").strip()
+        except Exception:
+            body = ""
+        detail = body or str(exc)
+        if body:
+            try:
+                parsed = json.loads(body)
+                if isinstance(parsed, dict):
+                    err = parsed.get("error")
+                    if isinstance(err, dict) and err.get("message"):
+                        detail = str(err["message"])
+                    elif isinstance(parsed.get("detail"), dict) and parsed["detail"].get("error"):
+                        detail = str(parsed["detail"]["error"])
+                    elif parsed.get("detail"):
+                        detail = str(parsed["detail"])
+            except Exception:
+                pass
+        return RuntimeError(f"ChatGPT 逆向服务返回 HTTP {exc.code}: {detail}")
+
     def chat(
         self,
         messages: List[Dict[str, Any]],
         model: str = "auto",
         stream: bool = False,
         thinking_effort: str = "",
-        timeout: int = 180,
+        timeout: int = 240,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Any = None,
     ) -> Union[dict, Generator[dict, None, None]]:
         """调用逆向 /v1/chat/completions 接口对话"""
         if stream:
-            return self._stream_generator(messages, model, thinking_effort, timeout)
+            return self._stream_generator(
+                messages,
+                model,
+                thinking_effort,
+                timeout,
+                tools=tools,
+                tool_choice=tool_choice,
+            )
 
         url = f"{self.base_url}/v1/chat/completions"
-        payload_dict = {
+        payload_dict: Dict[str, Any] = {
             "model": model,
             "messages": messages,
             "stream": False,
         }
         if thinking_effort:
             payload_dict["thinking_effort"] = thinking_effort
+        if tools:
+            payload_dict["tools"] = tools
+        if tool_choice is not None:
+            payload_dict["tool_choice"] = tool_choice
 
         payload = json.dumps(payload_dict).encode("utf-8")
         req = urllib.request.Request(url, data=payload, headers=self._auth_headers())
@@ -560,47 +596,53 @@ class ChatGPTReverseEngine:
             with self.opener.open(req, timeout=timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            raise RuntimeError(self._format_http_error(exc)) from exc
+            raise self._extract_http_error(exc) from exc
 
     def _stream_generator(
         self,
         messages: List[Dict[str, Any]],
         model: str = "auto",
         thinking_effort: str = "",
-        timeout: int = 180,
+        timeout: int = 240,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Any = None,
     ) -> Generator[dict, None, None]:
         url = f"{self.base_url}/v1/chat/completions"
-        payload_dict = {
+        payload_dict: Dict[str, Any] = {
             "model": model,
             "messages": messages,
             "stream": True,
         }
         if thinking_effort:
             payload_dict["thinking_effort"] = thinking_effort
+        if tools:
+            payload_dict["tools"] = tools
+        if tool_choice is not None:
+            payload_dict["tool_choice"] = tool_choice
 
         payload = json.dumps(payload_dict).encode("utf-8")
         req = urllib.request.Request(url, data=payload, headers=self._auth_headers())
         try:
             resp = self.opener.open(req, timeout=timeout)
         except urllib.error.HTTPError as exc:
-            raise RuntimeError(self._format_http_error(exc)) from exc
+            raise self._extract_http_error(exc) from exc
 
-        def _iter_stream():
-            with resp:
-                for raw_line in resp:
-                    line = raw_line.decode("utf-8").strip()
-                    if not line or not line.startswith("data:"):
-                        continue
-                    data_str = line[5:].strip()
-                    if data_str == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(data_str)
-                        yield chunk
-                    except Exception:
-                        continue
-
-        return _iter_stream()
+        with resp:
+            for raw_line in resp:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line or not line.startswith("data:"):
+                    continue
+                data_str = line[5:].strip()
+                if data_str == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data_str)
+                except Exception:
+                    continue
+                if isinstance(chunk, dict) and isinstance(chunk.get("error"), dict):
+                    err_msg = chunk["error"].get("message") or json.dumps(chunk["error"], ensure_ascii=False)
+                    raise RuntimeError(str(err_msg))
+                yield chunk
 
     def generate_image(
         self,
@@ -906,7 +948,15 @@ class UnifiedChatGPTService:
         res = self.chat([{"role": "user", "content": prompt}], model=model, stream=False)
         return res["choices"][0]["message"]["content"]
 
-    def chat(self, messages: List[Dict[str, Any]], model: str = "auto", stream: bool = False, thinking_effort: str = "") -> Union[dict, Generator[dict, None, None]]:
+    def chat(
+        self,
+        messages: List[Dict[str, Any]],
+        model: str = "auto",
+        stream: bool = False,
+        thinking_effort: str = "",
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Any = None,
+    ) -> Union[dict, Generator[dict, None, None]]:
         """OpenAI 兼容对话调用接口：
         - 若模型显式包含 moni 或为 chatgpt-web / chatgpt-web-moni，强制走浏览器 DOM 模拟输入
         - 其他模型 (gpt-6, gpt-5-6, auto 等) 走 Web API 协议逆向直连，绝不静默降级到浏览器输入！
@@ -916,8 +966,53 @@ class UnifiedChatGPTService:
             return self.bridge.chat(messages, model="chatgpt-web", stream=stream)
 
         self.ensure_live_account()
+        auth_retry_keywords = ("429", "401", "403", "quota", "token", "unauthorized", "anon", "invalid")
+
+        if stream:
+            def _stream_with_retry():
+                emitted = False
+                try:
+                    for chunk in self.reverse.chat(
+                        messages,
+                        model=model,
+                        stream=True,
+                        thinking_effort=thinking_effort,
+                        tools=tools,
+                        tool_choice=tool_choice,
+                    ):
+                        emitted = True
+                        yield chunk
+                except Exception as first_err:
+                    err_msg = str(first_err).lower()
+                    retryable = (not emitted) and any(k in err_msg for k in auth_retry_keywords)
+                    if retryable and not self._resyncing:
+                        self._resyncing = True
+                        try:
+                            self.sync_token_from_browser()
+                            yield from self.reverse.chat(
+                                messages,
+                                model=model,
+                                stream=True,
+                                thinking_effort=thinking_effort,
+                                tools=tools,
+                                tool_choice=tool_choice,
+                            )
+                            return
+                        finally:
+                            self._resyncing = False
+                    raise first_err
+
+            return _stream_with_retry()
+
         try:
-            return self.reverse.chat(messages, model=model, stream=stream, thinking_effort=thinking_effort)
+            return self.reverse.chat(
+                messages,
+                model=model,
+                stream=False,
+                thinking_effort=thinking_effort,
+                tools=tools,
+                tool_choice=tool_choice,
+            )
         except Exception as first_err:
             err_msg = str(first_err).lower()
             is_env_proxy_err = any(
@@ -929,30 +1024,58 @@ class UnifiedChatGPTService:
             if is_env_proxy_err:
                 if self.reverse.restart():
                     try:
-                        return self.reverse.chat(messages, model=model, stream=stream, thinking_effort=thinking_effort)
+                        return self.reverse.chat(
+                            messages,
+                            model=model,
+                            stream=False,
+                            thinking_effort=thinking_effort,
+                            tools=tools,
+                            tool_choice=tool_choice,
+                        )
                     except Exception as restart_retry_err:
                         first_err = restart_retry_err
                         err_msg = str(restart_retry_err).lower()
             elif is_proxy_err or "502" in err_msg:
                 if self.reverse.apply_proxy(force=True):
                     try:
-                        return self.reverse.chat(messages, model=model, stream=stream, thinking_effort=thinking_effort)
+                        return self.reverse.chat(
+                            messages,
+                            model=model,
+                            stream=False,
+                            thinking_effort=thinking_effort,
+                            tools=tools,
+                            tool_choice=tool_choice,
+                        )
                     except Exception as proxy_retry_err:
                         first_err = proxy_retry_err
                         err_msg = str(proxy_retry_err).lower()
                         if any(k in err_msg for k in ("proxyerror", "unable to connect to proxy", "winerror 10061", "failed to connect", "proxyconnect", "curl: (7)")):
                             if self.reverse.restart():
                                 try:
-                                    return self.reverse.chat(messages, model=model, stream=stream, thinking_effort=thinking_effort)
+                                    return self.reverse.chat(
+                                        messages,
+                                        model=model,
+                                        stream=False,
+                                        thinking_effort=thinking_effort,
+                                        tools=tools,
+                                        tool_choice=tool_choice,
+                                    )
                                 except Exception as restart_retry_err:
                                     first_err = restart_retry_err
                                     err_msg = str(restart_retry_err).lower()
-            retryable = any(k in err_msg for k in ("429", "401", "403", "502", "quota", "token", "unauthorized", "anon", "invalid"))
+            retryable = any(k in err_msg for k in auth_retry_keywords) or ("502" in err_msg)
             if retryable and not self._resyncing:
                 self._resyncing = True
                 try:
                     self.sync_token_from_browser()
-                    return self.reverse.chat(messages, model=model, stream=stream, thinking_effort=thinking_effort)
+                    return self.reverse.chat(
+                        messages,
+                        model=model,
+                        stream=False,
+                        thinking_effort=thinking_effort,
+                        tools=tools,
+                        tool_choice=tool_choice,
+                    )
                 finally:
                     self._resyncing = False
             raise first_err

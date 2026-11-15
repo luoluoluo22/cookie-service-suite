@@ -232,7 +232,7 @@ class TrayAppServer:
                 break
             for pid in pids:
                 print(f"⚠️ [API 服务] 端口 {port} 被旧进程 (PID: {pid}) 占用，正在释放...", flush=True)
-                subprocess.run(f'taskkill /F /PID {pid}', shell=True, capture_output=True)
+                subprocess.run(f'taskkill /F /PID {pid}', shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             time.sleep(1.5)
 
     def start_api_server(self):

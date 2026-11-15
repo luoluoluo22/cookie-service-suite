@@ -9,11 +9,13 @@ echo ================================================================
 echo.
 echo [*] 正在后台启动 API 服务 (http://127.0.0.1:18800) 与系统托盘...
 
-set "PYW_EXE=pythonw"
-if exist "%LOCALAPPDATA%\Programs\Python\Python314\pythonw.exe" (
-    set "PYW_EXE=%LOCALAPPDATA%\Programs\Python\Python314\pythonw.exe"
-) else (
-    where pythonw >nul 2>nul && set "PYW_EXE=pythonw"
+set "PYW_EXE=%~dp0.venv\Scripts\pythonw.exe"
+if not exist "%PYW_EXE%" (
+    if exist "%LOCALAPPDATA%\Programs\Python\Python314\pythonw.exe" (
+        set "PYW_EXE=%LOCALAPPDATA%\Programs\Python\Python314\pythonw.exe"
+    ) else (
+        where pythonw >nul 2>nul && set "PYW_EXE=pythonw"
+    )
 )
 
 start "" "%PYW_EXE%" "%~dp0run_service.py"
