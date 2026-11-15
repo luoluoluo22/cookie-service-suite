@@ -34,10 +34,17 @@ from chatgpt_service import chatgpt_service, UnifiedChatGPTService, ChatGPTBridg
 from bilibili_service import BilibiliService
 from baidu_pan_service import BaiduPanService
 from suno_service import SunoService, suno_service
-from login_status import collect_login_status, failure_payload, gemini_failure_should_retry
+from login_status import collect_login_status, failure_payload, gemini_failure_should_retry, gemini_failure_kind
 from minimax_service import MinimaxAudioService, minimax_service, PRESET_VOICES, OPENAI_VOICE_MAP
 from aistudio_service import aistudio_service, AIStudioService
+from chat_history_manager import chat_history_manager, wrap_chat_stream
 from opencode_export import export_to_file
+from gpt_tool_bridge import (
+    has_tool_protocol,
+    prepare_tool_messages,
+    adapt_stream_chunks,
+    adapt_completion_response,
+)
 from autostart import (
     is_autostart_enabled,
     enable_autostart,
@@ -365,13 +372,17 @@ def open_project_directory():
 # ==========================================
 # 2. Google Gemini 多账号池统一调度接口
 # ==========================================
-@app.get("/api/gemini/models", summary="读取 Gemini 网页当前模型选择器", tags=["Gemini 多账号调度"])
+@app.get("/api/gemini/models", summary="读取 Gemini 网页当前模型选择器 (支持对话与任务模式)", tags=["Gemini 多账号调度"])
 def list_gemini_models():
-    """返回当前登录账号在 gemini.google.com 上能看到的模型，名字与网页选择器一致。"""
+    """返回当前登录账号在 gemini.google.com 上能看到的模型，区分「对话」与「任务」两套官方选择器。"""
     models = gemini_pool.list_web_models()
+    task_models = gemini_pool.list_task_models()
     return {
         "source": "web",
         "models": models,
+        "chat_models": models,
+        "task_models": task_models,
+        "active_modes": ["chat", "task"],
         "service_running": gemini_pool.is_running(),
     }
 
@@ -452,10 +463,19 @@ def gemini_chat(req: ChatRequest):
 
     # 1. 默认优先走实时流式输出 (SSE)：首字毫秒级直出，体验与真实网页端一致
     if req.stream:
+        stream_gen = gemini_pool.stream_chat(
+            prompt=req.prompt, model=req.model, reasoning_level=reasoning, timeout=effective_timeout
+        )
+        wrapped_gen = wrap_chat_stream(
+            stream_gen,
+            endpoint="/api/gemini/chat",
+            model=req.model or "gemini-4-hydrogen",
+            messages=req.prompt,
+            actual_model=req.model or "gemini-4-hydrogen",
+            meta={"reasoning_level": reasoning}
+        )
         return StreamingResponse(
-            gemini_pool.stream_chat(
-                prompt=req.prompt, model=req.model, reasoning_level=reasoning, timeout=effective_timeout
-            ),
+            wrapped_gen,
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -476,17 +496,20 @@ def gemini_chat(req: ChatRequest):
             print(f"⚠️ [Gemini Chat] 账号 {res.get('account_label')} 返回通用拒绝文案: '{refusal_text}'，自动切换下一个账号重试...", flush=True)
             raise RuntimeError(f"Google 上游会话软拒绝: {refusal_text}")
     except Exception as first_err:
-        if not gemini_failure_should_retry(str(first_err)):
+        failure_kind = gemini_failure_kind(str(first_err))
+        if failure_kind == "login":
+            print("[Gemini Chat] 检测到登录态失效，正在从 Cookie Hub 刷新身份匹配的账号...", flush=True)
+        elif not gemini_failure_should_retry(str(first_err)):
             _gemini_stop(str(first_err))
-        print(f"⚠️ [Gemini Chat] 调度异常: {first_err}，尝试自愈并轮换至下一账号重试...", flush=True)
-        # 自动故障自愈：重置代理熔断计数 + 刷新最新 Cookie 凭证后重试一次
+        print(f"⚠️ [Gemini Chat] 调度异常 ({failure_kind})，尝试自愈并重试...", flush=True)
         try:
-            gemini_pool.reset_proxies()
-            gemini_pool.refresh_pool_cookies()
+            if failure_kind == "login":
+                gemini_pool.refresh_pool_cookies()
+            else:
+                gemini_pool.reset_proxies()
             res = gemini_pool.ask_with_details(
                 prompt=req.prompt, model=req.model, reasoning_level=reasoning, timeout=effective_timeout
             )
-            # 若重试仍然返回通用拒绝，再次尝试轮换
             if is_upstream_refusal(res.get("reply")):
                 print(f"⚠️ [Gemini Chat] 账号 {res.get('account_label')} 依然返回拒绝，发起备用轮转...", flush=True)
                 res = gemini_pool.ask_with_details(
@@ -495,6 +518,23 @@ def gemini_chat(req: ChatRequest):
         except Exception as retry_err:
             detail_msg = f"Gemini 调度调用失败: {first_err} (自愈重试亦未成功: {retry_err})"
             _service_error(502, detail_msg, "gemini")
+
+    chat_history_manager.record_chat(
+        endpoint="/api/gemini/chat",
+        model=res.get("model") or req.model or "gemini-4-hydrogen",
+        messages=req.prompt,
+        response_text=res.get("reply", ""),
+        status=200,
+        latency_ms=res.get("took_ms", 0),
+        is_stream=False,
+        actual_model=res.get("model") or req.model or "gemini-4-hydrogen",
+        meta={
+            "account_id": res.get("account_id"),
+            "account_label": res.get("account_label"),
+            "authuser": res.get("authuser"),
+            "reasoning_level": res.get("reasoning_level")
+        }
+    )
 
     return {
         "success": True,
@@ -532,25 +572,19 @@ def rotate_gemini_account(account_id: int = Path(..., description="账号自增 
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/gemini/refresh", summary="从前台浏览器提取最新凭证并热更新账号池", tags=["Gemini 多账号调度"])
-def refresh_gemini_cookies():
-    """从 Cookie Hub (18888) 提取浏览器内最新鉴权 Cookie 并批量写入 SQLite 数据库。"""
+@app.post("/api/gemini/refresh", summary="按 Google 登录身份验证后刷新匹配的 Gemini 账号", tags=["Gemini 多账号调度"])
+def refresh_gemini_cookies(account_id: Optional[int] = Query(None, ge=1, description="可选：只验证并刷新指定启用账号 ID")):
+    """先读取浏览器 Cookie，再逐个核验 authuser/邮箱；只更新身份匹配的启用账号。"""
     try:
-        cookie_str = gemini_pool.refresh_pool_cookies(reload=True)
-        accounts = gemini_pool.list_accounts()
-        named = [item for item in accounts if item.get("email")]
+        gemini_pool.refresh_pool_cookies(account_id=account_id)
+        updated_ids = getattr(gemini_pool, "_last_cookie_refresh_ids", [])
         return {
             "success": True,
-            "message": f"已同步浏览器凭证，识别到 {len(named)} 个 Google 账号。",
-            "cookie_length": len(cookie_str),
-            "accounts": [
-                {"id": item.get("id"), "name": item.get("name"), "email": item.get("email"), "auth_user": item.get("auth_user")}
-                for item in named
-            ],
+            "message": f"浏览器登录态已验证；仅更新身份匹配的启用账号（{len(updated_ids)} 个）。",
+            "updated_account_ids": updated_ids,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"凭证刷新失败: {str(e)}")
-
 
 @app.get("/api/gemini/requests", summary="获取最近请求调度轨迹与各账号响应历史", tags=["Gemini 多账号调度"])
 def get_gemini_recent_requests(limit: int = Query(20, description="返回条数上限")):
@@ -655,20 +689,30 @@ def sync_chatgpt_browser_token():
 @app.post("/api/chatgpt/chat", summary="向 ChatGPT 发起智能对话 (支持逆向与桥接双引擎)", tags=["ChatGPT 逆向与号池"])
 def chatgpt_ask(req: ChatRequest):
     """优先使用无头逆向引擎直连，若未就绪则自动降级到浏览器同源扩展。支持流式与非流式。"""
+    start_t = time.time()
+    target_model = req.model or "auto"
     try:
         if req.stream:
             def _chatgpt_sse_gen():
                 messages = [{"role": "user", "content": req.prompt}]
                 try:
-                    for chunk in chatgpt_client.chat(messages, model=req.model or "auto", stream=True):
+                    for chunk in chatgpt_client.chat(messages, model=target_model, stream=True):
                         yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                     yield "data: [DONE]\n\n"
                 except Exception as e:
                     err_data = {"error": {"message": str(e), "type": "chatgpt_error"}}
                     yield f"data: {json.dumps(err_data, ensure_ascii=False)}\n\n"
 
-            return StreamingResponse(
+            wrapped_gen = wrap_chat_stream(
                 _chatgpt_sse_gen(),
+                endpoint="/api/chatgpt/chat",
+                model=target_model,
+                messages=req.prompt,
+                actual_model=target_model
+            )
+
+            return StreamingResponse(
+                wrapped_gen,
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -677,7 +721,18 @@ def chatgpt_ask(req: ChatRequest):
                 }
             )
 
-        reply = chatgpt_client.ask(req.prompt, model=req.model or "auto")
+        reply = chatgpt_client.ask(req.prompt, model=target_model)
+        latency = int((time.time() - start_t) * 1000)
+        chat_history_manager.record_chat(
+            endpoint="/api/chatgpt/chat",
+            model=target_model,
+            messages=req.prompt,
+            response_text=reply,
+            status=200,
+            latency_ms=latency,
+            is_stream=False,
+            actual_model=target_model
+        )
         return {"success": True, "reply": reply}
     except Exception as e:
         _service_error(502, f"ChatGPT 提问失败: {str(e)}", "chatgpt")
@@ -787,16 +842,25 @@ def aistudio_chat(req: AIStudioChatRequest):
     通过 Google AI Studio Playground 逆向原生通道调用 Gemini 大模型，
     支持 gemini-4-argon, gemini-3.8-flash 等全系列模型，支持流式 SSE 打字机输出。
     """
+    start_t = time.time()
+    target_model = req.model or "gemini-4-argon"
     try:
         if req.stream:
             stream_gen = aistudio_client.chat(
                 prompt=req.prompt,
-                model=req.model or "gemini-4-argon",
+                model=target_model,
                 stream=True,
                 timeout=req.timeout or 120,
             )
-            return StreamingResponse(
+            wrapped_gen = wrap_chat_stream(
                 stream_gen,
+                endpoint="/api/aistudio/chat",
+                model=target_model,
+                messages=req.prompt,
+                actual_model=target_model
+            )
+            return StreamingResponse(
+                wrapped_gen,
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -807,9 +871,20 @@ def aistudio_chat(req: AIStudioChatRequest):
         else:
             result = aistudio_client.chat(
                 prompt=req.prompt,
-                model=req.model or "gemini-4-argon",
+                model=target_model,
                 stream=False,
                 timeout=req.timeout or 120,
+            )
+            latency = int((time.time() - start_t) * 1000)
+            chat_history_manager.record_chat(
+                endpoint="/api/aistudio/chat",
+                model=target_model,
+                messages=req.prompt,
+                response_text=str(result) if not isinstance(result, dict) else json.dumps(result, ensure_ascii=False),
+                status=200,
+                latency_ms=latency,
+                is_stream=False,
+                actual_model=target_model
             )
             return {"success": True, "result": result}
     except Exception as e:
@@ -1087,6 +1162,7 @@ def openai_chat_completions(req: OpenAIChatRequest):
     - gpt-* / chatgpt-* / auto 自动分发至 ChatGPT 逆向号池或同源扩展桥接；
     - 支持 stream=True 标准 SSE 流式输出。
     """
+    start_t = time.time()
     last_user_msg = next((m.content for m in reversed(req.messages) if m.role == "user"), "")
     if not last_user_msg:
         raise HTTPException(status_code=400, detail="未包含有效的 user 消息")
@@ -1101,14 +1177,22 @@ def openai_chat_completions(req: OpenAIChatRequest):
         messages_payload = [{"role": m.role, "content": m.content} for m in req.messages]
         req_timeout = getattr(req, "timeout", None) or 120
         if req.stream:
+            stream_gen = aistudio_client.chat(
+                prompt=last_user_msg,
+                model=actual_model,
+                stream=True,
+                messages=messages_payload,
+                timeout=req_timeout,
+            )
+            wrapped_gen = wrap_chat_stream(
+                stream_gen,
+                endpoint="/v1/chat/completions",
+                model=req.model or "gemini-4-argon",
+                messages=messages_payload,
+                actual_model=actual_model
+            )
             return StreamingResponse(
-                aistudio_client.chat(
-                    prompt=last_user_msg,
-                    model=actual_model,
-                    stream=True,
-                    messages=messages_payload,
-                    timeout=req_timeout,
-                ),
+                wrapped_gen,
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -1125,6 +1209,22 @@ def openai_chat_completions(req: OpenAIChatRequest):
                     messages=messages_payload,
                     timeout=req_timeout,
                 )
+                latency = int((time.time() - start_t) * 1000)
+                reply_text = ""
+                if isinstance(res, dict):
+                    choices = res.get("choices", [])
+                    if choices and isinstance(choices[0], dict):
+                        reply_text = choices[0].get("message", {}).get("content", "")
+                chat_history_manager.record_chat(
+                    endpoint="/v1/chat/completions",
+                    model=req.model or "gemini-4-argon",
+                    messages=messages_payload,
+                    response_text=reply_text,
+                    status=200,
+                    latency_ms=latency,
+                    is_stream=False,
+                    actual_model=actual_model
+                )
                 return res
             except Exception as e:
                 _service_error(502, f"AI Studio 兼容接口调用失败: {str(e)}", "aistudio")
@@ -1140,14 +1240,23 @@ def openai_chat_completions(req: OpenAIChatRequest):
         extra = req.model_extra or {}
 
         if req.stream:
+            stream_gen = gemini_pool.stream_chat_messages(
+                messages=messages_payload,
+                model=target_model,
+                reasoning_level=reasoning,
+                tools=extra.get("tools"),
+                tool_choice=extra.get("tool_choice"),
+            )
+            wrapped_gen = wrap_chat_stream(
+                stream_gen,
+                endpoint="/v1/chat/completions",
+                model=req.model or target_model,
+                messages=messages_payload,
+                actual_model=target_model,
+                meta={"reasoning_level": reasoning}
+            )
             return StreamingResponse(
-                gemini_pool.stream_chat_messages(
-                    messages=messages_payload,
-                    model=target_model,
-                    reasoning_level=reasoning,
-                    tools=extra.get("tools"),
-                    tool_choice=extra.get("tool_choice"),
-                ),
+                wrapped_gen,
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -1161,10 +1270,16 @@ def openai_chat_completions(req: OpenAIChatRequest):
                 prompt=last_user_msg, model=target_model, reasoning_level=reasoning
             )
         except Exception as first_err:
-            if not gemini_failure_should_retry(str(first_err)):
+            failure_kind = gemini_failure_kind(str(first_err))
+            if failure_kind == "login":
+                print("[Gemini OpenAI] 检测到登录态失效，正在从 Cookie Hub 刷新身份匹配的账号...", flush=True)
+            elif not gemini_failure_should_retry(str(first_err)):
                 _gemini_stop(str(first_err))
             try:
-                gemini_pool.refresh_pool_cookies()
+                if failure_kind == "login":
+                    gemini_pool.refresh_pool_cookies()
+                else:
+                    gemini_pool.reset_proxies()
                 res = gemini_pool.ask_with_details(
                     prompt=last_user_msg, model=target_model, reasoning_level=reasoning
                 )
@@ -1172,6 +1287,21 @@ def openai_chat_completions(req: OpenAIChatRequest):
                 _service_error(502, f"Gemini 兼容接口调用失败: {str(retry_err)}", "gemini")
 
         cid = f"chatcmpl-gemini-{int(time.time()*1000)}"
+        chat_history_manager.record_chat(
+            endpoint="/v1/chat/completions",
+            model=req.model or target_model,
+            messages=messages_payload,
+            response_text=res.get("reply", ""),
+            status=200,
+            latency_ms=res.get("took_ms", 0),
+            is_stream=False,
+            actual_model=target_model,
+            meta={
+                "account_id": res.get("account_id"),
+                "account_label": res.get("account_label"),
+                "authuser": res.get("authuser"),
+            }
+        )
         return {
             "id": cid,
             "object": "chat.completion",
@@ -1208,29 +1338,204 @@ def openai_chat_completions(req: OpenAIChatRequest):
     else:
         target_gpt_model = "auto"
 
-    messages_payload = [{"role": m.role, "content": m.content} for m in req.messages]
+    audit_messages = [m.model_dump(exclude_none=True) for m in req.messages]
     effort = req.reasoning_effort or req.reasoning_level or ""
+    extra = req.model_extra or {}
+    tools = extra.get("tools")
+    tool_choice = extra.get("tool_choice")
+
+    use_tool_bridge = (
+        target_gpt_model != "chatgpt-web-moni"
+        and has_tool_protocol(audit_messages, tools)
+    )
+    allowed_tool_names = None
+    tool_mode = "auto"
+    upstream_messages = audit_messages
+    upstream_tools = tools
+    upstream_tool_choice = tool_choice
+    if use_tool_bridge:
+        upstream_messages, allowed_tool_names, tool_mode = prepare_tool_messages(
+            audit_messages,
+            tools=tools,
+            tool_choice=tool_choice,
+        )
+        # Prompt-level tool bridge handles tool schemas directly; do not pass raw
+        # `tools` to chatgpt2api, which would otherwise inject TOOL_UNAVAILABLE_SYSTEM_MESSAGE.
+        upstream_tools = None
+        upstream_tool_choice = None
 
     if req.stream:
+        upstream_iter = chatgpt_client.chat(
+            upstream_messages,
+            model=target_gpt_model,
+            stream=True,
+            thinking_effort=effort,
+            tools=upstream_tools,
+            tool_choice=upstream_tool_choice,
+        )
+        if use_tool_bridge:
+            stream_iter = iter(
+                adapt_stream_chunks(
+                    upstream_iter,
+                    model=req.model or target_gpt_model,
+                    allowed_names=allowed_tool_names,
+                    mode=tool_mode,
+                )
+            )
+        else:
+            stream_iter = iter(upstream_iter)
+        try:
+            first_chunk = next(stream_iter)
+        except StopIteration:
+            latency = int((time.time() - start_t) * 1000)
+            err_msg = "ChatGPT 上游流式返回为空，未产生任何输出"
+            chat_history_manager.record_chat(
+                endpoint="/v1/chat/completions",
+                model=req.model or target_gpt_model,
+                messages=audit_messages,
+                response_text="",
+                status=502,
+                latency_ms=latency,
+                is_stream=True,
+                actual_model=target_gpt_model,
+                error_message=err_msg,
+            )
+            return JSONResponse(
+                status_code=502,
+                content={"error": {"message": err_msg, "type": "upstream_error", "code": "empty_stream"}},
+            )
+        except Exception as e:
+            latency = int((time.time() - start_t) * 1000)
+            err_msg = str(e)
+            low = err_msg.lower()
+            is_too_large = ("status=413" in low) or ("payload too large" in low) or ("request entity too large" in low)
+            is_timeout = ("timed out" in low or "timeout" in low or "超时" in err_msg)
+            err_status = 400 if is_too_large else (504 if is_timeout else 502)
+            chat_history_manager.record_chat(
+                endpoint="/v1/chat/completions",
+                model=req.model or target_gpt_model,
+                messages=audit_messages,
+                response_text="",
+                status=err_status,
+                latency_ms=latency,
+                is_stream=True,
+                actual_model=target_gpt_model,
+                error_message=err_msg,
+            )
+            return JSONResponse(
+                status_code=err_status,
+                content={
+                    "error": {
+                        "message": err_msg,
+                        "type": "invalid_request_error" if is_too_large else ("timeout_error" if err_status == 504 else "upstream_error"),
+                        "code": "context_length_exceeded" if is_too_large else str(err_status),
+                    }
+                },
+            )
+
         def _sse_generator():
             try:
-                for chunk in chatgpt_client.chat(messages_payload, model=target_gpt_model, stream=True, thinking_effort=effort):
+                yield f"data: {json.dumps(first_chunk, ensure_ascii=False)}\n\n"
+                for chunk in stream_iter:
                     yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                 yield "data: [DONE]\n\n"
             except Exception as e:
                 err_data = {"error": {"message": str(e), "type": "chatgpt_error"}}
                 yield f"data: {json.dumps(err_data, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
 
-        return StreamingResponse(_sse_generator(), media_type="text/event-stream")
+        wrapped_gen = wrap_chat_stream(
+            _sse_generator(),
+            endpoint="/v1/chat/completions",
+            model=req.model or target_gpt_model,
+            messages=audit_messages,
+            actual_model=target_gpt_model,
+            start_time=start_t,
+        )
+        return StreamingResponse(
+            wrapped_gen,
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     try:
-        res = chatgpt_client.chat(messages_payload, model=target_gpt_model, stream=False, thinking_effort=effort)
+        res = chatgpt_client.chat(
+            upstream_messages,
+            model=target_gpt_model,
+            stream=False,
+            thinking_effort=effort,
+            tools=upstream_tools,
+            tool_choice=upstream_tool_choice,
+        )
+        if use_tool_bridge:
+            res = adapt_completion_response(res, allowed_names=allowed_tool_names, mode=tool_mode)
+        latency = int((time.time() - start_t) * 1000)
+        reply_content = ""
+        if isinstance(res, dict):
+            choices = res.get("choices", [])
+            if choices and isinstance(choices[0], dict):
+                msg_obj = choices[0].get("message", {})
+                reply_content = msg_obj.get("content") or ""
+                if not reply_content and isinstance(msg_obj.get("tool_calls"), list):
+                    reply_content = " ".join(
+                        f"[tool_call: {tc.get('function', {}).get('name')}({tc.get('function', {}).get('arguments', '{}')})]"
+                        for tc in msg_obj["tool_calls"]
+                        if isinstance(tc, dict)
+                    )
+        chat_history_manager.record_chat(
+            endpoint="/v1/chat/completions",
+            model=req.model or target_gpt_model,
+            messages=audit_messages,
+            response_text=reply_content,
+            status=200,
+            latency_ms=latency,
+            is_stream=False,
+            actual_model=target_gpt_model
+        )
         return res
     except Exception as e:
+        if use_tool_bridge:
+            latency = int((time.time() - start_t) * 1000)
+            err_msg = str(e)
+            low = err_msg.lower()
+            is_too_large = ("status=413" in low) or ("payload too large" in low) or ("request entity too large" in low)
+            err_status = 400 if is_too_large else 502
+            chat_history_manager.record_chat(
+                endpoint="/v1/chat/completions",
+                model=req.model or target_gpt_model,
+                messages=audit_messages,
+                response_text="",
+                status=err_status,
+                latency_ms=latency,
+                is_stream=False,
+                actual_model=target_gpt_model,
+                error_message=err_msg,
+            )
+            if is_too_large:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": {"message": err_msg, "type": "invalid_request_error", "code": "context_length_exceeded"}},
+                )
+            _service_error(502, f"ChatGPT 工具调用桥接失败: {err_msg}", "chatgpt")
         # 降级尝试单句提问
         try:
             reply = chatgpt_client.ask(last_user_msg, model=target_gpt_model)
+            latency = int((time.time() - start_t) * 1000)
             cid = f"chatcmpl-gpt-{int(time.time()*1000)}"
+            chat_history_manager.record_chat(
+                endpoint="/v1/chat/completions",
+                model=req.model or target_gpt_model,
+                messages=audit_messages,
+                response_text=reply,
+                status=200,
+                latency_ms=latency,
+                is_stream=False,
+                actual_model=target_gpt_model
+            )
             return {
                 "id": cid,
                 "object": "chat.completion",
@@ -1250,6 +1555,18 @@ def openai_chat_completions(req: OpenAIChatRequest):
                 },
             }
         except Exception as fallback_err:
+            latency = int((time.time() - start_t) * 1000)
+            chat_history_manager.record_chat(
+                endpoint="/v1/chat/completions",
+                model=req.model or target_gpt_model,
+                messages=audit_messages,
+                response_text="",
+                status=502,
+                latency_ms=latency,
+                is_stream=False,
+                actual_model=target_gpt_model,
+                error_message=str(fallback_err),
+            )
             _service_error(502, f"ChatGPT 兼容调用失败: {str(fallback_err)}", "chatgpt")
 
 
@@ -1297,32 +1614,35 @@ def openai_audio_speech(body: OpenAISpeechRequest):
         raise HTTPException(status_code=500, detail=f"语音合成失败: {str(e)}")
 
 
-# 模型元数据中文描述字典 (区分日常聊天 Chat 与工作台 Work 专有模型)
+# 模型元数据中文描述字典 (保留全部官方模型及 Plus/Work 专有模型，底层不剥夺)
 REVERSE_MODEL_DESCRIPTIONS = {
     # --- 语音合成模型 (MiniMax TTS: OpenAI 兼容) ---
     "speech-01-hd": "[超自然语音/TTS] MiniMax 海螺语音 HD 高保真自然拟真模型",
     "speech-02-hd": "[超自然语音/TTS] MiniMax 旗舰超自然语音合成模型",
     "tts-1": "[语音合成/TTS] OpenAI 兼容快速语音合成 (由 MiniMax 驱动)",
     "tts-1-hd": "[语音合成/TTS] OpenAI 兼容高保真语音合成 (由 MiniMax 驱动)",
-    # --- 日常聊天专有模型 (Chat Mode: is_work_mode_model = false) ---
-    "auto": "[日常聊天/Auto] ChatGPT 智能自动优选模型",
-    "gpt-6-thinking": "[思考/旧标识] 当前免费账号的模型列表里没有这个 slug，请改用 gpt-6-t-mini",
-    "gpt-6": "[免费账号/不思考] Instant，选择器短名「6 Instant」，适用于日常聊天。官方备注会自动决定思考时长，不是专用思考模型。",
+
+    # --- 日常聊天模型 (免费账号正式露出与高频主选) ---
+    "auto": "[日常聊天/Auto] Auto 智能自动优选模型",
+    "gpt-6": "[日常聊天/Instant] 6 Instant 官方日常聊天模型 (自动决定思考时长)",
+    "gpt-6-t-mini": "[深度思考/Thinking] 6 Thinking 快速深度思考模型",
     "gpt-6-instant": "[极速响应/Chat] GPT-6 极速即时响应模型",
-    "gpt-6-mini": "[不思考] reasoning_type=none。当前免费选择器没有单独露出这一项。",
-    "gpt-6-t-mini": "[免费账号/思考] Thinking mini，选择器短名「6 Thinking」，官方说明是快速思考。这是当前免费账号里的思考模型。",
-    "gpt-6-t-mini-mini": "[思考] 更小的思考档。当前免费选择器没有单独露出，露出的思考模型是 gpt-6-t-mini。",
-    "gpt-5-6-thinking": "[思考/旧标识] 当前免费账号的模型列表里没有这个 slug",
-    "gpt-5-6": "[自动] reasoning_type=auto。账号列表里有，不是免费选择器的两个主模型。",
+    "gpt-6-thinking": "[深度思考/Chat] GPT-6 深度思考模型",
+    "gpt-6-mini": "[轻量不思考/Mini] GPT-6 纯轻量不思考模型",
+    "gpt-6-t-mini-mini": "[微缩思考/Mini] GPT-6 微缩思考模型",
+
+    # --- Plus / 高阶 / 深度推理模型 (保留支持，Plus 账号可见) ---
+    "gpt-5-6": "[深度推理/Luna] GPT-5.6 Luna 深度推理模型",
+    "gpt-5-6-thinking": "[深度思考/旧标识] GPT-5.6 思考模型",
     "gpt-5-6-instant": "[极速响应/Chat] GPT-5.6 极速即时响应模型",
-    "gpt-5-6-mini": "[不思考] reasoning_type=none。不是免费选择器里的两个主模型。",
-    "gpt-5-6-t-mini": "[思考] reasoning_type=reasoning。不是免费选择器当前露出的思考档。",
-    "gpt-5-6-t-mini-mini": "[思考] reasoning_type=reasoning。不是免费选择器当前露出的思考档。",
-    "research": "[学术研报/Research] ChatGPT 全网深度学术与研报挖掘模型 (Deep Research)",
+    "gpt-5-6-mini": "[轻量不思考/Mini] GPT-5.6 纯轻量不思考模型",
+    "gpt-5-6-t-mini": "[轻量思考/Mini] GPT-5.6 轻量思考模型",
+    "gpt-5-6-t-mini-mini": "[微缩思考/Mini] GPT-5.6 微缩思考模型",
+    "research": "[学术研报/Plus专享] Deep Research 全网深度学术与研报挖掘模型",
     "gpt-image-2": "[文生图/Image] ChatGPT 官方逆向绘图专用 (DALL-E 3)",
     "codex-gpt-image-2": "[高清绘图/Codex] ChatGPT Codex 高清画图专用",
 
-    # --- Work 协同工作台专有模型 (Work Mode: is_work_mode_model = true, 官方带 -wm 后缀) ---
+    # --- Work 协同工作台专有模型 (Work Mode: is_work_mode_model = true, 官方带 -wm 后缀，Plus专享) ---
     "gpt-6-sol-wm": "[工作台专有/Work] GPT-6 Sol 协同工作区模型",
     "gpt-6-luna-wm": "[工作台专有/Work] GPT-6 Luna 协同工作区模型",
     "gpt-6-astra-wm": "[工作台专有/Work] GPT-6 Astra 协同工作区模型",
@@ -1440,16 +1760,25 @@ def _gemini_catalog_rows():
 
 @app.post("/api/export/opencode", summary="把当前对话模型写入 OpenCode 配置", tags=["系统管理"])
 def export_opencode(set_default: bool = Query(False, description="是否把默认模型改成 cookie-suite/gemini-3.5-flash-lite")):
-    """按本机 OpenCode 1.18 的 provider 格式合并写入 ~/.config/opencode/opencode.json。"""
+    """按本机 OpenCode 1.18 的 provider 格式合并写入 ~/.config/opencode/opencode.json。
+    区分免费版与 Plus 版展示：免费版仅展示官方前台主力模型，Plus 账号额外展示高阶专享模型。
+    """
     catalog = openai_models()
     raw = catalog.get("data") if isinstance(catalog, dict) else []
+    plan = "free"
     try:
-        result = export_to_file(raw or [], set_default=set_default)
+        hint = chatgpt_client.public_account()
+        if hint and hint.get("plan"):
+            plan = str(hint.get("plan")).lower()
+    except Exception:
+        pass
+    try:
+        result = export_to_file(raw or [], set_default=set_default, plan=plan)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"写入 OpenCode 配置失败: {exc}")
     return {
         "success": True,
-        "message": f"已写入 OpenCode，共 {result['count']} 个对话模型。",
+        "message": f"已写入 OpenCode，共 {result['count']} 个对话模型（当前方案: {plan}）。",
         **result,
     }
 
@@ -1545,15 +1874,72 @@ def openai_models():
 
 
 # ==========================================
-# 8. 现代化 Web 控制台 (Management Dashboard)
+# 8. 对话历史与审计接口 (/api/history/*)
 # ==========================================
-from dashboard_template import DASHBOARD_HTML
+@app.get("/api/history/chats", summary="获取历史对话列表 (分页/筛选/大小统计)", tags=["对话历史审计"])
+def get_chat_history(
+    page: int = Query(1, ge=1, description="当前页码"),
+    page_size: int = Query(15, ge=1, le=100, description="每页条数"),
+    model: Optional[str] = Query(None, description="模型名称筛选"),
+    keyword: Optional[str] = Query(None, description="关键词搜索 (提示词/回复内容/ID)"),
+    status: Optional[int] = Query(None, description="状态码筛选")
+):
+    return chat_history_manager.list_chats(
+        page=page, page_size=page_size, model=model, keyword=keyword, status=status
+    )
+
+
+@app.get("/api/history/chats/{chat_id}", summary="获取单条对话完整上下文与回复详情", tags=["对话历史审计"])
+def get_chat_history_detail(chat_id: int):
+    detail = chat_history_manager.get_chat_detail(chat_id)
+    if not detail:
+        raise HTTPException(status_code=404, detail="未找到该对话历史记录")
+    return detail
+
+
+@app.delete("/api/history/chats/{chat_id}", summary="删除单条对话历史记录", tags=["对话历史审计"])
+def delete_chat_history_item(chat_id: int):
+    ok = chat_history_manager.delete_chat(chat_id)
+    if not ok:
+        raise HTTPException(status_code=500, detail="删除记录失败")
+    return {"success": True, "message": "记录已删除"}
+
+
+@app.post("/api/history/clear", summary="清空所有对话历史并释放磁盘空间", tags=["对话历史审计"])
+def clear_all_chat_history():
+    ok = chat_history_manager.clear_all()
+    if not ok:
+        raise HTTPException(status_code=500, detail="清空对话历史失败")
+    return {"success": True, "message": "已清空所有对话历史并整理磁盘空间", "stats": chat_history_manager.get_stats_dict()}
+
+
+@app.get("/api/history/stats", summary="获取对话历史存储占用与总量统计", tags=["对话历史审计"])
+def get_chat_history_stats():
+    return chat_history_manager.get_stats_dict()
+
+
+# ==========================================
+# 9. 现代化 Web 控制台 (Management Dashboard)
+# ==========================================
+import importlib
+import dashboard_template
+
+_DASHBOARD_PATH = os.path.abspath(dashboard_template.__file__)
+_DASHBOARD_MTIME = os.path.getmtime(_DASHBOARD_PATH) if os.path.exists(_DASHBOARD_PATH) else 0
 
 
 @app.get("/", response_class=HTMLResponse, summary="Web 管理控制台", tags=["系统管理"])
 def dashboard():
-    """返回可视化管理面板 HTML 页面。"""
-    return HTMLResponse(content=DASHBOARD_HTML)
+    """返回可视化管理面板 HTML 页面（支持模板热更新）。"""
+    global _DASHBOARD_MTIME
+    try:
+        mtime = os.path.getmtime(_DASHBOARD_PATH)
+        if mtime != _DASHBOARD_MTIME:
+            importlib.reload(dashboard_template)
+            _DASHBOARD_MTIME = mtime
+    except Exception:
+        pass
+    return HTMLResponse(content=dashboard_template.DASHBOARD_HTML)
 
 
 def generate_responses_text(model, messages):

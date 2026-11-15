@@ -1,0 +1,36 @@
+Chrome 导入: aistudio2api setup
+文件导入: aistudio2api setup --storage-state <file>
+Cookie 导入: aistudio2api setup --cookie <Cookie 请求头>、--cookie-file <file> 或 --cdp <调试地址>
+隔离登录: aistudio2api setup --login
+导入远程实例: 以上命令加 --remote <origin>
+恢复远程续签: aistudio2api setup --remote <origin> --renew
+  -authuser int
+    	Google 多账号会话序号 (0..9，对应 /u/0、/u/1...)
+  -cdp string
+    	指纹浏览器或 Chromium 的远程调试地址，读取其中的 Cookie
+  -chrome-root string
+    	Chrome User Data 目录
+  -cookie string
+    	一行 Cookie 请求头
+  -cookie-file string
+    	浏览器导出的 Cookie JSON 或 Netscape cookies.txt 文件
+  -email value
+    	要导入的 Google 邮箱，可重复；Cookie 导入时指定账户邮箱，省略时按 Cookie 识别
+  -locale string
+    	账户语言 (default "zh-CN")
+  -login
+    	使用隔离 Camoufox 登录
+  -profile value
+    	要导入的 Chrome Profile，可重复
+  -proxy string
+    	账户固定 HTTP、HTTPS 或 SOCKS5 代理
+  -remote string
+    	远程实例 origin，账户上传到该实例
+  -renew
+    	在前台为本机上传到 --remote 实例的 Chrome 导入账户按时续签，用于重启电脑后恢复续签
+  -storage-state string
+    	Playwright storage state 文件
+  -timezone string
+    	账户时区 (default "Asia/Shanghai")
+  -token string
+    	远程实例账户页生成的配对令牌，省略时从标准输入读取

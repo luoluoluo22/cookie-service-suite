@@ -358,6 +358,10 @@ def _web_model_label(display: str, role: str, locked: bool) -> str:
     return display
 
 
+# 任务模式（Task Mode）官方允许的模型集合（官方前端收窄，仅支持多工具协同与复杂任务的型号）
+TASK_MODE_MODEL_IDS = {"gemini-4-hydrogen", "gemini-4-argon"}
+
+
 def _parse_web_model_payload(body: str) -> List[Dict[str, Any]]:
     inner = None
     for line in body.splitlines():
@@ -402,12 +406,15 @@ def _parse_web_model_payload(body: str) -> List[Dict[str, Any]]:
             if not mid or mid in seen:
                 continue
             seen.add(mid)
+            is_task = mid in TASK_MODE_MODEL_IDS
             models.append({
                 "id": mid,
                 "name": display,
                 "role": role,
                 "label": _web_model_label(display, role, False),
                 "locked": False,
+                "modes": ["chat", "task"] if is_task else ["chat"],
+                "is_task_model": is_task,
             })
 
     catalog = inner[15] if len(inner) > 15 and isinstance(inner[15], list) else []
@@ -420,12 +427,15 @@ def _parse_web_model_payload(body: str) -> List[Dict[str, Any]]:
         if not mid or mid in seen:
             continue
         seen.add(mid)
+        is_task = mid in TASK_MODE_MODEL_IDS
         models.append({
             "id": mid,
             "name": display,
             "role": role,
             "label": _web_model_label(display, role, True),
             "locked": True,
+            "modes": ["chat", "task"] if is_task else ["chat"],
+            "is_task_model": is_task,
         })
     return models
 
@@ -468,34 +478,72 @@ class MultiAccountGeminiPool:
         self._web_models_cache: List[Dict[str, Any]] = []
         self._web_models_at = 0.0
 
-    def _extract_cookie_header(self) -> str:
-        """从 Cookie Hub 提取组装 Google 必要会话鉴权串。"""
-        url = f"{self.bridge.bridge_url}/cookies?domain=google.com"
+    def _extract_cookie_header(self, auto_fetch: bool = False) -> str:
+        """从 Cookie Hub 提取适用于 Gemini 的 Google 会话 Cookie；必要时可唤醒 AI Studio 标签页。"""
+        endpoint = "/aistudio/auto_fetch" if auto_fetch else "/cookies?domain=google.com"
+        url = f"{self.bridge.bridge_url}{endpoint}"
         try:
-            with _LOCAL_OPENER.open(url, timeout=15) as resp:
+            with _LOCAL_OPENER.open(url, timeout=45 if auto_fetch else 15) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
-                cookies = data.get("cookies", [])
-        except Exception as e:
-            raise ConnectionError(f"无法连接本地 Cookie Hub 提取凭证 ({self.bridge.bridge_url}): {e}")
+        except Exception as exc:
+            raise ConnectionError(
+                f"无法连接本地 Cookie Hub 获取凭证 ({type(exc).__name__})"
+            ) from exc
 
-        target_keys = [
-            "SID",
-            "HSID",
-            "SSID",
-            "APISID",
-            "SAPISID",
-            "__Secure-1PSID",
-            "__Secure-1PSIDTS",
-            "__Secure-1PSIDCC",
-        ]
-        parts = []
-        for k in target_keys:
-            v = next((c["value"] for c in cookies if c.get("name") == k), "")
-            if v:
-                parts.append(f"{k}={v}")
+        if auto_fetch:
+            if data.get("loginRequired"):
+                raise RuntimeError("Google 浏览器会话需要人工登录；未修改任何账号。")
+            if not data.get("success"):
+                raise RuntimeError(
+                    str(data.get("error") or "Cookie Hub 未能刷新浏览器登录态。")
+                )
 
-        if not parts:
-            raise RuntimeError("未能提取到有效的 Google 鉴权 Cookie！")
+        cookies = data.get("cookies", [])
+        if not cookies:
+            raise RuntimeError("Cookie Hub 未返回 Google Cookie；未修改任何账号。")
+
+        target_keys = (
+            "SID", "HSID", "SSID", "APISID", "SAPISID",
+            "__Secure-1PSID", "__Secure-1PSIDTS", "__Secure-1PSIDCC",
+        )
+        host = "gemini.google.com"
+        request_path = "/u/0/app"
+        now = time.time()
+        selected = {}
+
+        for cookie in cookies:
+            name = str(cookie.get("name") or "")
+            if name not in target_keys:
+                continue
+            domain = str(cookie.get("domain") or "").lstrip(".").lower()
+            if not domain or not (host == domain or host.endswith("." + domain)):
+                continue
+            cookie_path = str(cookie.get("path") or "/")
+            if not request_path.startswith(cookie_path):
+                continue
+            expiry = cookie.get("expirationDate", cookie.get("expires"))
+            try:
+                expiry = float(expiry) if expiry is not None else 0
+            except (TypeError, ValueError):
+                expiry = 0
+            if expiry > 0 and expiry <= now:
+                continue
+            value = str(cookie.get("value") or "")
+            if not value:
+                continue
+
+            # 同名 Cookie 可能同时存在于 accounts.google.com 与 .google.com；
+            # 只保留能发给 Gemini 的项，并优先更具体的域/路径。
+            specificity = (len(domain), len(cookie_path))
+            previous = selected.get(name)
+            if previous is None or specificity > previous[0]:
+                selected[name] = (specificity, value)
+
+        parts = [f"{name}={selected[name][1]}" for name in target_keys if name in selected]
+        if "__Secure-1PSID" not in selected or "SAPISID" not in selected:
+            raise RuntimeError(
+                "Cookie Hub 未提供适用于 Gemini 的完整登录 Cookie；请先在已连接浏览器登录 Google。"
+            )
         return "; ".join(parts)
 
     def init_database(self, force_refresh: bool = False, cookie_str: Optional[str] = None):
@@ -629,6 +677,11 @@ class MultiAccountGeminiPool:
         self._web_models_cache = list(models)
         self._web_models_at = now if parsed else now - 540
         return list(models)
+
+    def list_task_models(self) -> List[Dict[str, Any]]:
+        """获取 Gemini 网页在「任务」模式下可用的模型（Hydrogen 与 Argon）。"""
+        all_models = self.list_web_models()
+        return [m for m in all_models if m.get("is_task_model") or m.get("id") in TASK_MODE_MODEL_IDS]
 
     def _fetch_web_models(self) -> List[Dict[str, Any]]:
         cookie = ""
@@ -1224,10 +1277,17 @@ class MultiAccountGeminiPool:
             try:
                 resp = _LOCAL_OPENER.open(req, timeout=timeout)
             except Exception as first_err:
-                print(f"⚠️ [Gemini Stream] 连接 Go 核心池异常: {first_err}，尝试自愈刷新凭证并重试...", flush=True)
+                first_message = describe_upstream_error(first_err)
+                failure_kind = gemini_failure_kind(first_message)
+                print(
+                    f"⚠️ [Gemini Stream] 上游异常 ({failure_kind})，准备安全自愈并重试...",
+                    flush=True,
+                )
                 try:
-                    self.reset_proxies()
-                    self.refresh_pool_cookies()
+                    if failure_kind == "login":
+                        self.refresh_pool_cookies()
+                    else:
+                        self.reset_proxies()
                     resp = _LOCAL_OPENER.open(req, timeout=timeout)
                 except Exception as retry_err:
                     described = describe_upstream_error(retry_err)
@@ -1320,10 +1380,17 @@ class MultiAccountGeminiPool:
             try:
                 resp = _LOCAL_OPENER.open(req, timeout=timeout)
             except Exception as first_err:
-                print(f"⚠️ [Gemini Stream] 连接 Go 核心池异常: {first_err}，尝试自愈刷新凭证并重试...", flush=True)
+                first_message = describe_upstream_error(first_err)
+                failure_kind = gemini_failure_kind(first_message)
+                print(
+                    f"⚠️ [Gemini Stream] 上游异常 ({failure_kind})，准备安全自愈并重试...",
+                    flush=True,
+                )
                 try:
-                    self.reset_proxies()
-                    self.refresh_pool_cookies()
+                    if failure_kind == "login":
+                        self.refresh_pool_cookies()
+                    else:
+                        self.reset_proxies()
                     resp = _LOCAL_OPENER.open(req, timeout=timeout)
                 except Exception as retry_err:
                     described = describe_upstream_error(retry_err)
@@ -1421,22 +1488,110 @@ class MultiAccountGeminiPool:
                 pass
         return True
 
-    def refresh_pool_cookies(self, reload: bool = False) -> str:
-        """从前台 Cookie Hub 重新拉取最新凭证并更新多账号数据库。"""
-        self.reset_proxies()
-        self.proxy = _detect_local_proxy()
-        cookie_str = self._extract_cookie_header()
-        self._write_cookies(cookie_str)
+    def refresh_pool_cookies(self, account_id: Optional[int] = None) -> str:
+        """按 Google authuser 与已登记邮箱逐个验证，只刷新身份匹配的启用账号。"""
         conn = sqlite3.connect(self.db_path)
-        conn.execute("UPDATE proxies SET fail_count=0, last_error=''")
-        conn.commit()
+        conn.row_factory = sqlite3.Row
+        if account_id is None:
+            rows = conn.execute(
+                "SELECT id, authuser, label, note FROM accounts "
+                "WHERE status='enabled' ORDER BY authuser"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, authuser, label, note FROM accounts "
+                "WHERE id=? AND status='enabled'",
+                (account_id,),
+            ).fetchall()
         conn.close()
-        if reload:
-            with self._lifecycle_lock:
-                if self.is_running():
-                    self._release_port()
-                self._launch_process()
-            self.sync_account_profiles()
+
+        if not rows:
+            raise RuntimeError("没有找到可刷新的启用 Gemini 账号；数据库未修改。")
+
+        def validate_cookie(cookie_value: str):
+            validated = []
+            for row in rows:
+                authuser = int(row["authuser"] or 0)
+                try:
+                    _name, email = self.fetch_account_profile(
+                        authuser, cookie_override=cookie_value
+                    )
+                except Exception:
+                    continue
+                email = str(email or "").strip().lower()
+                if not email:
+                    continue
+
+                expected_match = re.search(
+                    r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+                    f"{row['label'] or ''} {row['note'] or ''}",
+                    re.I,
+                )
+                expected_email = expected_match.group(0).lower() if expected_match else ""
+                if expected_email and email != expected_email:
+                    continue
+                if not expected_email and len(rows) > 1:
+                    # 多账号池没有登记邮箱时，不能猜测浏览器会话属于哪个账号。
+                    continue
+                validated.append((int(row["id"]), authuser))
+            return validated
+
+        direct_error = None
+        cookie_str = ""
+        validated = []
+        try:
+            cookie_str = self._extract_cookie_header()
+            validated = validate_cookie(cookie_str)
+        except Exception as exc:
+            direct_error = exc
+
+        # 当前 Cookie 无法匹配全部启用账号时，唤醒浏览器中的 AI Studio 页面，
+        # 让 Google 有机会续期会话，再重新读取扩展 Cookie 并逐个核验身份。
+        if len(validated) < len(rows):
+            try:
+                fresh_cookie = self._extract_cookie_header(auto_fetch=True)
+                fresh_validated = validate_cookie(fresh_cookie)
+                if fresh_validated and len(fresh_validated) >= len(validated):
+                    cookie_str = fresh_cookie
+                    validated = fresh_validated
+            except Exception as exc:
+                print(
+                    f"[Gemini Cookie Refresh] 浏览器会话唤醒未完成: {type(exc).__name__}",
+                    flush=True,
+                )
+
+        if not validated:
+            reason = type(direct_error).__name__ if direct_error else "identity_mismatch"
+            raise RuntimeError(
+                "当前 Cookie Hub 登录态未能匹配任何已登记的启用 Gemini 账号；"
+                f"未覆盖任何账号（原因: {reason}）。请确认浏览器已登录对应 Google 账号。"
+            )
+
+        updated_ids = []
+        conn = sqlite3.connect(self.db_path)
+        try:
+            for row_id, _authuser in validated:
+                cursor = conn.execute(
+                    "UPDATE accounts SET cookie=?, fail_count=0, last_error='', last_ok_at=? "
+                    "WHERE id=? AND status='enabled'",
+                    (cookie_str, int(time.time()), row_id),
+                )
+                if cursor.rowcount:
+                    updated_ids.append(row_id)
+            conn.commit()
+        finally:
+            conn.close()
+
+        if not updated_ids:
+            raise RuntimeError("身份核验通过，但没有启用账号完成更新；未报告同步成功。")
+
+        self._last_cookie_refresh_ids = updated_ids
+        self.reset_proxies()
+        print(
+            f"[Gemini Cookie Refresh] 已验证并更新 {len(updated_ids)} 个启用账号 "
+            f"(IDs: {','.join(str(x) for x in updated_ids)})；未记录 Cookie 值。",
+            flush=True,
+        )
         return cookie_str
 
     def list_recent_requests(self, limit: int = 10) -> List[Dict[str, Any]]:

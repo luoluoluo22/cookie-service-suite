@@ -237,12 +237,14 @@ function connectBridge() {
               }
             } catch (e) {}
 
+            const targetWorld = req.world || 'ISOLATED';
             const results = await chrome.scripting.executeScript({
               target: { tabId: targetTabId },
-              world: 'MAIN',
+              world: targetWorld,
               func: async (codeStr) => {
                 try {
-                  let val = eval(codeStr);
+                  const fn = new Function(codeStr);
+                  let val = fn();
                   if (val && typeof val.then === 'function') {
                     val = await val;
                   }
@@ -265,6 +267,90 @@ function connectBridge() {
               success: false,
               error: err.message
             }));
+          }
+          return;
+        }
+
+        // 5.2 Gemini 页面原生 DOM 与模型探测 (绕过 CSP)
+        if (req.action === 'gemini_inspect') {
+          try {
+            const tabs = await chrome.tabs.query({ url: '*://gemini.google.com/*' });
+            if (!tabs || tabs.length === 0) {
+              ws.send(JSON.stringify({ id: req.id, action: 'gemini_inspect', success: false, error: '未找到已打开的 gemini.google.com 标签页' }));
+              return;
+            }
+            const tabId = tabs[0].id;
+            const results = await chrome.scripting.executeScript({
+              target: { tabId },
+              func: async () => {
+                const sleep = ms => new Promise(r => setTimeout(r, ms));
+                const segButtons = Array.from(document.querySelectorAll('button.gem-segmented-button-action'));
+                const chatBtn = segButtons.find(b => (b.innerText || '').includes('对话'));
+                const taskBtn = segButtons.find(b => (b.innerText || '').includes('任务'));
+
+                async function getMenuOptions() {
+                  const menuBtn = document.querySelector('button[data-test-id="bard-mode-menu-button"]');
+                  if (!menuBtn) return { error: 'menu button not found' };
+                  menuBtn.click();
+                  await sleep(400);
+
+                  // 寻找打开的 overlay / menu 容器
+                  const menuItems = Array.from(document.querySelectorAll('[role="menuitem"], [role="menuitemradio"], [role="option"], .mat-mdc-menu-item, mat-list-item, [data-test-id*="mode-select"]')).map(el => {
+                    const text = (el.innerText || '').trim();
+                    const titleEl = el.querySelector('.mode-title, h3, [class*="title"]') || el;
+                    const descEl = el.querySelector('.mode-description, [class*="desc"], [class*="subtitle"]');
+                    return {
+                      tag: el.tagName,
+                      role: el.getAttribute('role'),
+                      ariaChecked: el.getAttribute('aria-checked'),
+                      title: titleEl ? titleEl.innerText.trim() : text,
+                      desc: descEl ? descEl.innerText.trim() : '',
+                      fullText: text,
+                      testId: el.getAttribute('data-test-id') || el.getAttribute('data-model-id') || '',
+                      html: el.outerHTML.slice(0, 300)
+                    };
+                  }).filter(x => x.fullText);
+
+                  // 关掉菜单
+                  document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+                  await sleep(200);
+                  return menuItems;
+                }
+
+                // 1. 抓取“对话”模式下的模型
+                let chatModels = [];
+                if (chatBtn) {
+                  chatBtn.click();
+                  await sleep(400);
+                  chatModels = await getMenuOptions();
+                }
+
+                // 2. 抓取“任务”模式下的模型
+                let taskModels = [];
+                if (taskBtn) {
+                  taskBtn.click();
+                  await sleep(400);
+                  taskModels = await getMenuOptions();
+                }
+
+                return {
+                  url: location.href,
+                  title: document.title,
+                  hasChatBtn: !!chatBtn,
+                  hasTaskBtn: !!taskBtn,
+                  chatModels,
+                  taskModels
+                };
+              }
+            });
+            ws.send(JSON.stringify({
+              id: req.id,
+              action: 'gemini_inspect',
+              success: true,
+              data: results && results[0] ? results[0].result : null
+            }));
+          } catch (err) {
+            ws.send(JSON.stringify({ id: req.id, action: 'gemini_inspect', success: false, error: err.message }));
           }
           return;
         }
