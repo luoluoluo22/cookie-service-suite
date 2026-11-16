@@ -5,6 +5,7 @@ Google Gemini Web 服务调用与多账号统一调度模块
 """
 
 import os
+from contextlib import closing
 import sys
 import time
 import json
@@ -608,7 +609,7 @@ class MultiAccountGeminiPool:
             # 扩展还没连上时不要用空串覆盖已经可用的凭证
             if cookie_str and (force_refresh or not _cookie_value(existing_users[u], "__Secure-1PSID")):
                 cur.execute(
-                    "UPDATE accounts SET cookie=?, status='enabled', fail_count=0 WHERE authuser=?",
+                    "UPDATE accounts SET cookie=?, fail_count=0 WHERE authuser=? AND status='enabled'",
                     (cookie_str, u),
                 )
 
@@ -819,10 +820,8 @@ class MultiAccountGeminiPool:
         if not hub_psid or not os.path.exists(self.db_path):
             return True
         conn = sqlite3.connect(self.db_path)
-        rows = conn.execute("SELECT cookie FROM accounts WHERE status!='deleted'").fetchall()
+        rows = conn.execute("SELECT cookie FROM accounts WHERE status='enabled'").fetchall()
         conn.close()
-        if len(rows) < self.account_count:
-            return True
         return any(_cookie_value(row[0] or "", "__Secure-1PSID") != hub_psid for row in rows)
 
     def _write_cookies(self, cookie_str: str):
@@ -990,7 +989,7 @@ class MultiAccountGeminiPool:
 
         conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
-        rows = cur.execute("SELECT authuser FROM accounts ORDER BY authuser ASC").fetchall()
+        rows = cur.execute("SELECT authuser FROM accounts WHERE status='enabled' ORDER BY authuser ASC").fetchall()
         conn.close()
 
         seen_emails = {}
@@ -1016,7 +1015,7 @@ class MultiAccountGeminiPool:
             if email:
                 conn = sqlite3.connect(self.db_path)
                 conn.execute(
-                    "UPDATE accounts SET label = ?, note = ?, status = ? WHERE authuser = ?",
+                    "UPDATE accounts SET label = ?, note = ?, status = ? WHERE authuser = ? AND status='enabled'",
                     (new_label, note, status, u),
                 )
                 conn.commit()
@@ -1247,7 +1246,7 @@ class MultiAccountGeminiPool:
 
         results: Dict[int, Dict[str, Any]] = {}
         for authuser, cookie, note, status in rows:
-            if not cookie or "同一登录" in (note or "") or status == "deleted":
+            if not cookie or "同一登录" in (note or "") or status != "enabled":
                 continue
             info = self.fetch_account_usage(authuser, cookie_override=cookie)
             if info and not info.get("error") and ("five_hourly" in info or "weekly" in info):
@@ -1381,7 +1380,7 @@ class MultiAccountGeminiPool:
                     else:
                         real_weekly_reset_str = str(wk.get("reset_str") or "")
                 usage_source = "official"
-                if (now - usage_fetched_at) > 120:
+                if r[3] == "enabled" and (now - usage_fetched_at) > 120:
                     needs_usage_sync = True
             elif not is_dup and r[3] == "enabled":
                 needs_usage_sync = True
@@ -1446,7 +1445,7 @@ class MultiAccountGeminiPool:
         for item in res:
             email_key = (item.get("email") or "").strip().lower()
             duplicate = "同一登录" in (item.get("note") or "")
-            if email_key and email_key not in seen_emails and not duplicate:
+            if email_key and email_key not in seen_emails and not duplicate and item['status'] != 'deleted':
                 seen_emails.add(email_key)
                 item["visible"] = True
             else:
@@ -1455,6 +1454,21 @@ class MultiAccountGeminiPool:
         if needs_usage_sync and (time.time() - self._usage_sync_at > 60):
             self._schedule_usage_sync()
         return res
+
+    def set_account_status(self, account_id: int, status: str) -> None:
+        """停用或移除本地账号；删除保留槽位标记，避免后台自动重建。"""
+        if status not in ('enabled', 'disabled', 'deleted'):
+            raise ValueError('无效的账号状态')
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            row = conn.execute('SELECT status, note FROM accounts WHERE id=?', (account_id,)).fetchone()
+            if not row or row[0] == 'deleted':
+                raise LookupError('账号不存在或已删除')
+            if status == 'enabled' and '同一登录' in (row[1] or ''):
+                raise ValueError('重复登录槽位不能启用')
+            if status == 'deleted':
+                conn.execute("UPDATE accounts SET status='deleted', cookie='', last_error='', fail_count=0 WHERE id=?", (account_id,))
+            else:
+                conn.execute('UPDATE accounts SET status=? WHERE id=?', (status, account_id))
 
     def ask(
         self,
@@ -1764,6 +1778,7 @@ class MultiAccountGeminiPool:
 
     def check_account(self, account_id: int) -> Dict[str, Any]:
         """调用管理接口检测单个账号的会话凭证健康状态。"""
+        self._require_enabled_account(account_id)
         url = f"http://127.0.0.1:{self.port}/admin/api/cookies/{account_id}/check"
         req = urllib.request.Request(
             url,
@@ -1778,6 +1793,7 @@ class MultiAccountGeminiPool:
 
     def rotate_account(self, account_id: int) -> Dict[str, Any]:
         """强制触发单个账号的会话令牌主动保活轮换。"""
+        self._require_enabled_account(account_id)
         url = f"http://127.0.0.1:{self.port}/admin/api/cookies/{account_id}/rotate"
         req = urllib.request.Request(
             url,
@@ -1789,6 +1805,12 @@ class MultiAccountGeminiPool:
         )
         with _LOCAL_OPENER.open(req, timeout=15) as resp:
             return json.loads(resp.read().decode("utf-8"))
+
+    def _require_enabled_account(self, account_id: int) -> None:
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            row = conn.execute("SELECT status FROM accounts WHERE id=?", (account_id,)).fetchone()
+        if not row or row[0] != 'enabled':
+            raise ValueError('账号不存在或未启用')
 
     def reset_proxies(self) -> bool:
         """重置所有代理的熔断与失败计数器，确保不会因偶发超时被锁定。"""

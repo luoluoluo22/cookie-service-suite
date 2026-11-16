@@ -414,6 +414,17 @@ def list_gemini_accounts():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post('/api/gemini/accounts/{account_id}/status', tags=['Gemini 多账号调度'])
+def set_gemini_account_status(account_id: int, status: str = Query(...)):
+    try:
+        gemini_pool.set_account_status(account_id, status)
+        return {'success': True, 'status': status}
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
 @app.post("/api/gemini/accounts/sync-profiles", summary="同步提取所有账号的真实 Google 昵称与邮箱", tags=["Gemini 多账号调度"])
 def sync_gemini_profiles():
     """向 Google 上游拉取各 authuser 对应的真实用户显示昵称与 Gmail 邮箱并写入账号池。"""

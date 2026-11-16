@@ -2119,12 +2119,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
               <td class="py-3 px-3 whitespace-nowrap">
                 <span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[11px] font-medium border whitespace-nowrap ${enabled ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/30" : "bg-slate-800 text-slate-400 border-slate-700"}">
                   <span class="w-1.5 h-1.5 rounded-full ${enabled ? "bg-emerald-400" : "bg-slate-500"}"></span>
-                  ${enabled ? "已启用" : escapeHtml(a.status || "未知")}
+                  ${enabled ? "已启用" : (a.status === "disabled" ? "已停用" : escapeHtml(a.status || "未知"))}
                 </span>
               </td>
               <td class="py-3 px-3 text-right space-x-1 whitespace-nowrap">
-                <button type="button" onclick="checkAccount(${a.id})" class="px-2.5 py-1 rounded-md bg-slate-900 hover:bg-slate-800 text-[11px] text-slate-300 border border-slate-800 transition cursor-pointer">检测</button>
-                <button type="button" onclick="rotateAccount(${a.id})" class="px-2.5 py-1 rounded-md bg-slate-900 hover:bg-slate-800 text-[11px] text-amber-300 border border-slate-800 transition cursor-pointer">保活</button>
+                <button type="button" onclick="setAccountStatus(${a.id}, '${enabled ? "disabled" : "enabled"}')" class="px-2.5 py-1 rounded-md bg-slate-900 hover:bg-slate-800 text-[11px] text-sky-300 border border-slate-800 cursor-pointer">${enabled ? "停用" : "启用"}</button>
+                <button type="button" onclick="setAccountStatus(${a.id}, 'deleted')" class="px-2.5 py-1 rounded-md bg-slate-900 hover:bg-slate-800 text-[11px] text-rose-300 border border-slate-800 cursor-pointer">删除</button>
+                ${enabled ? `<button type="button" onclick="checkAccount(${a.id})" class="px-2.5 py-1 rounded-md bg-slate-900 hover:bg-slate-800 text-[11px] text-slate-300 border border-slate-800 cursor-pointer">检测</button><button type="button" onclick="rotateAccount(${a.id})" class="px-2.5 py-1 rounded-md bg-slate-900 hover:bg-slate-800 text-[11px] text-amber-300 border border-slate-800 cursor-pointer">保活</button>` : ""}
               </td>
             `;
             tbody.appendChild(tr);
@@ -2138,6 +2139,17 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       } finally {
         if (icon) icon.classList.remove("fa-spin");
       }
+    }
+
+    async function setAccountStatus(id, status) {
+      if (status === 'deleted' && !confirm('删除此账号的本地 Gemini 凭证并停止向远端同步？浏览器和其他 AI Studio 号池中的账号不会删除。')) return;
+      try {
+        const res = await fetch(`/api/gemini/accounts/${id}/status?status=${status}`, { method: 'POST' });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || '操作失败');
+        showToast(status === 'deleted' ? '账号已从 Gemini 池移除' : (status === 'enabled' ? '账号已启用' : '账号已停用'));
+        await refreshDashboard();
+      } catch (err) { showToast('账号操作失败: ' + err.message); }
     }
 
     async function syncUsage() {

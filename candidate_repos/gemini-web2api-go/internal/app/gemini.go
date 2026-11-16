@@ -982,6 +982,7 @@ func streamGenerateOnce(prompt, latest string, mc ModelConfig, pending []pending
 		// one extra video per attempt (burning daily quota). Once a conversation id
 		// exists, treat it as accepted and let fetchMediaArtifacts poll hNvQHb.
 		if !hasContentFrame(string(raw)) && !videoAccepted(mc.Tool, string(raw)) {
+			logf("empty frame diagnostic: bytes=%d frames=%s", len(raw), emptyFrameDiagnostic(raw))
 			lastErr = fmt.Errorf("upstream returned no content frame (raw %d bytes)", len(raw))
 			if pickedOK {
 				// 记进代理健康度：1155 跟出口质量强相关（干净出口 60+ 次 0 发生，
