@@ -5,6 +5,8 @@ CHAT_HTML = r"""<!doctype html>
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover" />
   <meta name="theme-color" content="#131314" />
   <link rel="manifest" href="/manifest.webmanifest" />
+  <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+  <link rel="apple-touch-icon" href="/icon.svg" />
   <title>Gemini</title>
   <style>
     :root { --bg:#131314; --panel:#1e1f20; --surface:#282a2c; --hover:#333537; --border:#2e2f30; --text:#e3e3e3; --muted:#9aa0a6; --accent:#a8c7fa; --user-bg:#282a2c; }
@@ -63,6 +65,14 @@ CHAT_HTML = r"""<!doctype html>
     .plus-menu.open { display:flex; }
     .plus-item { padding:10px 12px; border-radius:10px; font-size:13.5px; color:var(--text); cursor:pointer; display:flex; align-items:center; justify-content:space-between; gap:8px; background:none; border:none; text-align:left; font-family:inherit; }
     .plus-item:hover { background:var(--hover); }
+    .model-btn { background:transparent; color:var(--muted); border:none; border-radius:999px; padding:6px 10px; font-size:12.5px; font-weight:500; font-family:inherit; cursor:pointer; display:inline-flex; align-items:center; gap:4px; max-width:190px; }
+    .model-btn:hover { background:var(--surface); color:var(--text); }
+    #model-lbl { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .model-menu { position:absolute; bottom:56px; left:48px; background:var(--surface); border:1px solid var(--border); border-radius:16px; padding:6px; min-width:220px; max-width:85vw; display:none; flex-direction:column; gap:2px; box-shadow:0 8px 24px rgba(0,0,0,.55); z-index:45; }
+    .model-menu.open { display:flex; }
+    .model-opt { padding:10px 12px; border-radius:10px; font-size:13px; color:var(--text); cursor:pointer; display:flex; align-items:center; justify-content:space-between; gap:10px; background:none; border:none; text-align:left; font-family:inherit; width:100%; }
+    .model-opt:hover { background:var(--hover); }
+    .model-opt.active { color:#c2e7ff; background:rgba(0,74,119,.45); }
     .chip { display:inline-flex; align-items:center; gap:5px; background:#004a77; color:#c2e7ff; font-size:12px; font-weight:500; padding:4px 10px; border-radius:999px; }
     .chip button { background:none; border:none; color:#c2e7ff; cursor:pointer; padding:0; display:flex; align-items:center; }
     select { background:transparent; color:var(--muted); border:none; border-radius:999px; padding:5px 8px; font-size:12.5px; font-weight:500; font-family:inherit; cursor:pointer; outline:none; max-width:170px; }
@@ -98,7 +108,6 @@ CHAT_HTML = r"""<!doctype html>
       <div style="display:flex;align-items:center;gap:6px;min-width:0">
         <button class="icon-btn" onclick="toggleSidebar()" aria-label="菜单"><svg class="icon" viewBox="0 0 24 24"><path d="M3 18h18v-2H3v2zm0-5h18v-2H3v2zm0-7v2h18V6H3z"/></svg></button>
         <div class="brand">
-          <svg class="icon" style="color:#a8c7fa" viewBox="0 0 24 24"><path d="M12 2L14.8 9.2L22 12L14.8 14.8L12 22L9.2 14.8L2 12L9.2 9.2L12 2Z"/></svg>
           <span id="chat-title">Gemini</span>
         </div>
       </div>
@@ -115,7 +124,7 @@ CHAT_HTML = r"""<!doctype html>
             </div>
             <button class="plus-btn" onclick="togglePlusMenu(event)" title="工具与插件"><svg class="icon" viewBox="0 0 24 24"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg></button>
             <span class="chip" id="pigeon-chip" style="display:none">@鸽子 <button onclick="togglePigeon(false)" aria-label="取消"><svg class="icon-sm" style="width:14px;height:14px" viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg></button></span>
-            <select id="model-sel"></select>
+            <select id="model-sel" style="display:none"></select><div class="model-menu" id="model-menu"></div><button type="button" class="model-btn" id="model-btn" onclick="toggleModelMenu(event)"><span id="model-lbl">Gemini</span><svg class="icon-sm" viewBox="0 0 24 24"><path d="M7 10l5 5 5-5z"/></svg></button>
           </div>
           <button class="send-btn" id="send-btn" onclick="sendMsg()" aria-label="发送"><svg class="icon-sm" viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg></button>
         </div>
@@ -146,7 +155,17 @@ let activeCid = null, sending = false, usePigeon = false, convSyncPromise = null
 function hdrs() { return { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + TOKEN }; }
 function toggleSidebar(force) { const s = document.getElementById('sidebar'); if (typeof force === 'boolean') s.classList.toggle('open', force); else s.classList.toggle('open'); }
 function togglePlusMenu(e) { e.stopPropagation(); document.getElementById('plus-menu').classList.toggle('open'); }
-document.addEventListener('click', () => { const m = document.getElementById('plus-menu'); if (m) m.classList.remove('open'); });
+document.addEventListener('click', () => { ['plus-menu','model-menu'].forEach(id => { const m = document.getElementById(id); if (m) m.classList.remove('open'); }); });
+function toggleModelMenu(e) { e.stopPropagation(); const pm = document.getElementById('plus-menu'); if (pm) pm.classList.remove('open'); document.getElementById('model-menu').classList.toggle('open'); }
+function syncModelUI() {
+  const sel = document.getElementById('model-sel'), lbl = document.getElementById('model-lbl');
+  if (!sel || !lbl) return;
+  const opt = sel.options[sel.selectedIndex];
+  lbl.textContent = opt ? opt.textContent : (sel.value || 'Gemini');
+  document.querySelectorAll('.model-opt').forEach(b => b.classList.toggle('active', b.dataset.id === sel.value));
+}
+function selectModel(id) { const sel = document.getElementById('model-sel'); if (sel) sel.value = id; syncModelUI(); document.getElementById('model-menu').classList.remove('open'); }
+
 function togglePigeon(on) {
   usePigeon = on;
   document.getElementById('pigeon-chip').style.display = on ? 'inline-flex' : 'none';
@@ -155,7 +174,7 @@ function togglePigeon(on) {
     const sel = document.getElementById('model-sel');
     if (sel && !sel.value.endsWith('-task')) {
       const tOpt = Array.from(sel.options).find(o => o.value === 'gemini-4-hydrogen-task');
-      if (tOpt) sel.value = tOpt.value;
+      if (tOpt) { sel.value = tOpt.value; syncModelUI(); }
     }
     document.getElementById('prompt-in').focus();
   }
@@ -187,6 +206,9 @@ function renderModels(list) {
   sel.innerHTML = list.map(m => `<option value="${m.id}">${m.label || m.id}</option>`).join('');
   if (prev && list.some(m => m.id === prev)) sel.value = prev;
   else if (list.some(m => m.id === 'gemini-4-hydrogen')) sel.value = 'gemini-4-hydrogen';
+  const mm = document.getElementById('model-menu');
+  if (mm) mm.innerHTML = list.map(m => `<button type="button" class="model-opt ${m.id===sel.value?'active':''}" data-id="${m.id}" onclick="selectModel('${m.id}')"><span>${(m.label||m.id).replace(/</g,'&lt;')}</span></button>`).join('');
+  syncModelUI();
 }
 async function loadModels() {
   const r = await api('/api/gemini/models');
@@ -199,11 +221,7 @@ async function loadModels() {
 function addBubble(role, text) {
   const box = document.getElementById('msgs');
   const w = document.createElement('div'); w.className = 'msg ' + role;
-  if (role === 'assistant') {
-    const av = document.createElement('div'); av.className = 'bot-avatar';
-    av.innerHTML = '<svg class="icon" viewBox="0 0 24 24"><path d="M12 2L14.8 9.2L22 12L14.8 14.8L12 22L9.2 14.8L2 12L9.2 9.2L12 2Z"/></svg>';
-    w.appendChild(av);
-  }
+
   const b = document.createElement('div'); b.className = 'bubble'; b.textContent = text || '';
   w.appendChild(b); box.appendChild(w); box.scrollTop = box.scrollHeight; return b;
 }
@@ -239,7 +257,7 @@ function convSig(c) {
 function renderConvDetail(d) {
   const box = document.getElementById('msgs');
   document.getElementById('chat-title').textContent = d.title || 'Gemini';
-  if (d.model) { const s = document.getElementById('model-sel'); if (s && Array.from(s.options).some(o => o.value === d.model)) s.value = d.model; }
+  if (d.model) { const s = document.getElementById('model-sel'); if (s && Array.from(s.options).some(o => o.value === d.model)) { s.value = d.model; syncModelUI(); } }
   box.innerHTML = '';
   const msgs = d.messages || [];
   if (msgs.length) { for (const m of msgs) addBubble(m.role === 'user' ? 'user' : 'assistant', m.content || ''); }

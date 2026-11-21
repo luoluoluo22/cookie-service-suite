@@ -163,7 +163,7 @@ def _is_trusted_local_request(request: Request) -> bool:
 
 
 def _is_public_path(path: str) -> bool:
-    if path in ("/", "/chat", "/manifest.webmanifest", "/sw.js", "/favicon.ico", "/api/system/auth/status", "/api/system/auth/verify"):
+    if path in ("/", "/chat", "/manifest.webmanifest", "/sw.js", "/icon.svg", "/favicon.ico", "/api/system/auth/status", "/api/system/auth/verify"):
         return True
     return path.startswith("/assets/")
 
@@ -831,6 +831,12 @@ def generate_system_token(request: Request, response: Response):
 # ==========================================
 # 2. Google Gemini 多账号池统一调度接口
 # ==========================================
+@app.get("/icon.svg", include_in_schema=False)
+def pwa_icon_svg():
+    svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="16" fill="#131314"/><path d="M32 10L38.2 25.8L54 32L38.2 38.2L32 54L25.8 38.2L10 32L25.8 25.8L32 10Z" fill="#a8c7fa"/></svg>'
+    return Response(content=svg, media_type="image/svg+xml", headers={"Cache-Control": "public, max-age=86400"})
+
+
 @app.get("/manifest.webmanifest", include_in_schema=False)
 def pwa_manifest():
     return JSONResponse({
@@ -839,10 +845,10 @@ def pwa_manifest():
         "start_url": "/chat",
         "scope": "/",
         "display": "standalone",
-        "background_color": "#0b101b",
-        "theme_color": "#0b101b",
+        "background_color": "#131314",
+        "theme_color": "#131314",
         "icons": [
-            {"src": "/assets/app_icon.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"},
+            {"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable"},
             {"src": "/assets/icons/gemini.svg", "sizes": "any", "type": "image/svg+xml"}
         ]
     }, media_type="application/manifest+json")
