@@ -5,6 +5,8 @@ import json
 import urllib.parse
 import urllib.request
 
+from web_api_switches import is_service_enabled
+
 _LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 HUB = "http://127.0.0.1:18888"
 
@@ -186,13 +188,19 @@ def collect_login_status() -> dict:
         hub_error = f"Cookie Hub 未响应，暂时无法判断登录状态：{exc}"
 
     for spec in SERVICES:
+        enabled = is_service_enabled(spec["id"])
         item = {
             "id": spec["id"],
             "name": spec["name"],
             "login_url": spec["login_url"],
+            "enabled": enabled,
             "logged_in": None,
             "hint": spec["hint_out"],
         }
+        if not enabled:
+            item["hint"] = f"{spec['name']} 网页 API 已关闭，已停止获取 Cookie。"
+            services.append(item)
+            continue
         if hub_error:
             item["hint"] = hub_error
             services.append(item)
@@ -207,7 +215,7 @@ def collect_login_status() -> dict:
         item["hint"] = spec["hint_in"] if logged_in else spec["hint_out"]
         services.append(item)
 
-    needs = [item for item in services if item["logged_in"] is False]
+    needs = [item for item in services if item.get("enabled", True) and item["logged_in"] is False]
     names = "、".join(item["name"] for item in needs)
     return {
         "hub_connected": hub_error is None,

@@ -21,6 +21,7 @@ import sys
 import time
 import json
 import re
+import base64
 import subprocess
 from typing import Optional, Dict, Any, List, Union, Callable
 from urllib.parse import urlparse
@@ -30,6 +31,7 @@ os.environ["NO_PROXY"] = "127.0.0.1,localhost,::1"
 
 from curl_cffi import requests
 from cookie_bridge import CookieBridge
+from web_api_switches import is_service_enabled, require_service_enabled
 
 DEFAULT_BRIDGE_URL = "http://127.0.0.1:18888"
 STUDIO_API_URL = "https://studio-api.prod.suno.com"
@@ -141,9 +143,11 @@ class SunoService:
             self.session.proxies = {"http": self.proxy, "https": self.proxy}
 
         self.cookie_header: str = ""
+        self.cookie_source: str = ""
         self.jwt_token: Optional[str] = None
         self.jwt_expires_at: float = 0
         self.last_sid: Optional[str] = None
+        self.clerk_user: Dict[str, Any] = {}
 
         if auto_init:
             self.refresh_auth()
@@ -183,18 +187,21 @@ class SunoService:
         3. 自动静默拉起本地 Bridge 守护服务，并通过 Cookie Hub 扩展直接从浏览器提取
         4. 若浏览器中尚未打开过 Suno，扩展将自动在后台静默打开 https://suno.com/create 唤醒会话并提取
         """
+        require_service_enabled("suno")
         if self.cookie_header and not force_fetch:
             return self.cookie_header
 
         # 1. 显式传入或环境变量
         if self.manual_cookie and not force_fetch:
             self.cookie_header = self.manual_cookie.strip()
+            self.cookie_source = "manual"
             self.save_cookie_cache(self.cookie_header)
             return self.cookie_header
 
         env_cookie = os.getenv("SUNO_COOKIE")
         if env_cookie and not force_fetch:
             self.cookie_header = env_cookie.strip()
+            self.cookie_source = "env"
             self.save_cookie_cache(self.cookie_header)
             return self.cookie_header
 
@@ -203,6 +210,7 @@ class SunoService:
             cached = self.load_cookie_cache()
             if cached and ("__client" in cached or "__session" in cached):
                 self.cookie_header = cached
+                self.cookie_source = "cookie_cache"
                 return self.cookie_header
 
         # 3. 自动探测并拉起本地 Bridge 服务，通知浏览器扩展自动提取或自动访问
@@ -215,6 +223,7 @@ class SunoService:
                     hdr = auto_res["header"].strip()
                     if "__client" in hdr or "__session" in hdr:
                         self.cookie_header = hdr
+                        self.cookie_source = "cookie_hub"
                         self.save_cookie_cache(hdr)
                         return self.cookie_header
             except Exception:
@@ -229,6 +238,7 @@ class SunoService:
                         hdr = auto_res["header"].strip()
                         if "__client" in hdr or "__session" in hdr:
                             self.cookie_header = hdr
+                            self.cookie_source = "cookie_hub"
                             self.save_cookie_cache(hdr)
                             return self.cookie_header
                 except Exception:
@@ -252,6 +262,7 @@ class SunoService:
             merged = "; ".join(filter(None, extracted_cookies)).strip()
             if merged and ("__client" in merged or "__session" in merged):
                 self.cookie_header = merged
+                self.cookie_source = "cookie_hub"
                 self.save_cookie_cache(merged)
                 return self.cookie_header
 
@@ -259,6 +270,7 @@ class SunoService:
         cached = self.load_cookie_cache()
         if cached:
             self.cookie_header = cached
+            self.cookie_source = "cookie_cache"
             return self.cookie_header
 
         if not self.cookie_header:
@@ -271,13 +283,13 @@ class SunoService:
 
         return self.cookie_header
 
-    def _exchange_jwt_from_clerk(self) -> str:
+    def _exchange_jwt_from_clerk(self, auto_visit: bool = True) -> str:
         """
         使用 Cookie 向 Clerk 换取用于调用 Suno Studio API 的短效 JWT 访问令牌
         具备失败自动唤醒与前台浏览器凭证强刷重试机制
         """
         for exchange_attempt in range(2):
-            cookies = self.get_raw_cookies(force_fetch=(exchange_attempt > 0))
+            cookies = self.get_raw_cookies(force_fetch=(exchange_attempt > 0), auto_visit=auto_visit)
             headers = dict(COMMON_HEADERS)
             headers["Cookie"] = cookies
 
@@ -295,7 +307,7 @@ class SunoService:
                 raise
 
             if resp.status_code != 200:
-                if exchange_attempt == 0:
+                if exchange_attempt == 0 and auto_visit:
                     # 尝试通知浏览器扩展重新唤醒 suno.com 提取最新 Cookie
                     try:
                         self.get_raw_cookies(force_fetch=True, auto_visit=True)
@@ -312,20 +324,29 @@ class SunoService:
                 raise RuntimeError(f"Clerk 返回内容非合法 JSON: {resp.text[:300]}") from e
 
             res_obj = data.get("response", {})
+            sessions = res_obj.get("sessions", []) or []
             sid = res_obj.get("last_active_session_id")
+            selected_session = None
+
+            if sid:
+                selected_session = next((s for s in sessions if isinstance(s, dict) and s.get("id") == sid), None)
 
             if not sid:
                 # 尝试从 sessions 数组中获取首个活跃会话
-                sessions = res_obj.get("sessions", [])
                 for s in sessions:
-                    if s.get("status") == "active":
+                    if isinstance(s, dict) and s.get("status") == "active":
                         sid = s.get("id")
+                        selected_session = s
                         break
-                if not sid and sessions:
+                if not sid and sessions and isinstance(sessions[0], dict):
                     sid = sessions[0].get("id")
+                    selected_session = sessions[0]
+
+            if isinstance(selected_session, dict) and isinstance(selected_session.get("user"), dict):
+                self.clerk_user = selected_session["user"]
 
             if not sid:
-                if exchange_attempt == 0:
+                if exchange_attempt == 0 and auto_visit:
                     try:
                         self.get_raw_cookies(force_fetch=True, auto_visit=True)
                         continue
@@ -348,7 +369,7 @@ class SunoService:
                 token_resp = self.session.post(alt_url, headers=headers, timeout=20)
 
             if token_resp.status_code != 200:
-                if exchange_attempt == 0:
+                if exchange_attempt == 0 and auto_visit:
                     try:
                         self.get_raw_cookies(force_fetch=True, auto_visit=True)
                         continue
@@ -368,10 +389,11 @@ class SunoService:
             self.jwt_expires_at = time.time() + 45
             return jwt
 
-    def ensure_jwt(self, force_refresh: bool = False) -> str:
+    def ensure_jwt(self, force_refresh: bool = False, auto_visit: bool = True) -> str:
         """
         保证返回有效未过期的 JWT Token
         """
+        require_service_enabled("suno")
         if (
             not force_refresh
             and self.jwt_token
@@ -379,12 +401,13 @@ class SunoService:
         ):
             return self.jwt_token
 
-        return self._exchange_jwt_from_clerk()
+        return self._exchange_jwt_from_clerk(auto_visit=auto_visit)
 
     def refresh_auth(self) -> Dict[str, Any]:
         """
         强制刷新 Cookie 与 JWT 凭证，并测试连通性
         """
+        require_service_enabled("suno")
         self.get_raw_cookies(force_fetch=True)
         jwt = self.ensure_jwt(force_refresh=True)
         quota = self.get_credits()
@@ -402,11 +425,12 @@ class SunoService:
         json_data: Optional[Dict[str, Any]] = None,
         params: Optional[Dict[str, Any]] = None,
         timeout: int = 30,
+        auto_visit: bool = True,
     ) -> Any:
         """
         向 Suno Studio API 发起带鉴权的请求 (含自动重试与 Token 自动续期)
         """
-        jwt = self.ensure_jwt()
+        jwt = self.ensure_jwt(auto_visit=auto_visit)
         headers = dict(COMMON_HEADERS)
         headers["Authorization"] = f"Bearer {jwt}"
         headers["Content-Type"] = "application/json"
@@ -432,10 +456,10 @@ class SunoService:
             # 若遇到 401 Unauthorized，则强制刷新 Cookie 与 JWT 令牌并重试一次
             if resp.status_code == 401 and retry == 0:
                 try:
-                    self.get_raw_cookies(force_fetch=True, auto_visit=True)
+                    self.get_raw_cookies(force_fetch=True, auto_visit=auto_visit)
                 except Exception:
                     pass
-                jwt = self.ensure_jwt(force_refresh=True)
+                jwt = self.ensure_jwt(force_refresh=True, auto_visit=auto_visit)
                 headers["Authorization"] = f"Bearer {jwt}"
                 continue
 
@@ -449,6 +473,322 @@ class SunoService:
     # ==========================================
     # 核心业务接口
     # ==========================================
+
+    @staticmethod
+    def _decode_jwt_claims(token: Optional[str]) -> Dict[str, Any]:
+        """无签名校验解析 Clerk JWT 载荷，提取 email / handle / user_id / plan 等声明"""
+        if not token or "." not in token:
+            return {}
+        try:
+            parts = token.split(".")
+            if len(parts) < 2:
+                return {}
+            payload = parts[1]
+            payload += "=" * (-len(payload) % 4)
+            decoded = base64.urlsafe_b64decode(payload.encode("utf-8"))
+            obj = json.loads(decoded.decode("utf-8"))
+            return obj if isinstance(obj, dict) else {}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _parse_suno_membership(
+        billing_raw: Optional[Dict[str, Any]] = None,
+        session_data: Optional[Dict[str, Any]] = None,
+        jwt_claims: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """综合 billing/info、/api/session 与 JWT 声明解析 Suno 会员等级"""
+        billing = billing_raw or {}
+        sess = session_data or {}
+        claims = jwt_claims or {}
+
+        candidates: List[str] = []
+        sub_type = billing.get("subscription_type")
+        if isinstance(sub_type, dict):
+            for k in ("plan_key", "key", "name", "type"):
+                if sub_type.get(k):
+                    candidates.append(str(sub_type[k]))
+        elif isinstance(sub_type, str) and sub_type.strip():
+            candidates.append(sub_type.strip())
+
+        for k in ("plan_key", "current_plan", "plan", "tier"):
+            val = billing.get(k)
+            if isinstance(val, dict):
+                for dk in ("plan_key", "key", "name"):
+                    if val.get(dk):
+                        candidates.append(str(val[dk]))
+            elif isinstance(val, str) and val.strip():
+                candidates.append(val.strip())
+
+        statsig_custom = (
+            (sess.get("statsig_custom_properties") or {}).get("custom") or {}
+            if isinstance(sess.get("statsig_custom_properties"), dict)
+            else {}
+        )
+        if statsig_custom.get("user_plan_key"):
+            candidates.append(str(statsig_custom["user_plan_key"]).strip())
+
+        jwt_plan = str(claims.get("plan") or "").strip()
+        if jwt_plan and jwt_plan not in (":", "::"):
+            jwt_plan_head = jwt_plan.split(":")[0].strip()
+            if jwt_plan_head:
+                candidates.append(jwt_plan_head)
+
+        for raw_cand in candidates:
+            low = raw_cand.lower()
+            if low in ("false", "none", "null", "free", "free_plan", "free plan"):
+                continue
+            if "premier" in low:
+                return {"is_member": True, "plan_tier": "PREMIER", "membership_label": "Suno Premier"}
+            if "pro" in low:
+                return {"is_member": True, "plan_tier": "PRO", "membership_label": "Suno Pro"}
+            if "studio" in low:
+                return {"is_member": True, "plan_tier": "STUDIO", "membership_label": "Suno Studio"}
+            if "plus" in low:
+                return {"is_member": True, "plan_tier": "PLUS", "membership_label": "Suno Plus"}
+            if "vip" in low:
+                return {"is_member": True, "plan_tier": "VIP", "membership_label": "Suno VIP"}
+            return {"is_member": True, "plan_tier": raw_cand.upper(), "membership_label": f"Suno {raw_cand.title()}"}
+
+        is_active = bool(billing.get("is_active"))
+        monthly_limit = billing.get("monthly_limit") or 0
+        plan_price = billing.get("plan_price") or 0
+        roles = sess.get("roles") if isinstance(sess.get("roles"), dict) else {}
+        sess_user = sess.get("user") if isinstance(sess.get("user"), dict) else {}
+
+        if is_active:
+            try:
+                if float(plan_price) >= 25 or int(monthly_limit) >= 10000:
+                    return {"is_member": True, "plan_tier": "PREMIER", "membership_label": "Suno Premier"}
+            except Exception:
+                pass
+            return {"is_member": True, "plan_tier": "PRO", "membership_label": "Suno Pro"}
+
+        if roles.get("pro"):
+            return {"is_member": True, "plan_tier": "PRO", "membership_label": "Suno Pro"}
+
+        if sess_user.get("is_vip") or sess_user.get("is_trusted_vip"):
+            return {"is_member": True, "plan_tier": "VIP", "membership_label": "Suno VIP"}
+
+        return {"is_member": False, "plan_tier": "FREE", "membership_label": "免费版"}
+
+    @staticmethod
+    def _extract_clerk_identity(clerk_user: Optional[Dict[str, Any]]) -> Dict[str, str]:
+        """从 Clerk user 对象中提取姓名、邮箱和头像"""
+        u = clerk_user or {}
+        if not isinstance(u, dict):
+            return {"id": "", "name": "", "email": "", "avatar_url": ""}
+
+        primary_id = u.get("primary_email_address_id")
+        emails = u.get("email_addresses") or []
+        email = ""
+        if isinstance(emails, list):
+            for item in emails:
+                if isinstance(item, dict) and primary_id and item.get("id") == primary_id and item.get("email_address"):
+                    email = str(item["email_address"]).strip()
+                    break
+            if not email:
+                for item in emails:
+                    if isinstance(item, dict) and item.get("email_address"):
+                        email = str(item["email_address"]).strip()
+                        break
+
+        if not email and isinstance(u.get("external_accounts"), list):
+            for ext in u["external_accounts"]:
+                if isinstance(ext, dict) and ext.get("email_address"):
+                    email = str(ext["email_address"]).strip()
+                    break
+
+        username = str(u.get("username") or "").strip()
+        if not email and "@" in username:
+            email = username
+
+        full_name = " ".join(
+            part for part in (str(u.get("first_name") or "").strip(), str(u.get("last_name") or "").strip()) if part
+        )
+        name = full_name or (username if username and username != email else "")
+        return {
+            "id": str(u.get("id") or "").strip(),
+            "name": name,
+            "email": email,
+            "avatar_url": str(u.get("image_url") or "").strip(),
+        }
+
+    def get_account_profile(self, force_refresh: bool = False, auto_visit: bool = False) -> Dict[str, Any]:
+        """获取当前 Suno 账号完整资料、会员等级与积分额度"""
+        jwt = self.ensure_jwt(force_refresh=force_refresh, auto_visit=auto_visit)
+        claims = self._decode_jwt_claims(jwt)
+
+        billing_raw = self._api_request("GET", "/api/billing/info/", timeout=15, auto_visit=auto_visit)
+        if not isinstance(billing_raw, dict):
+            billing_raw = {}
+
+        session_data: Dict[str, Any] = {}
+        try:
+            sess_res = self._api_request("GET", "/api/session/", timeout=12, auto_visit=auto_visit)
+            if isinstance(sess_res, dict):
+                session_data = sess_res
+        except Exception:
+            pass
+
+        sess_user = session_data.get("user") if isinstance(session_data.get("user"), dict) else {}
+        clerk_id_info = self._extract_clerk_identity(self.clerk_user)
+
+        email = (
+            str(sess_user.get("email") or "").strip()
+            or str(claims.get("suno.com/claims/email") or claims.get("email") or "").strip()
+            or clerk_id_info["email"]
+        )
+        handle = str(sess_user.get("handle") or claims.get("suno/handle") or "").strip()
+        name = (
+            str(sess_user.get("display_name") or "").strip()
+            or clerk_id_info["name"]
+            or handle
+            or (email.split("@")[0] if email else "")
+            or "Suno 用户"
+        )
+        raw_id = (
+            str(sess_user.get("id") or sess_user.get("clerk_id") or "").strip()
+            or str(claims.get("sub") or claims.get("suno/user_id") or "").strip()
+            or clerk_id_info["id"]
+            or "default"
+        )
+        avatar_url = str(sess_user.get("avatar_image_url") or clerk_id_info["avatar_url"] or "").strip()
+
+        membership = self._parse_suno_membership(billing_raw, session_data, claims)
+        total_credits = billing_raw.get("total_credits_left", 0) or 0
+        try:
+            songs_left = int(float(total_credits) // 10)
+        except Exception:
+            songs_left = 0
+        monthly_usage = billing_raw.get("monthly_usage", 0) or 0
+        monthly_limit = billing_raw.get("monthly_limit", 0) or 0
+
+        return {
+            "raw_id": raw_id,
+            "name": name,
+            "email": email,
+            "handle": handle,
+            "avatar_url": avatar_url,
+            "is_member": membership["is_member"],
+            "plan_tier": membership["plan_tier"],
+            "membership_label": membership["membership_label"],
+            "total_credits_left": total_credits,
+            "songs_left": songs_left,
+            "monthly_usage": monthly_usage,
+            "monthly_limit": monthly_limit,
+            "period": billing_raw.get("period", "day"),
+            "is_active": bool(billing_raw.get("is_active")),
+            "total_clips": sess_user.get("total_clips"),
+            "billing_raw": billing_raw,
+            "session_raw": session_data,
+            "jwt_claims": claims,
+        }
+
+    def get_dashboard_accounts(self, refresh: bool = False) -> List[Dict[str, Any]]:
+        """返回供统一账号看板展示的标准化 Suno 账号列表（失败或未登录时安全降级）"""
+        if not is_service_enabled("suno"):
+            return []
+        now = int(time.time())
+        try:
+            self.get_raw_cookies(force_fetch=refresh, auto_visit=False)
+        except Exception:
+            return []
+
+        try:
+            profile = self.get_account_profile(force_refresh=refresh, auto_visit=False)
+            total_credits = profile["total_credits_left"]
+            songs_left = profile["songs_left"]
+            monthly_usage = profile["monthly_usage"]
+            monthly_limit = profile["monthly_limit"]
+            quota_summary = f"剩余 {total_credits} 积分 (约 {songs_left} 首) · 本月 {monthly_usage}/{monthly_limit}"
+            note_parts = []
+            if profile.get("handle"):
+                note_parts.append(f"@{profile['handle']}")
+            if profile.get("total_clips") is not None:
+                note_parts.append(f"累计作品 {profile['total_clips']} 首")
+
+            return [
+                {
+                    "platform": "suno",
+                    "platform_name": "Suno",
+                    "id": f"suno:{profile['raw_id']}",
+                    "raw_id": profile["raw_id"],
+                    "name": profile["name"],
+                    "email": profile["email"],
+                    "is_member": profile["is_member"],
+                    "plan_tier": profile["plan_tier"],
+                    "membership": profile["plan_tier"],
+                    "membership_label": profile["membership_label"],
+                    "quota_summary": quota_summary,
+                    "status": "ready",
+                    "visible": True,
+                    "note": " · ".join(note_parts),
+                    "source": self.cookie_source or "cookie_cache",
+                    "login_url": "https://suno.com/",
+                    "updated_at": now,
+                    "details": {
+                        "user_id": profile["raw_id"],
+                        "handle": profile["handle"],
+                        "avatar_url": profile["avatar_url"],
+                        "total_credits_left": total_credits,
+                        "songs_left": songs_left,
+                        "monthly_usage": monthly_usage,
+                        "monthly_limit": monthly_limit,
+                        "period": profile["period"],
+                        "is_active": profile["is_active"],
+                        "total_clips": profile["total_clips"],
+                    },
+                }
+            ]
+        except Exception as exc:
+            err_msg = str(exc)
+            low = err_msg.lower()
+            is_auth_err = any(
+                k in low
+                for k in ("401", "403", "clerk", "last_active_session_id", "jwt", "unauthorized", "login", "cookie")
+            )
+            claims = self._decode_jwt_claims(self.jwt_token)
+            clerk_id_info = self._extract_clerk_identity(self.clerk_user)
+            email = str(claims.get("suno.com/claims/email") or claims.get("email") or clerk_id_info["email"] or "").strip()
+            handle = str(claims.get("suno/handle") or "").strip()
+            name = clerk_id_info["name"] or handle or (email.split("@")[0] if email else "")
+            raw_id = str(claims.get("sub") or claims.get("suno/user_id") or clerk_id_info["id"] or "").strip()
+
+            if not (email or name or raw_id):
+                return []
+
+            return [
+                {
+                    "platform": "suno",
+                    "platform_name": "Suno",
+                    "id": f"suno:{raw_id or 'default'}",
+                    "raw_id": raw_id or "default",
+                    "name": name or "Suno 用户",
+                    "email": email,
+                    "is_member": False,
+                    "plan_tier": "FREE",
+                    "membership": "FREE",
+                    "membership_label": "免费版",
+                    "quota_summary": "登录凭证已过期" if is_auth_err else "暂无法获取积分额度",
+                    "status": "not_logged_in" if is_auth_err else "offline",
+                    "visible": True,
+                    "note": err_msg[:180],
+                    "source": self.cookie_source or "cookie_cache",
+                    "login_url": "https://suno.com/",
+                    "updated_at": now,
+                    "details": {
+                        "user_id": raw_id,
+                        "handle": handle,
+                        "error": err_msg,
+                    },
+                }
+            ]
+
+    def refresh_dashboard_accounts(self) -> List[Dict[str, Any]]:
+        """强制刷新 Suno Cookie/JWT 并返回最新看板账号信息"""
+        require_service_enabled("suno")
+        return self.get_dashboard_accounts(refresh=True)
 
     def get_credits(self) -> Dict[str, Any]:
         """

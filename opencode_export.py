@@ -25,6 +25,7 @@ MODEL_DISPLAY_NAMES: Dict[str, str] = {
     # ChatGPT Plus / 高阶 / 工作台专有模型 (Plus 账号展示，免费版暂不展示)
     "research": "Deep Research（全网深度研究）",
     "gpt-5-6": "GPT-5.6 Luna（深度推理）",
+    "gpt-6-plus": "GPT-6 Plus（深度旗舰）",
     "gpt-6-thinking": "GPT-6 Thinking（深度思考）",
     "gpt-6-instant": "GPT-6 Instant（极速响应）",
     "gpt-5.6-luna-wm": "GPT-5.6 Luna（协同工作区）",
@@ -60,6 +61,7 @@ MODEL_DISPLAY_NAMES: Dict[str, str] = {
 PLUS_EXCLUSIVE_MODELS = {
     "research",
     "gpt-5-6",
+    "gpt-6-plus",
     "gpt-6-thinking",
     "gpt-5-6-thinking",
     "gpt-5.6-luna-wm",
@@ -84,8 +86,16 @@ INTERNAL_HIDDEN_MODELS = {
 
 
 def default_config_path() -> str:
+    override = os.environ.get("OPENCODE_CONFIG_PATH", "").strip()
+    if override:
+        return override
     home = os.path.expanduser("~")
-    return os.path.join(home, ".config", "opencode", "opencode.json")
+    candidate = os.path.join(home, ".config", "opencode", "opencode.json")
+    if os.name == "nt" and "systemprofile" in home.lower():
+        admin_cfg = r"C:\Users\Administrator\.config\opencode\opencode.json"
+        if os.path.exists(os.path.dirname(admin_cfg)):
+            return admin_cfg
+    return candidate
 
 
 def _display_name(model: Dict[str, Any]) -> str:
@@ -171,6 +181,8 @@ def models_for_opencode(raw_models: List[Dict[str, Any]], plan: str = "free") ->
             "name": _display_name(item),
             "limit": _limits(mid),
         }
+        if mid not in ("chatgpt-web", "chatgpt-web-moni"):
+            entry["tool_call"] = True
         if _supports_reasoning(mid):
             entry["reasoning"] = True
             entry["variants"] = {
@@ -186,13 +198,14 @@ def build_provider(
     raw_models: List[Dict[str, Any]],
     base_url: str = DEFAULT_BASE_URL,
     plan: str = "free",
+    api_key: str = DEFAULT_API_KEY,
 ) -> Dict[str, Any]:
     return {
         "npm": "@ai-sdk/openai-compatible",
         "name": PROVIDER_NAME,
         "options": {
             "baseURL": base_url.rstrip("/"),
-            "apiKey": DEFAULT_API_KEY,
+            "apiKey": (api_key or DEFAULT_API_KEY),
         },
         "models": models_for_opencode(raw_models, plan=plan),
     }
@@ -205,8 +218,9 @@ def merge_config(
     set_default: bool = False,
     default_model: str = "gemini-3.5-flash-lite",
     plan: str = "free",
+    api_key: str = DEFAULT_API_KEY,
 ) -> Dict[str, Any]:
-    provider = build_provider(raw_models, base_url=base_url, plan=plan)
+    provider = build_provider(raw_models, base_url=base_url, plan=plan, api_key=api_key)
     providers = config.get("provider")
     if not isinstance(providers, dict):
         providers = {}
@@ -224,6 +238,7 @@ def export_to_file(
     base_url: str = DEFAULT_BASE_URL,
     set_default: bool = False,
     plan: str = "free",
+    api_key: str = DEFAULT_API_KEY,
 ) -> Dict[str, Any]:
     target = path or default_config_path()
     os.makedirs(os.path.dirname(target), exist_ok=True)
@@ -233,7 +248,7 @@ def export_to_file(
             loaded = json.load(fh)
         if isinstance(loaded, dict):
             config = loaded
-    merge_config(config, raw_models, base_url=base_url, set_default=set_default, plan=plan)
+    merge_config(config, raw_models, base_url=base_url, set_default=set_default, plan=plan, api_key=api_key)
     with open(target, "w", encoding="utf-8") as fh:
         json.dump(config, fh, ensure_ascii=False, indent=2)
         fh.write("\n")

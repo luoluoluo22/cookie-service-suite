@@ -22,6 +22,7 @@ import urllib.error
 import urllib.request
 
 from aistudio_service import AIStudioService, _LOCAL_OPENER, _NoRedirectHandler
+from web_api_switches import get_google_sync_settings, is_service_enabled, AISTUDIO_REMOTE_SYNC_PID
 
 ROOT = Path(__file__).resolve().parent
 CONFIG = ROOT / "runtime_state" / "aistudio_remote_sync.json"
@@ -184,6 +185,9 @@ def wait_task(base, task_id, account, timeout=120):
 
 
 def sync_once(config):
+    if not is_service_enabled("aistudio"):
+        logger.info("AI Studio 网页 API 已关闭，跳过远端 Cookie 同步")
+        return
     service = AIStudioService()
     hub = json_request(service.bridge_url + "/cookies?domain=google.com")
     cookies = hub.get("cookies") or []
@@ -261,18 +265,41 @@ def main():
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
-    while True:
+    if not args.once:
         try:
-            config = json.loads(CONFIG.read_text(encoding="utf-8"))
-            if config.get("enabled"):
-                sync_once(config)
-        except Exception as exc:
-            logger.warning("远端同步未完成: %s", type(exc).__name__)
+            AISTUDIO_REMOTE_SYNC_PID.parent.mkdir(parents=True, exist_ok=True)
+            AISTUDIO_REMOTE_SYNC_PID.write_text(str(os.getpid()), encoding="utf-8")
+        except OSError:
+            pass
+    try:
+        while True:
+            try:
+                if not is_service_enabled("aistudio"):
+                    logger.info("AI Studio 网页 API 已关闭，远端同步守护进程退出。")
+                    return
+                gs = get_google_sync_settings()
+                if not gs.get("auto_sync_enabled", True) or gs.get("cookie_sync_interval_sec", 0) <= 0:
+                    logger.info("Google 自动 Cookie 监听与同步已暂停，跳过本轮同步。")
+                else:
+                    config = json.loads(CONFIG.read_text(encoding="utf-8"))
+                    if config.get("enabled"):
+                        sync_once(config)
+            except Exception as exc:
+                logger.warning("远端同步未完成: %s", type(exc).__name__)
+                if args.once:
+                    raise
             if args.once:
-                raise
-        if args.once:
-            return
-        time.sleep(300)
+                return
+            gs_sleep = get_google_sync_settings()
+            interval = int(gs_sleep.get("cookie_sync_interval_sec", 1800) or 1800)
+            time.sleep(max(60, interval))
+    finally:
+        if not args.once:
+            try:
+                if AISTUDIO_REMOTE_SYNC_PID.is_file() and AISTUDIO_REMOTE_SYNC_PID.read_text(encoding="utf-8").strip() == str(os.getpid()):
+                    AISTUDIO_REMOTE_SYNC_PID.unlink()
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":

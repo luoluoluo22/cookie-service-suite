@@ -160,6 +160,30 @@ class ChatHistoryManager:
                 conn.commit()
             finally:
                 conn.close()
+        try:
+            self.expire_stale_running(max_age_seconds=1800)
+        except Exception:
+            pass
+
+    def expire_stale_running(self, max_age_seconds: int = 1800) -> int:
+        """Mark long-abandoned in-flight rows (status 0 or 102) as timed out."""
+        cutoff = time.time() - max(60, int(max_age_seconds))
+        with self._write_lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.execute(
+                    "UPDATE chat_logs SET status = 504, "
+                    "error_message = CASE WHEN COALESCE(error_message, '') = '' THEN ? ELSE error_message END "
+                    "WHERE status IN (0, 102) AND timestamp IS NOT NULL AND timestamp < ?",
+                    ("任务中断或超时未完成", cutoff),
+                )
+                conn.commit()
+                return cur.rowcount or 0
+            except Exception as e:
+                print(f"[ChatHistory] Failed to expire stale running chats: {e}")
+                return 0
+            finally:
+                conn.close()
 
     def get_db_size_bytes(self) -> int:
         """Calculate total disk usage including WAL and SHM files."""
@@ -282,6 +306,35 @@ class ChatHistoryManager:
                 conn.close()
 
             return inserted_id
+
+    def start_chat(self, endpoint: str, model: str, messages: Any, is_stream: bool = False, actual_model: str = '', trace_id: str = '', meta: Optional[Dict[str, Any]] = None) -> int:
+        return self.record_chat(endpoint=endpoint, model=model, messages=messages, response_text='', status=0, latency_ms=0, is_stream=is_stream, actual_model=actual_model, error_message='', trace_id=trace_id, meta=meta)
+
+    def finish_chat(self, chat_id: int, response_text: str = '', status: int = 200, latency_ms: int = 0, actual_model: str = '', error_message: str = '', meta: Optional[Dict[str, Any]] = None) -> bool:
+        if not chat_id or int(chat_id) <= 0:
+            return False
+        with self._write_lock:
+            conn = self._get_connection()
+            try:
+                if meta is not None:
+                    conn.execute(
+                        "UPDATE chat_logs SET status = ?, latency_ms = ?, response_text = ?, error_message = ?, "
+                        "actual_model = COALESCE(NULLIF(?, ''), actual_model), meta_json = ? WHERE id = ?",
+                        (int(status), int(latency_ms), response_text or "", error_message or "", actual_model or "", json.dumps(meta, ensure_ascii=False), int(chat_id)),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE chat_logs SET status = ?, latency_ms = ?, response_text = ?, error_message = ?, "
+                        "actual_model = COALESCE(NULLIF(?, ''), actual_model) WHERE id = ?",
+                        (int(status), int(latency_ms), response_text or "", error_message or "", actual_model or "", int(chat_id)),
+                    )
+                conn.commit()
+                return True
+            except Exception as e:
+                print(f'[ChatHistory] Failed to finish chat {chat_id}: {e}')
+                return False
+            finally:
+                conn.close()
 
     def list_chats(
         self,
@@ -486,23 +539,19 @@ def wrap_chat_stream(
     collected_texts = []
     error_occurred = None
     status_code = 200
+    chat_id = -1
+    try:
+        chat_id = manager.start_chat(endpoint=endpoint, model=model, messages=messages, is_stream=True, actual_model=actual_model or model, trace_id=trace_id, meta=meta)
+    except Exception:
+        chat_id = -1
 
     def _save_record(full_text: str, status: int, err: str):
         try:
             latency = int((time.time() - start_time) * 1000)
-            manager.record_chat(
-                endpoint=endpoint,
-                model=model,
-                messages=messages,
-                response_text=full_text,
-                status=status,
-                latency_ms=latency,
-                is_stream=True,
-                actual_model=actual_model or model,
-                error_message=err,
-                trace_id=trace_id,
-                meta=meta
-            )
+            if chat_id and chat_id > 0:
+                manager.finish_chat(chat_id, response_text=full_text, status=status, latency_ms=latency, actual_model=actual_model or model, error_message=err, meta=meta)
+            else:
+                manager.record_chat(endpoint=endpoint, model=model, messages=messages, response_text=full_text, status=status, latency_ms=latency, is_stream=True, actual_model=actual_model or model, error_message=err, trace_id=trace_id, meta=meta)
         except Exception:
             pass
 

@@ -192,6 +192,27 @@ function connectBridge() {
           return;
         }
 
+        // 4.655 关闭指定临时标签页
+        if (req.action === 'close_tab') {
+          try {
+            await chrome.tabs.remove(Number(req.tabId));
+            ws.send(JSON.stringify({
+              id: req.id,
+              action: 'close_tab',
+              success: true,
+              tabId: Number(req.tabId)
+            }));
+          } catch (err) {
+            ws.send(JSON.stringify({
+              id: req.id,
+              action: 'close_tab',
+              success: false,
+              error: err.message
+            }));
+          }
+          return;
+        }
+
         // 4.66 通用导航/跳转指定标签页
         if (req.action === 'navigate_tab') {
           try {
@@ -351,6 +372,53 @@ function connectBridge() {
             }));
           } catch (err) {
             ws.send(JSON.stringify({ id: req.id, action: 'gemini_inspect', success: false, error: err.message }));
+          }
+          return;
+        }
+
+        // 5.2b Gemini 页面网络抓包读取/注入 (绕过 CSP)
+        if (req.action === 'gemini_captures') {
+          try {
+            const tabs = req.tabId
+              ? [await chrome.tabs.get(req.tabId)]
+              : await chrome.tabs.query({ url: '*://gemini.google.com/*' });
+            if (!tabs || tabs.length === 0) {
+              ws.send(JSON.stringify({ id: req.id, action: 'gemini_captures', success: false, error: '未找到已打开的 gemini.google.com 标签页' }));
+              return;
+            }
+            const tabId = tabs[0].id;
+            const checkRes = await chrome.scripting.executeScript({
+              target: { tabId },
+              world: 'MAIN',
+              func: (shouldClear) => {
+                const installed = !!window.__gemini_hook_installed__;
+                const calls = Array.isArray(window.__gemini_captured_calls)
+                  ? window.__gemini_captured_calls.slice()
+                  : [];
+                if (shouldClear && typeof window.__gemini_clear_calls === 'function') {
+                  window.__gemini_clear_calls();
+                }
+                return { installed, url: location.href, count: calls.length, calls };
+              },
+              args: [!!req.clear]
+            });
+            let data = checkRes && checkRes[0] ? checkRes[0].result : null;
+            if (data && !data.installed) {
+              await chrome.scripting.executeScript({
+                target: { tabId },
+                world: 'MAIN',
+                files: ['gemini_hook.js']
+              });
+              data.injectedNow = true;
+            }
+            ws.send(JSON.stringify({
+              id: req.id,
+              action: 'gemini_captures',
+              success: true,
+              data
+            }));
+          } catch (err) {
+            ws.send(JSON.stringify({ id: req.id, action: 'gemini_captures', success: false, error: err.message }));
           }
           return;
         }
@@ -1518,11 +1586,45 @@ async function dispatchToUdioTab(action, payload) {
   return { success: false, error: '未知 Udio 操作: ' + action };
 }
 
+async function waitForTabLoadAndHydrate(tabId, timeoutMs = 15000) {
+  await new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      try { chrome.tabs.onUpdated.removeListener(onUpdated); } catch (_) {}
+      resolve();
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    const onUpdated = (updatedTabId, changeInfo) => {
+      if (updatedTabId === tabId && changeInfo && changeInfo.status === 'complete') {
+        clearTimeout(timer);
+        setTimeout(finish, 1800);
+      }
+    };
+    chrome.tabs.onUpdated.addListener(onUpdated);
+  });
+}
+
 // Helper: Dispatch action into ChatGPT tab using direct chrome.scripting.executeScript
 async function dispatchToChatGPTTab(action, payload) {
   // Query ChatGPT tabs
   const allTabs = await chrome.tabs.query({});
-  const gptTabs = allTabs.filter(t => t.url && t.url.includes('chatgpt.com'));
+  const gptTabs = allTabs.filter(t => {
+    if (!t.url) return false;
+    try {
+      const h = new URL(t.url).hostname.toLowerCase();
+      return h === 'chatgpt.com' || h.endsWith('.chatgpt.com');
+    } catch {
+      return false;
+    }
+  });
+
+  if (!gptTabs.length && action === 'chatgpt_get_session' && payload && (payload.autoOpen || payload.refresh)) {
+    const newTab = await chrome.tabs.create({ url: 'https://chatgpt.com/', active: false });
+    await waitForTabLoadAndHydrate(newTab.id, 15000);
+    gptTabs.push(newTab);
+  }
 
   if (!gptTabs.length) {
     throw new Error('未在浏览器中找到打开的 chatgpt.com 标签页，请确保浏览器中有一个 chatgpt.com 标签！');
@@ -1557,73 +1659,58 @@ async function dispatchToChatGPTTab(action, payload) {
     activeBridgeTabId = tab.id;
   }
 
-  // 1. Get Session
+  // 1. Get Session (supports auto tab-reload when token is expired or refresh=true)
   if (action === 'chatgpt_get_session') {
-    const results = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: async () => {
-        const diagnostics = {};
-        diagnostics.location = window.location.href;
-        diagnostics.title = document.title;
-        
-        // 1. Try standard /api/auth/session
-        try {
-          const res = await fetch('/api/auth/session', { credentials: 'include' });
-          diagnostics.api_auth_session_status = res.status;
-          if (res.ok) {
-            const data = await res.json();
-            if (data && data.accessToken) {
-              return { success: true, session: data };
-            }
-            diagnostics.api_auth_session_body = data;
-          }
-        } catch (e) {
-          diagnostics.api_auth_session_err = e.message;
-        }
-
-        // 2. Try candidate endpoints
-        const candidateUrls = [
-          '/backend-api/me',
-          '/backend-api/session',
-          '/api/auth/csrf',
-          '/api/auth/providers'
-        ];
-        for (const url of candidateUrls) {
+    const runSessionCheck = async (targetTabId) => {
+      const results = await chrome.scripting.executeScript({
+        target: { tabId: targetTabId },
+        func: async () => {
+          const diagnostics = {};
+          diagnostics.location = window.location.href;
+          diagnostics.title = document.title;
           try {
-            const r = await fetch(url, { credentials: 'include' });
-            diagnostics[url] = { status: r.status };
-            if (r.ok) {
-              const text = await r.text();
-              try { diagnostics[url].data = JSON.parse(text); } catch(e) { diagnostics[url].text = text.slice(0, 100); }
+            const res = await fetch('/api/auth/session', { credentials: 'include' });
+            diagnostics.api_auth_session_status = res.status;
+            if (res.ok) {
+              const data = await res.json();
+              if (data && data.accessToken) {
+                let tokenInvalid = false;
+                try {
+                  const meRes = await fetch('/backend-api/me', {
+                    credentials: 'include',
+                    headers: { 'Authorization': 'Bearer ' + data.accessToken, 'Accept': 'application/json' }
+                  });
+                  diagnostics.me_status = meRes.status;
+                  if (meRes.status === 401 || meRes.status === 403) {
+                    tokenInvalid = true;
+                  }
+                } catch (_) {}
+                return { success: true, session: data, tokenInvalid, diagnostics };
+              }
+              diagnostics.api_auth_session_body = data;
             }
-          } catch(e) {
-            diagnostics[url] = { error: e.message };
+          } catch (e) {
+            diagnostics.api_auth_session_err = e.message;
           }
+          return { success: false, error: 'Session fetch failed', tokenInvalid: true, diagnostics };
         }
+      });
+      return results[0]?.result || { success: false, error: 'No result returned', tokenInvalid: true };
+    };
 
-        // 3. Check performance resource entries
-        try {
-          const resources = performance.getEntriesByType('resource')
-            .map(r => r.name)
-            .filter(n => n.includes('/backend-api/') || n.includes('/api/auth/') || n.includes('token') || n.includes('session'));
-          diagnostics.matched_resources = resources.slice(-15);
-        } catch(e) {}
-
-        // 4. Check window / localStorage keys
-        try {
-          const lsKeys = Object.keys(localStorage);
-          diagnostics.localStorageKeys = lsKeys.slice(0, 30);
-          for (const k of lsKeys) {
-            if (k.toLowerCase().includes('token') || k.toLowerCase().includes('session') || k.toLowerCase().includes('auth')) {
-              diagnostics['ls_' + k] = String(localStorage.getItem(k)).slice(0, 100);
-            }
-          }
-        } catch(e) {}
-
-        return { success: false, error: 'Session fetch failed', diagnostics };
+    let sessionRes = await runSessionCheck(tab.id);
+    const shouldReload = Boolean((payload && payload.refresh) || !sessionRes.success || sessionRes.tokenInvalid);
+    if (shouldReload) {
+      try {
+        await chrome.tabs.reload(tab.id);
+        await waitForTabLoadAndHydrate(tab.id, 15000);
+        sessionRes = await runSessionCheck(tab.id);
+        sessionRes.refreshedTab = true;
+      } catch (reloadErr) {
+        sessionRes.reloadError = reloadErr && reloadErr.message ? reloadErr.message : String(reloadErr);
       }
-    });
-    return results[0]?.result || { success: false, error: 'No result returned' };
+    }
+    return sessionRes;
   }
 
   // 1.5 Get Models via in-page fetch

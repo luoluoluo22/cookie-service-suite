@@ -127,24 +127,10 @@ if not _acquire_single_instance():
 
 
 def _start_aistudio_remote_sync():
-    """Start the optional SSH synchronizer; its own mutex prevents duplicates."""
-    import json
-    import subprocess
-    config_path = os.path.join(BASE_DIR, "runtime_state", "aistudio_remote_sync.json")
+    """Start the optional SSH synchronizer when AI Studio Web API and remote sync are both enabled."""
     try:
-        with open(config_path, "r", encoding="utf-8") as stream:
-            if not json.load(stream).get("enabled"):
-                return
-        executable = sys.executable
-        if sys.platform == "win32":
-            candidate = os.path.join(os.path.dirname(executable), "pythonw.exe")
-            if os.path.isfile(candidate):
-                executable = candidate
-        subprocess.Popen(
-            [executable, os.path.join(BASE_DIR, "aistudio_remote_sync.py")],
-            cwd=BASE_DIR, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
+        from web_api_switches import start_aistudio_remote_sync
+        start_aistudio_remote_sync()
     except Exception as exc:
         print(f"[AIStudio] 远端同步启动失败: {type(exc).__name__}", flush=True)
 
@@ -155,11 +141,33 @@ _start_aistudio_remote_sync()
 # 运行模式选择
 if "--no-tray" in sys.argv:
     import uvicorn
-    from app_service import app
-    print("🚀 [命令行模式] 正在启动 Cookie Service Suite API 服务: http://127.0.0.1:18800")
-    print("📚 Swagger 交互式文档: http://127.0.0.1:18800/docs")
-    print("🌐 Web 管理控制台:     http://127.0.0.1:18800/")
-    uvicorn.run(app, host="127.0.0.1", port=18800)
+    from app_service import app, gemini_pool, COOKIE_SUITE_HOST, COOKIE_SUITE_PORT
+
+    listen_host = COOKIE_SUITE_HOST
+    listen_port = COOKIE_SUITE_PORT
+    if "--host" in sys.argv:
+        idx = sys.argv.index("--host")
+        if idx + 1 < len(sys.argv) and sys.argv[idx + 1].strip():
+            listen_host = sys.argv[idx + 1].strip()
+    if "--port" in sys.argv:
+        idx = sys.argv.index("--port")
+        if idx + 1 < len(sys.argv):
+            listen_port = int(sys.argv[idx + 1])
+
+    try:
+        from web_api_switches import is_service_enabled
+        if is_service_enabled("gemini"):
+            gemini_pool._schedule_account_sync()
+        else:
+            print("⛔ [Gemini] 网页 API 已在管理控制台关闭，跳过启动与账号同步。", flush=True)
+    except Exception as exc:
+        print(f"⚠️ [Gemini] 后台账号同步初始化提示: {type(exc).__name__}", flush=True)
+
+    display_host = "127.0.0.1" if listen_host in ("0.0.0.0", "::") else listen_host
+    print(f"🚀 [命令行模式] 正在启动 Cookie Service Suite API 服务: http://{listen_host}:{listen_port}")
+    print(f"📚 Swagger 交互式文档: http://{display_host}:{listen_port}/docs")
+    print(f"🌐 Web 管理控制台:     http://{display_host}:{listen_port}/")
+    uvicorn.run(app, host=listen_host, port=listen_port)
 else:
     from tray_service import TrayAppServer
     auto_open = "--no-browser" not in sys.argv

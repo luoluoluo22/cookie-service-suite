@@ -20,6 +20,7 @@ import sys
 import time
 import json
 import re
+import base64
 import urllib.parse
 from typing import Optional, Dict, Any, List, Union, Callable
 
@@ -28,6 +29,7 @@ os.environ["NO_PROXY"] = "127.0.0.1,localhost,::1"
 
 from curl_cffi import requests
 from cookie_bridge import CookieBridge
+from web_api_switches import is_service_enabled, require_service_enabled
 
 DEFAULT_BRIDGE_URL = "http://127.0.0.1:18888"
 UDIO_BASE_URL = "https://www.udio.com"
@@ -77,7 +79,7 @@ class UdioService:
         if not self.cookie_string:
             self._load_cookie_cache()
 
-        if not self.cookie_string:
+        if not self.cookie_string and is_service_enabled("udio"):
             self.refresh_cookie_from_browser()
 
         self._extract_auth_token()
@@ -107,6 +109,7 @@ class UdioService:
 
     def refresh_cookie_from_browser(self, timeout: int = 15) -> bool:
         """尝试通过本地 CookieBridge 从 Chrome / Edge 提取 udio.com 的 Cookie"""
+        require_service_enabled("udio")
         try:
             header_cookie = self.bridge.get_cookies_header("udio.com")
             if header_cookie and "sb-" in header_cookie:
@@ -330,3 +333,183 @@ class UdioService:
                 f.write(resp.content)
             return filepath
         raise RuntimeError(f"下载曲目失败 (HTTP {resp.status_code})")
+
+    @staticmethod
+    def _decode_jwt_claims(token: Optional[str]) -> Dict[str, Any]:
+        if not token or not isinstance(token, str):
+            return {}
+        parts = token.split(".")
+        if len(parts) < 2:
+            return {}
+        payload_b64 = parts[1]
+        padding = "=" * (-len(payload_b64) % 4)
+        try:
+            raw = base64.urlsafe_b64decode(payload_b64 + padding)
+            data = json.loads(raw.decode("utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _parse_subscription(user_data: Dict[str, Any]) -> Dict[str, Any]:
+        sub = (
+            user_data.get("subscription")
+            or user_data.get("plan")
+            or user_data.get("plan_tier")
+            or user_data.get("tier")
+            or user_data.get("subscription_tier")
+            or user_data.get("membership")
+        )
+
+        tier_raw = ""
+        active = True
+        if isinstance(sub, dict):
+            tier_raw = str(
+                sub.get("tier")
+                or sub.get("plan")
+                or sub.get("name")
+                or sub.get("type")
+                or ""
+            ).strip()
+            status_val = str(sub.get("status") or "").strip().lower()
+            if status_val and status_val not in ("active", "trialing", "paid"):
+                active = False
+        elif isinstance(sub, str):
+            tier_raw = sub.strip()
+
+        tier_lower = tier_raw.lower()
+        if not tier_lower and (user_data.get("is_pro") or user_data.get("is_subscriber")):
+            tier_lower = "pro"
+
+        if not active or tier_lower in ("", "free", "none", "basic"):
+            return {
+                "is_member": False,
+                "plan_tier": "FREE",
+                "membership_label": "免费版",
+            }
+        if "pro" in tier_lower:
+            return {
+                "is_member": True,
+                "plan_tier": "PRO",
+                "membership_label": "Udio Pro",
+            }
+        if "standard" in tier_lower or "plus" in tier_lower:
+            return {
+                "is_member": True,
+                "plan_tier": "STANDARD",
+                "membership_label": "Udio Standard",
+            }
+        return {
+            "is_member": True,
+            "plan_tier": tier_raw.upper(),
+            "membership_label": f"Udio {tier_raw.title()}",
+        }
+
+    @staticmethod
+    def _parse_credits_summary(user_data: Dict[str, Any]) -> str:
+        usage = user_data.get("usage") if isinstance(user_data.get("usage"), dict) else {}
+        remaining = (
+            user_data.get("remaining_credits")
+            if user_data.get("remaining_credits") is not None
+            else user_data.get("credits")
+        )
+        if remaining is None:
+            remaining = usage.get("credits_remaining") or usage.get("remaining")
+        monthly = (
+            user_data.get("monthly_credits")
+            or usage.get("monthly_credits")
+            or usage.get("credits_limit")
+        )
+        daily = user_data.get("daily_credits") or usage.get("daily_credits")
+
+        if remaining is not None and monthly is not None:
+            return f"剩余 {remaining} / {monthly} 积分"
+        if remaining is not None:
+            return f"剩余 {remaining} 积分"
+        if daily is not None:
+            return f"每日积分 {daily}"
+        return "已登录"
+
+    def get_dashboard_accounts(self, refresh: bool = False) -> List[Dict[str, Any]]:
+        """返回供全平台账号看板消费的标准化 Udio 账号列表（未登录/断连时安全返回空列表）"""
+        if not is_service_enabled("udio"):
+            return []
+        if refresh:
+            try:
+                self.refresh_cookie_from_browser()
+            except Exception:
+                pass
+
+        if not self.cookie_string and not self.auth_token:
+            return []
+
+        try:
+            auth_res = self.check_auth()
+        except Exception:
+            return []
+
+        if not isinstance(auth_res, dict) or not auth_res.get("authenticated"):
+            return []
+
+        raw_user = auth_res.get("user") if isinstance(auth_res.get("user"), dict) else {}
+        if isinstance(raw_user.get("data"), dict) and "id" not in raw_user:
+            user_data = raw_user["data"]
+        elif isinstance(raw_user.get("user"), dict) and "id" not in raw_user:
+            user_data = raw_user["user"]
+        else:
+            user_data = raw_user
+
+        claims = self._decode_jwt_claims(self.auth_token)
+        jwt_meta = claims.get("user_metadata") if isinstance(claims.get("user_metadata"), dict) else {}
+
+        email = str(user_data.get("email") or claims.get("email") or "").strip()
+        raw_id = str(
+            user_data.get("id")
+            or user_data.get("user_id")
+            or claims.get("sub")
+            or email
+            or "browser"
+        )
+        name = str(
+            user_data.get("display_name")
+            or user_data.get("username")
+            or user_data.get("name")
+            or user_data.get("artist_name")
+            or jwt_meta.get("full_name")
+            or jwt_meta.get("name")
+            or jwt_meta.get("preferred_username")
+            or email
+            or raw_id
+        ).strip()
+
+        sub_info = self._parse_subscription(user_data)
+        quota_summary = self._parse_credits_summary(user_data)
+
+        return [
+            {
+                "platform": "udio",
+                "platform_name": "Udio",
+                "id": f"udio:{raw_id}",
+                "raw_id": raw_id,
+                "name": name,
+                "email": email,
+                "is_member": sub_info["is_member"],
+                "plan_tier": sub_info["plan_tier"],
+                "membership_label": sub_info["membership_label"],
+                "quota_summary": quota_summary,
+                "status": "ready",
+                "visible": True,
+                "note": f"ID: {raw_id}" if raw_id != name else "",
+                "source": "browser_session",
+                "login_url": "https://www.udio.com/",
+                "updated_at": int(time.time()),
+                "details": {
+                    "user": user_data,
+                },
+            }
+        ]
+
+    def refresh_dashboard_accounts(self) -> List[Dict[str, Any]]:
+        """强制刷新浏览器凭证并返回最新 Udio 账号列表"""
+        require_service_enabled("udio")
+        return self.get_dashboard_accounts(refresh=True)

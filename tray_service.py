@@ -87,7 +87,8 @@ from PIL import Image
 import uvicorn
 
 from generate_icon import ensure_app_icon, PNG_PATH, ICO_PATH
-from app_service import app, gemini_pool, chatgpt_client, aistudio_client
+from app_service import app, gemini_pool, chatgpt_client, aistudio_client, COOKIE_SUITE_HOST, COOKIE_SUITE_PORT
+from web_api_switches import is_service_enabled
 from autostart import (
     is_autostart_enabled,
     enable_autostart,
@@ -96,8 +97,9 @@ from autostart import (
     get_autostart_command,
 )
 
-SERVER_HOST = "127.0.0.1"
-SERVER_PORT = 18800
+BIND_HOST = COOKIE_SUITE_HOST
+SERVER_HOST = "127.0.0.1" if BIND_HOST in ("0.0.0.0", "::", "") else BIND_HOST
+SERVER_PORT = COOKIE_SUITE_PORT
 HUB_PORT = 18888
 GEMINI_PORT = 18083
 AISTUDIO_PORT = 2048
@@ -134,6 +136,7 @@ class TrayAppServer:
         self.monitor_thread: Optional[threading.Thread] = None
         self._api_start_lock = threading.Lock()
         self._extension_task_lock = threading.Lock()
+        self._last_menu_signature: Optional[Tuple[Any, ...]] = None
 
         # 实时服务状态缓存 (线程安全)
         self.status_cache: Dict[str, Any] = {
@@ -259,7 +262,7 @@ class TrayAppServer:
             self._ensure_port_available(SERVER_PORT)
             config = uvicorn.Config(
                 app=app,
-                host=SERVER_HOST,
+                host=BIND_HOST,
                 port=SERVER_PORT,
                 log_level="warning",
                 access_log=False,
@@ -269,7 +272,7 @@ class TrayAppServer:
 
             def _run():
                 try:
-                    print(f"🚀 [API 服务] 正在监听: http://{SERVER_HOST}:{SERVER_PORT}", flush=True)
+                    print(f"🚀 [API 服务] 正在监听: http://{BIND_HOST}:{SERVER_PORT}", flush=True)
                     self.uvicorn_server.run()
                 except Exception as e:
                     print(f"❌ [API 服务] 运行异常退出: {e}", flush=True)
@@ -290,6 +293,16 @@ class TrayAppServer:
 
     def ensure_gemini_pool(self, icon=None, item=None):
         """启动或健康检查 Gemini 多账号统一代理服务 (18083)"""
+        if not is_service_enabled("gemini"):
+            try:
+                if gemini_pool.is_running():
+                    gemini_pool.stop()
+            except Exception:
+                pass
+            if self.tray_icon and item is not None:
+                self.tray_icon.notify("Gemini 网页 API 已在管理控制台关闭，请先开启开关。", "服务已关闭")
+            print("⛔ [Gemini 池] 网页 API 已关闭，跳过启动。", flush=True)
+            return False
         try:
             gemini_pool.start()
             is_ok = gemini_pool.is_running()
@@ -312,6 +325,10 @@ class TrayAppServer:
                 if self.tray_icon:
                     self.tray_icon.notify("ChatGPT 逆向引擎已停止。", "服务操作")
             else:
+                if not is_service_enabled("chatgpt"):
+                    if self.tray_icon:
+                        self.tray_icon.notify("ChatGPT 网页 API 已在管理控制台关闭，请先开启开关。", "服务已关闭")
+                    return
                 chatgpt_client.reverse.start()
                 if self.tray_icon:
                     self.tray_icon.notify("ChatGPT 逆向引擎已在后台启动 (端口 18084)！", "服务操作")
@@ -328,6 +345,10 @@ class TrayAppServer:
                 if self.tray_icon:
                     self.tray_icon.notify("AI Studio 逆向引擎已停止。", "服务操作")
             else:
+                if not is_service_enabled("aistudio"):
+                    if self.tray_icon:
+                        self.tray_icon.notify("AI Studio 网页 API 已在管理控制台关闭，请先开启开关。", "服务已关闭")
+                    return
                 aistudio_client.start()
                 if self.tray_icon:
                     self.tray_icon.notify("AI Studio 逆向引擎已在后台启动 (端口 2048)！", "服务操作")
@@ -478,6 +499,27 @@ class TrayAppServer:
                     self.tray_icon.title = new_title
             except Exception:
                 pass
+            menu_sig = (
+                api_ok,
+                hub_ok,
+                ext_connected,
+                ext_clients,
+                gemini_ok,
+                gemini_accounts,
+                gemini_active,
+                aistudio_ok,
+                chatgpt_ok,
+                is_service_enabled("gemini"),
+                is_service_enabled("aistudio"),
+                is_service_enabled("chatgpt"),
+                int((time.time() - self.start_time) // 60),
+            )
+            if menu_sig != self._last_menu_signature:
+                self._last_menu_signature = menu_sig
+                try:
+                    self.tray_icon.update_menu()
+                except Exception:
+                    pass
 
     def _status_monitor_loop(self):
         """后台常驻状态轮询线程 (每 3 秒检测一次，支持 API 掉线自愈恢复)"""
@@ -526,17 +568,23 @@ class TrayAppServer:
 
     def _menu_text_gemini(self, item=None) -> str:
         c = self.status_cache
+        if not is_service_enabled("gemini"):
+            return "  ├─ 🤖 Gemini 统一池: ⛔ 已关闭 (控制台已停用)"
         if c["gemini_ok"]:
             return f"  ├─ 🤖 Gemini 统一池: 🟢 运行中 ({c['gemini_accounts']}账号/{c['gemini_active']}可用)"
         else:
             return "  ├─ 🤖 Gemini 统一池: ⚪ 未启动 (点击启动)"
 
     def _menu_text_aistudio(self, item=None) -> str:
+        if not is_service_enabled("aistudio"):
+            return f"  ├─ 🪄 AI Studio 逆向: ⛔ 已关闭 (端口 {AISTUDIO_PORT})"
         ok = self.status_cache.get("aistudio_ok", False)
         mark = "🟢 运行中" if ok else "⚪ 未启动"
         return f"  ├─ 🪄 AI Studio 逆向: {mark} (端口 {AISTUDIO_PORT})"
 
     def _menu_text_chatgpt(self, item=None) -> str:
+        if not is_service_enabled("chatgpt"):
+            return f"  └─ ⚡ ChatGPT 逆向: ⛔ 已关闭 (端口 {CHATGPT_PORT})"
         ok = self.status_cache["chatgpt_ok"]
         mark = "🟢 运行中" if ok else "⚪ 未启动"
         return f"  └─ ⚡ ChatGPT 逆向: {mark} (端口 {CHATGPT_PORT})"
@@ -848,9 +896,12 @@ class TrayAppServer:
         # 3. 启动 FastAPI API 主服务 (18800)
         self.start_api_server()
 
-        # 4. 确保底层 Gemini 多账号代理就绪 (18083)
+        # 4. 确保底层 Gemini 多账号代理就绪 (18083)，若控制台已关闭则跳过
         try:
-            self.ensure_gemini_pool()
+            if is_service_enabled("gemini"):
+                self.ensure_gemini_pool()
+            else:
+                print("⛔ [Gemini 池] 网页 API 已在控制面板关闭，启动时保持停止。", flush=True)
         except Exception as e:
             print(f"⚠️ Gemini 后台池启动提示: {e}", flush=True)
 

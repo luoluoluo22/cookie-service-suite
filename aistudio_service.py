@@ -23,6 +23,8 @@ import urllib.error
 import urllib.parse
 from typing import Generator, Dict, Any, Union, List, Optional
 
+from web_api_switches import is_service_enabled, require_service_enabled
+
 os.environ["NO_PROXY"] = "127.0.0.1,localhost,::1"
 _LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -120,9 +122,15 @@ class AIStudioService:
     # -------------------------------------------------------------
     def is_running(self) -> bool:
         """检查 aistudio2api 管理端是否正在监听且健康响应。"""
+        import socket
+        try:
+            with socket.create_connection(("127.0.0.1", self.port), timeout=0.15):
+                pass
+        except OSError:
+            return False
         try:
             req = urllib.request.Request(f"http://127.0.0.1:{self.port}/api/status")
-            with _LOCAL_OPENER.open(req, timeout=1.5) as resp:
+            with _LOCAL_OPENER.open(req, timeout=0.8) as resp:
                 return resp.status == 200
         except Exception:
             return False
@@ -174,6 +182,7 @@ class AIStudioService:
 
     def start(self, timeout: int = 15) -> bool:
         """启动 aistudio2api 进程并激活数据面。"""
+        require_service_enabled("aistudio")
         self.proxy = _system_http_proxy(self.proxy)
         self._repair_stale_account_proxies()
         if not os.path.isfile(self.exe_path):
@@ -281,12 +290,14 @@ class AIStudioService:
 
     def restart(self) -> bool:
         """重启服务"""
+        require_service_enabled("aistudio")
         self.stop()
         time.sleep(1)
         return self.start()
 
     def ensure_ready(self) -> None:
         """确保服务已就绪并可接收推理请求"""
+        require_service_enabled("aistudio")
         if not self.is_running() or not self.is_data_plane_ready():
             ok = self.start()
             if not ok:
@@ -490,6 +501,7 @@ class AIStudioService:
 
         Never log the captured subprocess output: it contains authentication data.
         """
+        require_service_enabled("aistudio")
         executable = (
             os.environ.get("EGO_BROWSER_EXE")
             or shutil.which("ego-browser.exe")
@@ -527,6 +539,7 @@ class AIStudioService:
 
     def sync_cookies_from_hub(self) -> Dict[str, Any]:
         """从本地 Cookie Hub 提取浏览器已登录的 Google Cookie 并一键导入/更新 AI Studio 号池"""
+        require_service_enabled("aistudio")
         # Cookie Hub is the default source for AI Studio authentication; it opens the signed-in browser tab before reading HttpOnly cookies.
         if os.environ.get("AI_STUDIO_BROWSER", "hub").strip().lower() == "hub":
             hub_url = f"{self.bridge_url}/aistudio/auto_fetch"
