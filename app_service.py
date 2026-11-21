@@ -20,7 +20,7 @@ from typing import Optional, Dict, Any, List
 from pydantic import BaseModel, ConfigDict, Field
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query, Path, Request
+from fastapi import FastAPI, HTTPException, Query, Path, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, FileResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -28,8 +28,11 @@ from fastapi.staticfiles import StaticFiles
 # 保证本地通信不被外部代理拦截
 os.environ["NO_PROXY"] = "127.0.0.1,localhost,::1"
 
+from access_token import AccessTokenStore
+from chat_template import render_chat_html
 from cookie_bridge import CookieBridge
 from gemini_service import GeminiService, MultiAccountGeminiPool, resolve_model_reasoning
+from gemini_conversation_manager import gemini_conv_manager
 from chatgpt_service import chatgpt_service, UnifiedChatGPTService, ChatGPTBridgeClient, ChatGPTReverseEngine
 from bilibili_service import BilibiliService
 from baidu_pan_service import BaiduPanService
@@ -37,12 +40,14 @@ from suno_service import SunoService, suno_service
 from login_status import collect_login_status, failure_payload, gemini_failure_should_retry, gemini_failure_kind
 from minimax_service import MinimaxAudioService, minimax_service, PRESET_VOICES, OPENAI_VOICE_MAP
 from aistudio_service import aistudio_service, AIStudioService
+from accounts_aggregator import aggregate_accounts, refresh_accounts
 from chat_history_manager import chat_history_manager, wrap_chat_stream
-from opencode_export import export_to_file
+from opencode_export import export_to_file, PLUS_EXCLUSIVE_MODELS, INTERNAL_HIDDEN_MODELS, MODEL_DISPLAY_NAMES
 from gpt_tool_bridge import (
     has_tool_protocol,
     prepare_tool_messages,
-    adapt_stream_chunks,
+    normalize_tool_definitions,
+    stream_tool_bridge,
     adapt_completion_response,
     ToolLimitReachedError,
     append_tool_limit_override,
@@ -57,38 +62,152 @@ from autostart import (
     toggle_autostart,
     get_autostart_entry,
 )
+from web_api_switches import (
+    ServiceDisabledError,
+    get_google_sync_settings,
+    is_domain_cookie_allowed,
+    is_service_enabled,
+    is_aistudio_remote_sync_configured,
+    is_aistudio_remote_sync_running,
+    require_service_enabled,
+    start_aistudio_remote_sync,
+    stop_aistudio_remote_sync,
+    switch_store,
+    update_google_sync_settings,
+)
+
+COOKIE_SUITE_HOST = os.environ.get("COOKIE_SUITE_HOST", "0.0.0.0").strip() or "0.0.0.0"
+COOKIE_SUITE_PORT = int(os.environ.get("COOKIE_SUITE_PORT", "18800"))
+AUTH_COOKIE_NAME = "css_auth_token"
+token_store = AccessTokenStore()
 
 # 初始化 FastAPI 应用
 app = FastAPI(
     title="Cookie Service Suite API",
-    description="浏览器实时 Cookie 动态提取与多平台 Web 服务统一本地调度中心",
+    description="浏览器实时 Cookie 动态提取与多平台 Web 服务统一调度中心",
     version="2.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
 )
 
-# 允许跨域（前端控制台与本地工具调用）
+# 允许跨域（前端控制台、本地工具与带 Token 的外部 OpenAI 客户端）
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://127.0.0.1:18800", "http://localhost:18800", "http://127.0.0.1:18888", "http://localhost:18888"],
+    allow_origin_regex=r"^https?://.*",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(ServiceDisabledError)
+async def handle_service_disabled(request: Request, exc: ServiceDisabledError):
+    if request.url.path.startswith("/v1/"):
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "message": str(exc),
+                    "type": "service_disabled",
+                    "code": "service_disabled",
+                    "service_id": exc.service_id,
+                }
+            },
+        )
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": {
+                "message": str(exc),
+                "type": "service_disabled",
+                "service_id": exc.service_id,
+            }
+        },
+    )
 
 # 静态资源挂载 (网站图标与媒体文件)
 ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 if os.path.exists(ASSETS_DIR):
     app.mount("/assets", StaticFiles(directory=ASSETS_DIR), name="assets")
 
-# Reject DNS rebinding and cross-site browser requests before reaching sensitive Cookie/Token APIs.
+
+def _extract_header_token(request: Request) -> str:
+    auth_header = request.headers.get("authorization", "").strip()
+    if auth_header.lower().startswith("bearer "):
+        return auth_header[7:].strip()
+    for header_name in ("x-api-key", "x-access-token"):
+        val = request.headers.get(header_name, "").strip()
+        if val:
+            return val
+    return ""
+
+
+def _extract_request_token(request: Request) -> str:
+    header_tok = _extract_header_token(request)
+    if header_tok:
+        return header_tok
+    for param_name in ("token", "api_key"):
+        val = (request.query_params.get(param_name) or "").strip()
+        if val:
+            return val
+    cookie_tok = (request.cookies.get(AUTH_COOKIE_NAME) or "").strip()
+    if cookie_tok:
+        return cookie_tok
+    return ""
+
+
+def _is_trusted_local_request(request: Request) -> bool:
+    client_host = (request.client.host if request.client else "").strip().lower()
+    req_host = request.headers.get("host", "").split(":")[0].strip("[]").lower()
+    return client_host in ("127.0.0.1", "::1", "localhost") and req_host in ("127.0.0.1", "localhost", "::1")
+
+
+def _is_public_path(path: str) -> bool:
+    if path in ("/", "/chat", "/manifest.webmanifest", "/sw.js", "/favicon.ico", "/api/system/auth/status", "/api/system/auth/verify"):
+        return True
+    return path.startswith("/assets/")
+
+
+# Protect remote access with API Token while preventing cross-site browser CSRF on sensitive Cookie/Token APIs.
 @app.middleware("http")
-async def restrict_local_api_origins(request: Request, call_next):
-    host = request.headers.get("host", "").split(":")[0].lower()
+async def enforce_access_and_origins(request: Request, call_next):
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
+    host_header = request.headers.get("host", "").strip().lower()
     origin = request.headers.get("origin")
-    allowed_origins = {"http://127.0.0.1:18800", "http://localhost:18800", "http://127.0.0.1:18888", "http://localhost:18888"}
-    if host not in ("127.0.0.1", "localhost") or (origin is not None and origin not in allowed_origins):
-        return PlainTextResponse("Forbidden local API access", status_code=403)
+    header_token_valid = token_store.verify(_extract_header_token(request))
+
+    if origin is not None:
+        origin_norm = origin.strip().rstrip("/").lower()
+        local_origins = {
+            "http://127.0.0.1:18800",
+            "http://localhost:18800",
+            "http://127.0.0.1:18888",
+            "http://localhost:18888",
+        }
+        same_origin = bool(host_header) and origin_norm in {f"http://{host_header}", f"https://{host_header}"}
+        if not (same_origin or origin_norm in local_origins or header_token_valid):
+            return PlainTextResponse("Forbidden cross-origin API access", status_code=403)
+
+    if not _is_trusted_local_request(request) and not _is_public_path(request.url.path):
+        if not token_store.verify(_extract_request_token(request)):
+            if request.url.path.startswith("/v1/"):
+                return JSONResponse(
+                    status_code=401,
+                    content={
+                        "error": {
+                            "message": "Invalid or missing API token. Pass Authorization: Bearer <token>.",
+                            "type": "invalid_request_error",
+                            "code": "invalid_api_key",
+                        }
+                    },
+                )
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Unauthorized: missing or invalid access token"},
+            )
+
     return await call_next(request)
 
 # 单例业务客户端
@@ -100,6 +219,40 @@ baidu_service = BaiduPanService()
 suno_client = suno_service
 minimax_client = minimax_service
 aistudio_client = aistudio_service
+udio_client = None
+
+
+@app.on_event("startup")
+def _startup_background_sync():
+    try:
+        if is_service_enabled("chatgpt"):
+            chatgpt_client.start_auto_sync()
+    except Exception:
+        pass
+
+
+def _get_udio_client():
+    global udio_client
+    if udio_client is not None:
+        return udio_client
+    try:
+        import udio_service as udio_mod
+        udio_client = getattr(udio_mod, "udio_service", None) or udio_mod.UdioService()
+    except Exception:
+        return None
+    return udio_client
+
+
+def _get_account_services() -> Dict[str, Any]:
+    return {
+        "gemini": gemini_pool,
+        "chatgpt": chatgpt_client,
+        "suno": suno_client,
+        "minimax": minimax_client,
+        "baidupan": baidu_service,
+        "bilibili": bili_service,
+        "udio": _get_udio_client(),
+    }
 
 START_TIME = datetime.datetime.now()
 
@@ -138,6 +291,37 @@ class OpenAIImageGenerationRequest(BaseModel):
     model: Optional[str] = Field("gpt-image-2")
     n: Optional[int] = Field(1)
     response_format: Optional[str] = Field("b64_json")
+
+class ChatGPTConcurrentImageRequest(BaseModel):
+    prompts: Optional[List[str]] = Field(None, description='并发提示词列表')
+    prompt: Optional[str] = Field(None, description='单提示词并发生成时使用')
+    count: Optional[int] = Field(1, description='单提示词并发张数 (1-20)', ge=1, le=20)
+    model: Optional[str] = Field('gpt-image-2', description='图片模型')
+    n: Optional[int] = Field(1, description='每次请求张数 (1-4)', ge=1, le=4)
+    max_concurrency: Optional[int] = Field(3, description='最大并发数 (1-10)', ge=1, le=10)
+    response_format: Optional[str] = Field('b64_json', description='返回格式 (b64_json 或 url)')
+    timeout: Optional[int] = Field(240, description='单任务超时秒数', ge=30, le=600)
+
+
+def _format_image_history_summary(res: Any, response_format: str = 'b64_json'):
+    items = res.get('data', []) if isinstance(res, dict) else []
+    lines, urls = [], []
+    for idx, item in enumerate(items, 1):
+        if not isinstance(item, dict): continue
+        url = str(item.get('url') or '').strip()
+        b64 = str(item.get('b64_json') or '').strip()
+        rev = str(item.get('revised_prompt') or '').strip()
+        if url:
+            urls.append(url)
+            d = f'图片 #{idx}: {url}'
+        elif b64:
+            d = f'图片 #{idx}: [base64 图片, ~{(len(b64)*3/4)/1024.0:.1f} KB]'
+        else:
+            d = f'图片 #{idx}: [已生成]'
+        if rev: d += f' (revised_prompt: {rev[:160]})'
+        lines.append(d)
+    return ('\n'.join(lines) if lines else '[未返回图片数据]'), {'type': 'image_generation', 'response_format': response_format, 'image_count': len(items), 'urls': urls}
+
 
 
 class OpenAIMessage(BaseModel):
@@ -195,6 +379,147 @@ class MinimaxSpeechRequest(BaseModel):
     format: Optional[str] = Field("mp3", description="音频格式 (mp3, wav)")
 
 
+class AccountsRefreshRequest(BaseModel):
+    platform: Optional[str] = Field(None, description="可选平台过滤: gemini, chatgpt, suno, minimax, baidupan, bilibili, udio")
+
+
+class WebApiToggleRequest(BaseModel):
+    enabled: Optional[bool] = Field(None, description="目标启停状态；省略时在开启与关闭之间自动切换")
+
+
+def _get_web_api_items(
+    aistudio_local_running: Optional[bool] = None,
+    aistudio_remote_sync_running: Optional[bool] = None,
+) -> List[Dict[str, Any]]:
+    """Build Web API switch metadata enriched with live dependent daemon status."""
+    items = switch_store.list_specs()
+    for item in items:
+        sid = item["id"]
+        daemon_running = False
+        daemon_details: Dict[str, Any] = {}
+        try:
+            if sid == "gemini":
+                daemon_running = bool(gemini_pool.is_running())
+                daemon_details = {"port": gemini_pool.port}
+            elif sid == "aistudio":
+                local_running = bool(aistudio_client.is_running()) if aistudio_local_running is None else bool(aistudio_local_running)
+                remote_sync_running = bool(is_aistudio_remote_sync_running()) if aistudio_remote_sync_running is None else bool(aistudio_remote_sync_running)
+                daemon_running = local_running or remote_sync_running
+                daemon_details = {
+                    "port": aistudio_client.port,
+                    "local_running": local_running,
+                    "remote_sync_running": remote_sync_running,
+                    "remote_sync_configured": is_aistudio_remote_sync_configured(),
+                }
+            elif sid == "chatgpt":
+                daemon_running = bool(chatgpt_client.reverse.is_running())
+                daemon_details = {"port": chatgpt_client.reverse.port}
+        except Exception:
+            daemon_running = False
+        item["daemon_running"] = daemon_running
+        item["daemon_details"] = daemon_details
+        item["cookie_fetching_allowed"] = bool(item["enabled"])
+    return items
+
+
+def _apply_web_api_toggle(service_id: str, enabled: Optional[bool] = None) -> Dict[str, Any]:
+    """Persist Web API switch state and synchronously stop/start dependent background processes."""
+    result = switch_store.toggle(service_id, enabled=enabled)
+    sid = result["id"]
+    new_enabled = bool(result["enabled"])
+    actions: List[str] = []
+    warnings: List[str] = []
+
+    if not new_enabled:
+        if sid == "gemini":
+            was_running = False
+            try:
+                was_running = bool(gemini_pool.is_running() or getattr(gemini_pool, "proc", None) is not None)
+                gemini_pool.stop()
+            except Exception as exc:
+                warnings.append(f"停止 Gemini 后台池提示: {exc}")
+            actions.append(
+                "已停止 Gemini 4账号池后台程序 (18083) 并禁止获取/刷新 Cookie"
+                if was_running
+                else "已关闭 Gemini 网页 API，禁止获取/刷新 Cookie"
+            )
+        elif sid == "aistudio":
+            was_local = False
+            stopped_sync = 0
+            try:
+                was_local = bool(aistudio_client.is_running() or getattr(aistudio_client, "process", None) is not None)
+                aistudio_client.stop()
+            except Exception as exc:
+                warnings.append(f"停止 AI Studio 本地服务提示: {exc}")
+            try:
+                stopped_sync = stop_aistudio_remote_sync()
+            except Exception as exc:
+                warnings.append(f"停止 AI Studio 远端同步提示: {exc}")
+            parts = []
+            if was_local:
+                parts.append("aistudio2api (2048)")
+            if stopped_sync:
+                parts.append("远端同步守护进程")
+            actions.append(
+                f"已停止 {' 与 '.join(parts)} 并禁止获取/刷新 Cookie"
+                if parts
+                else "已关闭 AI Studio 网页 API，禁止获取/刷新 Cookie"
+            )
+        elif sid == "chatgpt":
+            was_running = False
+            try:
+                chatgpt_client.stop_auto_sync()
+                was_running = bool(chatgpt_client.reverse.is_running() or getattr(chatgpt_client.reverse, "proc", None) is not None)
+                chatgpt_client.reverse.stop()
+            except Exception as exc:
+                warnings.append(f"停止 ChatGPT 逆向后台提示: {exc}")
+            actions.append(
+                "已停止 ChatGPT 逆向后台程序 (18084) 并禁止获取/刷新 Cookie"
+                if was_running
+                else "已关闭 ChatGPT 网页 API，禁止获取/刷新 Cookie"
+            )
+        else:
+            actions.append(f"已关闭 {result['name']} 网页 API，不再获取或刷新对应 Cookie")
+    else:
+        if sid == "gemini":
+            try:
+                ok = gemini_pool.start(wait_timeout=8)
+                if ok:
+                    actions.append("已开启 Gemini 网页 API 并拉起 4账号池后台服务 (18083)")
+                else:
+                    warnings.append("Gemini 4账号池启动未就绪，请检查本地代理或日志")
+                    actions.append("已开启 Gemini 网页 API，允许获取/刷新 Cookie")
+            except Exception as exc:
+                warnings.append(f"拉起 Gemini 后台池提示: {exc}")
+                actions.append("已开启 Gemini 网页 API，允许获取/刷新 Cookie")
+        elif sid == "aistudio":
+            if is_aistudio_remote_sync_configured():
+                try:
+                    if start_aistudio_remote_sync():
+                        actions.append("已开启 AI Studio 网页 API 并恢复远端同步守护进程")
+                    else:
+                        actions.append("已开启 AI Studio 网页 API，允许获取/刷新 Cookie")
+                except Exception as exc:
+                    warnings.append(f"恢复 AI Studio 远端同步提示: {exc}")
+                    actions.append("已开启 AI Studio 网页 API")
+            else:
+                actions.append("已开启 AI Studio 网页 API，允许获取/刷新 Cookie（按需启动服务）")
+        elif sid == "chatgpt":
+            chatgpt_client.start_auto_sync()
+            actions.append("已开启 ChatGPT 网页 API 并恢复后台定时保活同步")
+        else:
+            actions.append(f"已开启 {result['name']} 网页 API，允许获取/刷新 Cookie")
+
+    return {
+        "success": True,
+        **result,
+        "actions": actions,
+        "warnings": warnings,
+        "message": "；".join(actions),
+        "items": _get_web_api_items(),
+    }
+
+
 # ==========================================
 # 1. 核心系统概览与状态接口
 # ==========================================
@@ -213,8 +538,8 @@ def _gemini_stop(message: str) -> None:
 def get_login_status():
     """通过 Cookie Hub 判断 Gemini、ChatGPT、百度网盘、Suno、哔哩哔哩哪些还没登录。"""
     status = collect_login_status()
-    hint = chatgpt_client.public_account()
-    if not hint and chatgpt_client.reverse.is_running():
+    hint = chatgpt_client.public_account() if is_service_enabled("chatgpt") else {}
+    if not hint and is_service_enabled("chatgpt") and chatgpt_client.reverse.is_running():
         try:
             usable = [
                 account for account in chatgpt_client.reverse.list_accounts()
@@ -250,27 +575,41 @@ def get_system_overview():
     except Exception:
         pass
 
+    gemini_enabled = is_service_enabled("gemini")
     gemini_running = False
     gemini_accounts = []
     try:
         gemini_running = gemini_pool.is_running()
-        if gemini_running:
+        if gemini_enabled and gemini_running:
             gemini_accounts = gemini_pool.list_accounts()
     except Exception:
         pass
 
     uptime_sec = int((datetime.datetime.now() - START_TIME).total_seconds())
+    chatgpt_enabled = is_service_enabled("chatgpt")
     chatgpt_status = {}
     try:
         chatgpt_status = chatgpt_client.get_status()
     except Exception:
         pass
 
+    aistudio_enabled = is_service_enabled("aistudio")
     aistudio_status = {}
     try:
         aistudio_status = aistudio_client.get_status()
     except Exception:
         pass
+    aistudio_remote_sync_running = False
+    try:
+        aistudio_remote_sync_running = bool(is_aistudio_remote_sync_running())
+    except Exception:
+        pass
+
+    minimax_enabled = is_service_enabled("minimax")
+    web_api_items = _get_web_api_items(
+        aistudio_local_running=bool(aistudio_status.get("running", False)),
+        aistudio_remote_sync_running=aistudio_remote_sync_running,
+    )
 
     autostart_ok = False
     autostart_desc = None
@@ -284,7 +623,11 @@ def get_system_overview():
         "status": "online",
         "service_name": "Cookie Service Suite",
         "version": "2.0.0",
+        "listen_host": COOKIE_SUITE_HOST,
+        "listen_port": COOKIE_SUITE_PORT,
         "uptime_seconds": uptime_sec,
+        "web_api_switches": switch_store.get_states(),
+        "web_apis": web_api_items,
         "autostart": {
             "enabled": autostart_ok,
             "status": "enabled" if autostart_ok else "disabled",
@@ -298,39 +641,88 @@ def get_system_overview():
                 "clients": hub_info.get("connectedClients", 0),
             },
             "gemini_pool": {
+                "enabled": gemini_enabled,
                 "port": gemini_pool.port,
-                "status": "running" if gemini_running else "stopped",
+                "status": ("disabled" if not gemini_enabled else ("running" if gemini_running else "stopped")),
                 "account_count": sum(1 for a in gemini_accounts if a.get("visible")),
                 "active_accounts": sum(1 for a in gemini_accounts if a.get("visible") and a.get("status") == "enabled"),
             },
             "chatgpt": {
-                "mode": chatgpt_status.get("mode"),
+                "enabled": chatgpt_enabled,
+                "mode": ("disabled" if not chatgpt_enabled else chatgpt_status.get("mode")),
                 "reverse_running": chatgpt_status.get("reverse_engine", {}).get("running", False),
                 "reverse_port": chatgpt_status.get("reverse_engine", {}).get("port", 18084),
                 "reverse_health": chatgpt_status.get("reverse_engine", {}).get("health", {}),
                 "bridge_connected": chatgpt_status.get("browser_bridge", {}).get("extension_connected", False),
             },
             "chatgpt_bridge": {
-                "status": "ready" if hub_ok else "waiting_hub",
+                "enabled": chatgpt_enabled,
+                "status": ("disabled" if not chatgpt_enabled else ("ready" if hub_ok else "waiting_hub")),
                 "method": "in_page_hook_sse",
             },
             "aistudio": {
+                "enabled": aistudio_enabled,
                 "port": aistudio_client.port,
-                "status": "running" if aistudio_status.get("running") else "stopped",
+                "status": ("disabled" if not aistudio_enabled else ("running" if aistudio_status.get("running") else "stopped")),
                 "running": aistudio_status.get("running", False),
                 "data_plane_ready": aistudio_status.get("data_plane_ready", False),
-                "state": aistudio_status.get("state", "STOPPED"),
+                "state": ("DISABLED" if not aistudio_enabled else aistudio_status.get("state", "STOPPED")),
                 "accounts_total": aistudio_status.get("accounts_total", 0),
                 "accounts_ready": aistudio_status.get("accounts_ready", 0),
                 "models_count": aistudio_status.get("models_count", 0),
+                "remote_sync_running": aistudio_remote_sync_running,
             },
             "minimax_audio": {
-                "status": "ready" if bool(minimax_client.token) else ("connected" if hub_ok else "idle"),
+                "enabled": minimax_enabled,
+                "status": ("disabled" if not minimax_enabled else ("ready" if bool(minimax_client.token) else ("connected" if hub_ok else "idle"))),
                 "token_ready": bool(minimax_client.token),
                 "voices_count": len(PRESET_VOICES),
             },
         },
     }
+
+
+@app.get("/api/system/web-apis", summary="获取各个网页 API 的启停开关与后台进程状态", tags=["系统管理"])
+def get_system_web_apis():
+    """查看所有网页 API 的启停开关状态、关联域名与依赖后台程序运行情况。"""
+    return {
+        "items": _get_web_api_items(),
+        "states": switch_store.get_states(),
+    }
+
+
+@app.post("/api/system/web-apis/{service_id}/toggle", summary="切换或设置指定网页 API 的启停开关", tags=["系统管理"])
+def toggle_system_web_api(
+    service_id: str = Path(..., description="网页 API 标识: gemini, aistudio, chatgpt, suno, minimax, baidupan, bilibili, udio"),
+    enabled: Optional[bool] = Query(None, description="可选显式状态 true/false；省略时自动反转"),
+    body: Optional[WebApiToggleRequest] = None,
+):
+    """开启或关闭指定网页 API；关闭后立即停止获取/刷新对应 Cookie 并同步停止关联后台程序。"""
+    target_enabled = enabled if enabled is not None else (body.enabled if body else None)
+    try:
+        return _apply_web_api_toggle(service_id, enabled=target_enabled)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"切换网页 API 状态失败: {exc}")
+
+
+class GoogleSyncSettingsRequest(BaseModel):
+    auto_sync_enabled: Optional[bool] = Field(None, description="一键开关：是否允许后台自动监听 Google Cookie 与刷新额度")
+    usage_sync_interval_sec: Optional[int] = Field(None, description="Gemini 官网额度自动刷新间隔（秒），0 表示仅手动刷新")
+    cookie_sync_interval_sec: Optional[int] = Field(None, description="Google Cookie 监听与远端同步间隔（秒），0 表示仅手动")
+    allow_auto_fetch_tab: Optional[bool] = Field(None, description="是否允许自动唤醒浏览器标签页拉取 Google Cookie")
+
+
+@app.get("/api/system/google-sync", summary="获取 Google 防风控同步频率与静默开关配置", tags=["系统管理"])
+def get_system_google_sync():
+    return {"settings": get_google_sync_settings()}
+
+
+@app.post("/api/system/google-sync", summary="更新 Google 防风控同步频率或一键关闭所有自动监听", tags=["系统管理"])
+def update_system_google_sync(req: GoogleSyncSettingsRequest):
+    updated = update_google_sync_settings(req.model_dump(exclude_none=True))
+    return {"success": True, "settings": updated}
 
 
 @app.get("/api/system/autostart", summary="获取 Windows 开机自启状态", tags=["系统管理"])
@@ -381,22 +773,150 @@ def open_project_directory():
         raise HTTPException(status_code=500, detail=f"打开项目目录失败: {str(e)}")
 
 
+class TokenVerifyRequest(BaseModel):
+    token: str = Field(..., description="访问令牌")
+
+
+@app.get("/api/system/auth/status", summary="检查当前请求是否已通过访问鉴权", tags=["系统管理"])
+def get_system_auth_status(request: Request):
+    """供管理控制台判断是否需要弹出令牌解锁界面。"""
+    is_local = _is_trusted_local_request(request)
+    authorized = is_local or token_store.verify(_extract_request_token(request))
+    return {
+        "authorized": authorized,
+        "requires_token": not is_local,
+        "is_local": is_local,
+    }
+
+
+@app.post("/api/system/auth/verify", summary="验证并写入控制面板访问令牌 Cookie", tags=["系统管理"])
+def verify_system_auth_token(body: TokenVerifyRequest, response: Response):
+    """校验访问令牌并设置 HttpOnly 会话 Cookie，便于控制台与 Swagger 访问。"""
+    candidate = (body.token or "").strip()
+    if not token_store.verify(candidate):
+        raise HTTPException(status_code=401, detail="访问令牌无效")
+    response.set_cookie(
+        key=AUTH_COOKIE_NAME,
+        value=candidate,
+        httponly=True,
+        samesite="lax",
+        path="/",
+        max_age=30 * 24 * 3600,
+    )
+    return {"success": True, "authorized": True}
+
+
+@app.get("/api/system/token", summary="获取当前 API 访问令牌", tags=["系统管理"])
+def get_system_token():
+    """返回当前生效的 API Token 及更新时间戳。"""
+    return token_store.get_info()
+
+
+@app.post("/api/system/token/generate", summary="重新生成并持久化 API 访问令牌", tags=["系统管理"])
+def generate_system_token(request: Request, response: Response):
+    """生成新的随机 API Token 并立即生效；若当前为已鉴权浏览器会话则同步刷新会话 Cookie。"""
+    info = token_store.rotate()
+    if request.cookies.get(AUTH_COOKIE_NAME):
+        response.set_cookie(
+            key=AUTH_COOKIE_NAME,
+            value=str(info["token"]),
+            httponly=True,
+            samesite="lax",
+            path="/",
+            max_age=30 * 24 * 3600,
+        )
+    return {"success": True, **info}
+
+
 # ==========================================
 # 2. Google Gemini 多账号池统一调度接口
 # ==========================================
+@app.get("/manifest.webmanifest", include_in_schema=False)
+def pwa_manifest():
+    return JSONResponse({
+        "name": "Gemini Chat",
+        "short_name": "Gemini",
+        "start_url": "/chat",
+        "scope": "/",
+        "display": "standalone",
+        "background_color": "#0b101b",
+        "theme_color": "#0b101b",
+        "icons": [
+            {"src": "/assets/app_icon.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"},
+            {"src": "/assets/icons/gemini.svg", "sizes": "any", "type": "image/svg+xml"}
+        ]
+    }, media_type="application/manifest+json")
+
+@app.get("/sw.js", include_in_schema=False)
+def pwa_sw():
+    return PlainTextResponse("self.addEventListener('install',()=>self.skipWaiting());self.addEventListener('activate',e=>e.waitUntil(self.clients.claim()));self.addEventListener('fetch',()=>{});", media_type="application/javascript")
+
+@app.get("/chat", response_class=HTMLResponse, include_in_schema=False)
+def chat_page():
+    return HTMLResponse(render_chat_html())
+
 @app.get("/api/gemini/models", summary="读取 Gemini 网页当前模型选择器 (支持对话与任务模式)", tags=["Gemini 多账号调度"])
 def list_gemini_models():
-    """返回当前登录账号在 gemini.google.com 上能看到的模型，区分「对话」与「任务」两套官方选择器。"""
-    models = gemini_pool.list_web_models()
+    raw_chat = gemini_pool.list_web_models()
+    chat_models = []
+    for m in raw_chat:
+        if m.get("locked"):
+            continue
+        item = dict(m)
+        lbl = str(item.get("label") or item.get("name") or item.get("id") or "")
+        if not lbl.startswith("["):
+            item["label"] = f"[聊天] {lbl}"
+        item["mode"] = "chat"
+        chat_models.append(item)
     task_models = gemini_pool.list_task_models()
     return {
         "source": "web",
-        "models": models,
-        "chat_models": models,
+        "models": chat_models + task_models,
+        "chat_models": chat_models,
         "task_models": task_models,
         "active_modes": ["chat", "task"],
         "service_running": gemini_pool.is_running(),
     }
+
+
+# ==========================================
+# 1.5. 全平台统一账号看板 API
+# ==========================================
+@app.get("/api/accounts", summary="获取全平台统一账号看板数据", tags=["全平台账号看板"])
+def list_unified_accounts(
+    platform: Optional[str] = Query(None, description="可选平台过滤: gemini, chatgpt, suno, minimax, baidupan, bilibili, udio")
+):
+    """聚合 Google Gemini、ChatGPT、Suno、MiniMax、百度网盘、哔哩哔哩与 Udio 的归一化账号、会员与额度状态。"""
+    try:
+        return aggregate_accounts(
+            services=_get_account_services(),
+            platform=platform,
+            collect_login_status_fn=collect_login_status,
+            timeout_seconds=9.0,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"获取全平台账号失败: {str(exc)}")
+
+
+@app.post("/api/accounts/refresh", summary="刷新全平台或指定平台账号状态与额度", tags=["全平台账号看板"])
+def refresh_unified_accounts(
+    platform: Optional[str] = Query(None, description="可选平台过滤: gemini, chatgpt, suno, minimax, baidupan, bilibili, udio"),
+    body: Optional[AccountsRefreshRequest] = None,
+):
+    """刷新全平台或指定平台的浏览器会话/凭证/额度，并返回最新归一化账号快照。"""
+    target_platform = platform if platform is not None else (body.platform if body else None)
+    try:
+        return refresh_accounts(
+            services=_get_account_services(),
+            platform=target_platform,
+            collect_login_status_fn=collect_login_status,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"刷新全平台账号失败: {str(exc)}")
 
 
 @app.get("/api/gemini/accounts", summary="获取已接入的 4 个 Google 账号状态", tags=["Gemini 多账号调度"])
@@ -428,6 +948,7 @@ def set_gemini_account_status(account_id: int, status: str = Query(...)):
 @app.post("/api/gemini/accounts/sync-profiles", summary="同步提取所有账号的真实 Google 昵称与邮箱", tags=["Gemini 多账号调度"])
 def sync_gemini_profiles():
     """向 Google 上游拉取各 authuser 对应的真实用户显示昵称与 Gmail 邮箱并写入账号池。"""
+    require_service_enabled("gemini")
     try:
         res = gemini_pool.sync_account_profiles()
         return {
@@ -435,6 +956,8 @@ def sync_gemini_profiles():
             "message": "已成功更新账号真实昵称、邮箱与官网额度信息！",
             "profiles": res,
         }
+    except ServiceDisabledError:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"同步昵称邮箱失败: {str(e)}")
 
@@ -442,6 +965,7 @@ def sync_gemini_profiles():
 @app.post("/api/gemini/accounts/sync-usage", summary="同步 Google Gemini 官网 /usage 实时用量百分比与重置时间", tags=["Gemini 多账号调度"])
 def sync_gemini_usage():
     """直接请求 Gemini 网页 /usage GraphQL 接口，同步每个独立账号的真实套餐等级、5 小时与周限额百分比及重置时间。"""
+    require_service_enabled("gemini")
     try:
         res = gemini_pool.sync_account_usage()
         ok_count = sum(1 for v in res.values() if isinstance(v, dict) and not v.get("error"))
@@ -451,6 +975,8 @@ def sync_gemini_usage():
             "message": f"已同步 {ok_count} 个账号的官网实时用量限额！" if ok_count else "未能拉取到官网用量限额，请检查账号 Cookie 或代理状态。",
             "usage": res,
         }
+    except ServiceDisabledError:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"同步官网额度失败: {str(e)}")
 
@@ -487,15 +1013,15 @@ def _resolve_gemini_timeout(model_name: str, reasoning_level: str = "off", reque
 
 
 @app.post("/api/gemini/chat", summary="向 Gemini 发起提问 (自动 LRU 负载均衡轮换)", tags=["Gemini 多账号调度"])
+@app.post("/api/pool/chat", summary="向号池发起提问 (自动 LRU 负载均衡轮换)", tags=["Gemini 多账号调度"])
 def gemini_chat(req: ChatRequest):
     """
     底层通过最久未用 (LRU) 算法自动在已接入的 4 个账号之间分发请求，
     支持指定推理级别 ('off' 快速直出, 'medium' 中等推理, 'high' 深度长思考链)，
     遇凭证过期或网络异常自动触发 Cookie Hub 热刷新与重试自愈。
     """
+    require_service_enabled("gemini")
     start_t = time.time()
-    if not gemini_pool.is_running():
-        gemini_pool.start()
 
     reasoning = req.reasoning_level or "off"
     model_name = (req.model or "gemini-4-hydrogen").lower().strip()
@@ -507,9 +1033,36 @@ def gemini_chat(req: ChatRequest):
 
     # 1. 默认优先走实时流式输出 (SSE)：首字毫秒级直出，体验与真实网页端一致
     if req.stream:
-        stream_gen = gemini_pool.stream_chat(
-            prompt=req.prompt, model=req.model, reasoning_level=reasoning, timeout=effective_timeout
-        )
+        def _pool_chat_stream_with_fallback():
+            mdl = (req.model or "gemini-4-hydrogen").strip() or "gemini-4-hydrogen"
+            if mdl.endswith("-task") or not gemini_pool.is_running():
+                try:
+                    yield from gemini_conv_manager.stream_openai_task_chat(
+                        messages=[{"role": "user", "content": req.prompt}], model=mdl, timeout=effective_timeout
+                    )
+                except Exception as exc:
+                    err_chunk = {"id": f"chatcmpl-err-{int(time.time()*1000)}", "object": "chat.completion.chunk", "created": int(time.time()), "model": mdl, "choices": [{"index": 0, "delta": {"role": "assistant", "content": f"[流式异常] {exc}"}, "finish_reason": "stop"}]}
+                    yield f"data: {json.dumps(err_chunk, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                return
+            emitted = False
+            try:
+                for chunk in gemini_pool.stream_chat(
+                    prompt=req.prompt, model=mdl, reasoning_level=reasoning, timeout=effective_timeout
+                ):
+                    if "HTTP Error 502" in chunk or "HTTP Error 429" in chunk or "流式异常" in chunk:
+                        if not emitted:
+                            raise RuntimeError(chunk)
+                    emitted = True
+                    yield chunk
+            except Exception:
+                if emitted:
+                    raise
+                yield from gemini_conv_manager.stream_openai_task_chat(
+                    messages=[{"role": "user", "content": req.prompt}], model=mdl, timeout=effective_timeout
+                )
+
+        stream_gen = _pool_chat_stream_with_fallback()
         wrapped_gen = wrap_chat_stream(
             stream_gen,
             endpoint="/api/gemini/chat",
@@ -531,6 +1084,20 @@ def gemini_chat(req: ChatRequest):
 
     # 2. 非流式聚合调用
 
+    if model_name.endswith("-task") or not gemini_pool.is_running():
+        parts = []
+        for sse_line in gemini_conv_manager.stream_openai_task_chat(
+            messages=[{"role": "user", "content": req.prompt}], model=req.model or "gemini-4-hydrogen", timeout=effective_timeout
+        ):
+            st = sse_line.strip()
+            if not st.startswith("data:") or st == "data: [DONE]": continue
+            try:
+                dl = ((json.loads(st[5:].strip()).get("choices") or [{}])[0].get("delta") or {})
+                if dl.get("content"): parts.append(dl["content"])
+            except Exception: pass
+        reply_txt = "".join(parts)
+        return {"status": "ok", "model": req.model or "gemini-4-hydrogen", "reply": reply_txt, "took_ms": int((time.time() - start_t) * 1000)}
+
     try:
         res = gemini_pool.ask_with_details(
             prompt=req.prompt, model=req.model, reasoning_level=reasoning, timeout=effective_timeout
@@ -542,14 +1109,16 @@ def gemini_chat(req: ChatRequest):
             raise RuntimeError(f"Google 上游会话软拒绝: {refusal_text}")
     except Exception as first_err:
         failure_kind = gemini_failure_kind(str(first_err))
-        if failure_kind == "login":
-            print("[Gemini Chat] 检测到登录态失效，正在从 Cookie Hub 刷新身份匹配的账号...", flush=True)
+        if failure_kind in {"login", "unbound"}:
+            print(f"[Gemini Chat] 检测到上游异常 ({failure_kind})，正在从 Cookie Hub 自动刷新凭证...", flush=True)
         elif not gemini_failure_should_retry(str(first_err)):
             _gemini_stop(str(first_err))
         print(f"[Gemini Chat] 调度异常 ({failure_kind})，尝试自愈并重试...", flush=True)
         try:
-            if failure_kind == "login":
-                gemini_pool.refresh_pool_cookies()
+            if failure_kind in {"login", "unbound"}:
+                refreshed = gemini_pool.recover_from_failure(failure_kind)
+                if failure_kind == "unbound" and not refreshed:
+                    _gemini_stop(str(first_err))
             else:
                 gemini_pool.reset_proxies()
             res = gemini_pool.ask_with_details(
@@ -557,8 +1126,10 @@ def gemini_chat(req: ChatRequest):
             )
             if is_upstream_refusal(res.get("reply")):
                 _service_error(502, f"Gemini 上游拒绝请求: {res.get('reply')}", "gemini")
+        except HTTPException:
+            raise
         except Exception as retry_err:
-            detail_msg = f"Gemini 调度调用失败: {first_err} (不修改 Cookie 的重试亦未成功: {retry_err})"
+            detail_msg = f"Gemini 调度调用失败: {first_err} (自愈重试亦未成功: {retry_err})"
             _service_error(502, detail_msg, "gemini")
 
     chat_history_manager.record_chat(
@@ -593,11 +1164,12 @@ def gemini_chat(req: ChatRequest):
 @app.post("/api/gemini/accounts/{account_id}/check", summary="检测指定账号凭证健康度", tags=["Gemini 多账号调度"])
 def check_gemini_account(account_id: int = Path(..., description="账号自增 ID (1..4)")):
     """向 Google 上游验证指定账号会话有效性并更新健康状态。"""
+    require_service_enabled("gemini")
     try:
-        if not gemini_pool.is_running():
-            gemini_pool.start()
         res = gemini_pool.check_account(account_id)
         return res
+    except ServiceDisabledError:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -605,18 +1177,39 @@ def check_gemini_account(account_id: int = Path(..., description="账号自增 I
 @app.post("/api/gemini/accounts/{account_id}/rotate", summary="触发指定账号会话令牌保活续期", tags=["Gemini 多账号调度"])
 def rotate_gemini_account(account_id: int = Path(..., description="账号自增 ID (1..4)")):
     """向 Google accounts.google.com/RotateCookies 申请换发最新短命会话票据。"""
+    require_service_enabled("gemini")
     try:
-        if not gemini_pool.is_running():
-            gemini_pool.start()
         res = gemini_pool.rotate_account(account_id)
         return res
+    except ServiceDisabledError:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/gemini/accounts/refresh-all", summary="强制获取一次 Cookie 并同步账号名称、邮箱与官网额度", tags=["Gemini 多账号调度"])
+def refresh_gemini_accounts_all(account_id: Optional[int] = Query(None, ge=1, description="可选：只验证并刷新指定启用账号 ID")):
+    """一键强制从 Cookie Hub 获取最新凭证、解析账号真实名称与邮箱，并同步官网实时额度。"""
+    require_service_enabled("gemini")
+    try:
+        res = gemini_pool.refresh_and_sync_all(account_id=account_id)
+        updated_ids = res.get("updated_account_ids", [])
+        return {
+            "success": True,
+            "message": f"已完成凭证刷新（{len(updated_ids)} 个账号）、账号信息解析与官网额度同步！",
+            "updated_account_ids": updated_ids,
+            "profiles": res.get("profiles", {}),
+        }
+    except ServiceDisabledError:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"刷新失败: {str(e)}")
 
 
 @app.post("/api/gemini/refresh", summary="按 Google 登录身份验证后刷新匹配的 Gemini 账号", tags=["Gemini 多账号调度"])
 def refresh_gemini_cookies(account_id: Optional[int] = Query(None, ge=1, description="可选：只验证并刷新指定启用账号 ID")):
     """先读取浏览器 Cookie，再逐个核验 authuser/邮箱；只更新身份匹配的启用账号。"""
+    require_service_enabled("gemini")
     try:
         gemini_pool.refresh_pool_cookies(account_id=account_id)
         updated_ids = getattr(gemini_pool, "_last_cookie_refresh_ids", [])
@@ -625,6 +1218,8 @@ def refresh_gemini_cookies(account_id: Optional[int] = Query(None, ge=1, descrip
             "message": f"浏览器登录态已验证；仅更新身份匹配的启用账号（{len(updated_ids)} 个）。",
             "updated_account_ids": updated_ids,
         }
+    except ServiceDisabledError:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"凭证刷新失败: {str(e)}")
 
@@ -649,6 +1244,192 @@ def reset_gemini_pace():
     return {"success": True, "message": "Gemini 调用锁与冷却状态已成功强制复位！"}
 
 
+class GeminiConvCreateRequest(BaseModel):
+    prompt: str = Field(..., description="首轮提问内容")
+    model: Optional[str] = Field("gemini-3.6-flash", description="模型名称")
+    account_id: Optional[int] = Field(None, description="可选指定账号 ID")
+
+
+class GeminiConvMessageRequest(BaseModel):
+    prompt: str = Field(..., description="续聊消息内容")
+    model: Optional[str] = Field(None, description="可选切换模型")
+
+
+@app.get("/api/gemini/conversations", summary="获取落盘的 Gemini 对话列表与实时状态", tags=["Gemini 多账号调度"])
+def list_gemini_conversations(limit: int = Query(50, description="返回对话条数上限")):
+    try:
+        items = gemini_conv_manager.list_conversations(limit=limit)
+        return {"conversations": items, "total": len(items)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/gemini/conversations/sync", summary="从 Gemini 官网同步历史对话列表 (MaZiqc)", tags=["Gemini 多账号调度"])
+def sync_gemini_conversations(
+    account_id: Optional[int] = Query(None, description="可选仅同步指定账号 ID"),
+    limit: int = Query(20, description="每个账号拉取条数"),
+):
+    try:
+        res = gemini_conv_manager.sync_conversations(account_id=account_id, limit=limit)
+        return {"success": True, **res}
+    except ServiceDisabledError:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.get("/api/gemini/conversations/events", summary="订阅所有 Gemini 对话状态与完成通知 (SSE)", tags=["Gemini 多账号调度"])
+def stream_gemini_conversation_events():
+    import queue as _q
+
+    q = gemini_conv_manager.subscribe_global()
+
+    def _gen():
+        try:
+            yield "event: connected\ndata: {}\n\n"
+            while True:
+                try:
+                    msg = q.get(timeout=15.0)
+                    yield f"event: {msg['event']}\ndata: {json.dumps(msg['data'], ensure_ascii=False)}\n\n"
+                except _q.Empty:
+                    yield ": keepalive\n\n"
+        finally:
+            gemini_conv_manager.unsubscribe_global(q)
+
+    return StreamingResponse(
+        _gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/api/gemini/conversations/{cid}", summary="获取单个 Gemini 对话详情与消息历史", tags=["Gemini 多账号调度"])
+def get_gemini_conversation(
+    cid: str,
+    refresh: bool = Query(False, description="是否向官网 hNvQHb 拉取最新轮次"),
+):
+    try:
+        if refresh:
+            item = gemini_conv_manager.sync_conversation_detail(cid)
+        else:
+            item = gemini_conv_manager.get_conversation(cid, include_messages=True)
+        if not item:
+            raise HTTPException(status_code=404, detail=f"未找到对话 {cid}")
+        return {"conversation": item}
+    except HTTPException:
+        raise
+    except ServiceDisabledError:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.delete("/api/gemini/conversations/{cid}", summary="删除本地落盘的 Gemini 对话", tags=["Gemini 多账号调度"])
+def delete_gemini_conversation(
+    cid: str,
+    upstream: bool = Query(False, description="是否同时删除官网对话 (GzXR5e)"),
+):
+    try:
+        ok = gemini_conv_manager.delete_local_conversation(cid, delete_upstream=upstream)
+        if not ok:
+            raise HTTPException(status_code=404, detail=f"未找到对话 {cid}")
+        return {"success": True, "cid": cid}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/gemini/conversations", summary="发起新的可控 Gemini 对话", tags=["Gemini 多账号调度"])
+def create_gemini_conversation(req: GeminiConvCreateRequest):
+    try:
+        res = gemini_conv_manager.start_run(
+            prompt=req.prompt,
+            cid=None,
+            model=req.model or "gemini-3.6-flash",
+            account_id=req.account_id,
+        )
+        return {"success": True, **res}
+    except ServiceDisabledError:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.post("/api/gemini/conversations/{cid}/messages", summary="向指定 Gemini 对话续发消息", tags=["Gemini 多账号调度"])
+def send_gemini_conversation_message(cid: str, req: GeminiConvMessageRequest):
+    try:
+        res = gemini_conv_manager.start_run(
+            prompt=req.prompt,
+            cid=cid,
+            model=req.model or "",
+        )
+        return {"success": True, **res}
+    except ServiceDisabledError:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.post("/api/gemini/conversations/{cid}/stop", summary="停止指定 Gemini 对话正在输出的回复", tags=["Gemini 多账号调度"])
+def stop_gemini_conversation(cid: str):
+    try:
+        res = gemini_conv_manager.stop_conversation(cid)
+        return {"success": True, **res}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/gemini/runs/{run_id}", summary="查询单次 Gemini 生成任务状态与已输出内容", tags=["Gemini 多账号调度"])
+def get_gemini_run(run_id: str):
+    run = gemini_conv_manager.get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail=f"未找到任务 {run_id}")
+    return {"run": run}
+
+
+@app.post("/api/gemini/runs/{run_id}/stop", summary="停止指定 Gemini 生成任务", tags=["Gemini 多账号调度"])
+def stop_gemini_run(run_id: str):
+    res = gemini_conv_manager.stop_run(run_id)
+    return {"success": True, **res}
+
+
+@app.get("/api/gemini/runs/{run_id}/events", summary="订阅单次 Gemini 生成任务实时增量与结束通知 (SSE)", tags=["Gemini 多账号调度"])
+def stream_gemini_run_events(run_id: str):
+    import queue as _q
+
+    q = gemini_conv_manager.subscribe_run(run_id)
+
+    def _gen():
+        try:
+            snap = gemini_conv_manager.get_run(run_id)
+            if snap:
+                yield f"event: snapshot\ndata: {json.dumps(snap, ensure_ascii=False)}\n\n"
+                if snap.get("status") != "running":
+                    yield f"event: run_finished\ndata: {json.dumps(snap, ensure_ascii=False)}\n\n"
+                    return
+            while True:
+                try:
+                    msg = q.get(timeout=15.0)
+                    yield f"event: {msg['event']}\ndata: {json.dumps(msg['data'], ensure_ascii=False)}\n\n"
+                    if msg["event"] == "run_finished":
+                        break
+                except _q.Empty:
+                    yield ": keepalive\n\n"
+        finally:
+            gemini_conv_manager.unsubscribe_run(run_id, q)
+
+    return StreamingResponse(
+        _gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 # ==========================================
 # 3. ChatGPT 逆向工程与原生桥接号池 API
 # ==========================================
@@ -661,9 +1442,12 @@ def get_chatgpt_status():
 @app.post("/api/chatgpt/start", summary="启动 ChatGPT 本地独立逆向后台服务", tags=["ChatGPT 逆向与号池"])
 def start_chatgpt_reverse():
     """手动按需启动基于 chatgpt2api 的独立无头逆向进程 (默认 18084 端口)。"""
+    require_service_enabled("chatgpt")
     try:
         ok = chatgpt_client.reverse.start()
         return {"success": ok, "port": chatgpt_client.reverse.port, "is_running": chatgpt_client.reverse.is_running()}
+    except ServiceDisabledError:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"启动 ChatGPT 逆向后台失败: {str(e)}")
 
@@ -681,28 +1465,38 @@ def stop_chatgpt_reverse():
 @app.get("/api/chatgpt/session", summary="获取当前 ChatGPT 登录会话与邮箱", tags=["ChatGPT 逆向与号池"])
 def get_chatgpt_session():
     """提取当前 ChatGPT 标签页或逆向号池中的已登录用户与 Access Token。"""
+    require_service_enabled("chatgpt")
     try:
         return chatgpt_client.get_session()
+    except ServiceDisabledError:
+        raise
     except Exception as e:
         _service_error(502, f"无法获取 ChatGPT 会话: {str(e)}", "chatgpt")
 
 
 @app.get("/api/chatgpt/models", summary="获取 ChatGPT 账号可用模型列表", tags=["ChatGPT 逆向与号池"])
 def get_chatgpt_models():
-    """拉取逆向暴露或浏览器同源支持的模型列表 (如 auto, gpt-5-6, gpt-image-2 等)。"""
+    """拉取逆向暴露或浏览器同源支持的模型列表，并按当前账号方案区分免费版与 Plus/Pro 专享模型。"""
+    require_service_enabled("chatgpt")
     try:
-        return chatgpt_client.get_models()
+        raw_res = chatgpt_client.get_models()
+    except ServiceDisabledError:
+        raise
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"无法获取模型列表: {str(e)}")
+    return _build_chatgpt_model_catalog(raw_res)
 
 
 @app.get("/api/chatgpt/accounts", summary="获取当前 ChatGPT 逆向号池账号列表", tags=["ChatGPT 逆向与号池"])
 def list_chatgpt_accounts():
     """查看已导入逆向引擎的账号列表、额度与健康状态。"""
+    require_service_enabled("chatgpt")
     try:
         if not chatgpt_client.reverse.is_running():
             chatgpt_client.reverse.start()
         return {"items": chatgpt_client.reverse.list_accounts()}
+    except ServiceDisabledError:
+        raise
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"获取账号列表失败: {str(e)}")
 
@@ -710,11 +1504,14 @@ def list_chatgpt_accounts():
 @app.post("/api/chatgpt/accounts", summary="向 ChatGPT 号池导入 AccessToken", tags=["ChatGPT 逆向与号池"])
 def import_chatgpt_accounts(body: ChatGPTAccountImportRequest):
     """手动导入一个或多个 Access Token 进入号池并自动刷新有效性。"""
+    require_service_enabled("chatgpt")
     try:
         if not chatgpt_client.reverse.is_running():
             chatgpt_client.reverse.start()
         res = chatgpt_client.reverse.import_tokens(body.tokens)
         return res
+    except ServiceDisabledError:
+        raise
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"导入账号失败: {str(e)}")
 
@@ -722,8 +1519,11 @@ def import_chatgpt_accounts(body: ChatGPTAccountImportRequest):
 @app.post("/api/chatgpt/accounts/sync-browser", summary="从浏览器 Cookie Hub 一键同步 Token 入池", tags=["ChatGPT 逆向与号池"])
 def sync_chatgpt_browser_token():
     """通过 Cookie Hub 自动获取浏览器中当前 chatgpt.com 登录会话的 Access Token，并一键载入逆向号池。"""
+    require_service_enabled("chatgpt")
     try:
         return chatgpt_client.sync_token_from_browser()
+    except ServiceDisabledError:
+        raise
     except Exception as e:
         _service_error(502, f"从浏览器同步 Token 失败: {str(e)}", "chatgpt")
 
@@ -731,6 +1531,7 @@ def sync_chatgpt_browser_token():
 @app.post("/api/chatgpt/chat", summary="向 ChatGPT 发起智能对话 (支持逆向与桥接双引擎)", tags=["ChatGPT 逆向与号池"])
 def chatgpt_ask(req: ChatRequest):
     """优先使用无头逆向引擎直连，若未就绪则自动降级到浏览器同源扩展。支持流式与非流式。"""
+    require_service_enabled("chatgpt")
     start_t = time.time()
     target_model = req.model or "auto"
     try:
@@ -781,18 +1582,56 @@ def chatgpt_ask(req: ChatRequest):
         _service_error(502, f"ChatGPT 提问失败: {str(e)}", "chatgpt")
 
 
-@app.post("/api/chatgpt/image", summary="ChatGPT 逆向图片生成 (gpt-image-2)", tags=["ChatGPT 逆向与号池"])
+@app.post('/api/chatgpt/image', summary='ChatGPT 逆向图片生成 (gpt-image-2)', tags=['ChatGPT 逆向与号池'])
 def chatgpt_image_generation(body: ChatGPTImageRequest):
-    """基于 chatgpt2api 官方逆向实现文生图，支持 gpt-image-2 等模型。"""
+    require_service_enabled('chatgpt')
+    start_t = time.time()
+    target_model = body.model or 'gpt-image-2'
+    fmt = body.response_format or 'b64_json'
+    n_val = body.n or 1
+    chat_id = chat_history_manager.start_chat(endpoint='/api/chatgpt/image', model=target_model, messages=body.prompt, is_stream=False, actual_model=target_model, meta={'type': 'image_generation', 'n': n_val, 'response_format': fmt})
     try:
-        return chatgpt_client.generate_image(
-            prompt=body.prompt,
-            model=body.model or "gpt-image-2",
-            n=body.n or 1,
-            response_format=body.response_format or "b64_json"
-        )
+        res = chatgpt_client.generate_image(prompt=body.prompt, model=target_model, n=n_val, response_format=fmt)
+        latency = int((time.time() - start_t) * 1000)
+        summary_text, meta = _format_image_history_summary(res, response_format=fmt)
+        meta['n'] = n_val
+        chat_history_manager.finish_chat(chat_id, response_text=summary_text, status=200, latency_ms=latency, actual_model=target_model, meta=meta)
+        return res
+    except ServiceDisabledError:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"ChatGPT 图片生成失败: {str(e)}")
+        latency = int((time.time() - start_t) * 1000)
+        chat_history_manager.finish_chat(chat_id, response_text='', status=502, latency_ms=latency, actual_model=target_model, error_message=str(e))
+        raise HTTPException(status_code=502, detail=f'ChatGPT 图片生成失败: {str(e)}')
+
+
+@app.post('/api/chatgpt/image/batch', summary='ChatGPT 并发批量生图 (gpt-image-2)', tags=['ChatGPT 逆向与号池'])
+def chatgpt_image_batch_generation(body: ChatGPTConcurrentImageRequest):
+    require_service_enabled('chatgpt')
+    start_t = time.time()
+    target_model = body.model or 'gpt-image-2'
+    fmt = body.response_format or 'b64_json'
+    prompt_log = body.prompts if body.prompts else (f'{body.prompt} (x{body.count or 1})' if body.prompt else '')
+    chat_id = chat_history_manager.start_chat(endpoint='/api/chatgpt/image/batch', model=target_model, messages=prompt_log, is_stream=False, actual_model=target_model, meta={'type': 'image_generation', 'batch': True, 'response_format': fmt})
+    try:
+        res = chatgpt_client.generate_images_concurrent(prompts=body.prompts, prompt=body.prompt, count=body.count or 1, model=target_model, n=body.n or 1, response_format=fmt, max_concurrency=body.max_concurrency or 3, timeout=body.timeout or 240)
+        latency = int((time.time() - start_t) * 1000)
+        summary_text, meta = _format_image_history_summary(res, response_format=fmt)
+        meta.update({'batch': True, 'total_tasks': res.get('total_tasks', 0), 'succeeded': res.get('succeeded', 0), 'failed': res.get('failed', 0), 'max_concurrency': res.get('max_concurrency', 1)})
+        errs = [f'#{r.get('index', 0)+1}: {r.get('error')}' for r in res.get('results', []) if not r.get('success')]
+        ok_cnt, tot_cnt, mc = res.get('succeeded', 0), res.get('total_tasks', 0), res.get('max_concurrency', 1)
+        chat_history_manager.finish_chat(chat_id, response_text=f'并发出图完成: 成功 {ok_cnt}/{tot_cnt} (并发度 {mc})\n{summary_text}', status=200 if res.get('success') else 502, latency_ms=latency, actual_model=target_model, error_message='; '.join(errs[:5]), meta=meta)
+        if not res.get('success'):
+            raise HTTPException(status_code=502, detail='ChatGPT 并发图片生成全部失败: ' + '; '.join(errs[:3]))
+        return res
+    except (ServiceDisabledError, HTTPException):
+        raise
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        latency = int((time.time() - start_t) * 1000)
+        chat_history_manager.finish_chat(chat_id, response_text='', status=502, latency_ms=latency, actual_model=target_model, error_message=str(e))
+        raise HTTPException(status_code=502, detail=f'ChatGPT 并发图片生成失败: {str(e)}')
 
 
 # ==========================================
@@ -810,6 +1649,7 @@ def aistudio_get_status():
 @app.post("/api/aistudio/start", summary="启动 Google AI Studio 逆向后台服务", tags=["Google AI Studio 逆向"])
 def aistudio_start_service():
     """手动启动 aistudio2api 核心引擎并激活数据面。"""
+    require_service_enabled("aistudio")
     try:
         ok = aistudio_client.start()
         return {
@@ -817,6 +1657,8 @@ def aistudio_start_service():
             "message": "AI Studio 逆向服务已成功启动并就绪" if ok else "启动失败，请检查控制台日志",
             "status": aistudio_client.get_status(),
         }
+    except ServiceDisabledError:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"启动 AI Studio 服务失败: {str(e)}")
 
@@ -838,6 +1680,7 @@ def aistudio_stop_service():
 @app.post("/api/aistudio/restart", summary="重启 Google AI Studio 逆向服务", tags=["Google AI Studio 逆向"])
 def aistudio_restart_service():
     """重启 aistudio2api 引擎并重新加载账号凭证与 BotGuard 引擎。"""
+    require_service_enabled("aistudio")
     try:
         ok = aistudio_client.restart()
         return {
@@ -845,6 +1688,8 @@ def aistudio_restart_service():
             "message": "AI Studio 逆向服务已重启并重新就绪" if ok else "重启失败",
             "status": aistudio_client.get_status(),
         }
+    except ServiceDisabledError:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"重启 AI Studio 服务失败: {str(e)}")
 
@@ -872,9 +1717,12 @@ def aistudio_list_models():
 @app.post("/api/aistudio/sync-cookies", summary="从浏览器 Cookie Hub 一键同步 Google 凭证入池", tags=["Google AI Studio 逆向"])
 def aistudio_sync_cookies():
     """从本地 Cookie Hub 提取最新 google.com 登录凭证并自动生成 account.json 入池。"""
+    require_service_enabled("aistudio")
     try:
         res = aistudio_client.sync_cookies_from_hub()
         return res
+    except ServiceDisabledError:
+        raise
     except Exception as e:
         _service_error(500, f"同步 AI Studio 凭证失败: {str(e)}", "aistudio")
 
@@ -885,6 +1733,7 @@ def aistudio_chat(req: AIStudioChatRequest):
     通过 Google AI Studio Playground 逆向原生通道调用 Gemini 大模型，
     支持 gemini-4-argon, gemini-3.8-flash 等全系列模型，支持流式 SSE 打字机输出。
     """
+    require_service_enabled("aistudio")
     start_t = time.time()
     target_model = req.model or "gemini-4-argon"
     try:
@@ -940,16 +1789,22 @@ def aistudio_chat(req: AIStudioChatRequest):
 # ==========================================
 @app.get("/api/bilibili/user", summary="获取 B 站登录用户信息与大会员资产", tags=["Bilibili 视频特权"])
 def get_bilibili_user():
+    require_service_enabled("bilibili")
     try:
         return bili_service.get_user_info()
+    except ServiceDisabledError:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"获取 B 站用户失败: {str(e)}")
 
 
 @app.get("/api/bilibili/video", summary="查询 B 站视频信息与最高画质流", tags=["Bilibili 视频特权"])
 def get_bilibili_video(bvid: str = Query(..., description="视频 BV 号，如 BV1GJ411x7h7")):
+    require_service_enabled("bilibili")
     try:
         return bili_service.get_video_info(bvid)
+    except ServiceDisabledError:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"解析视频失败: {str(e)}")
 
@@ -959,32 +1814,44 @@ def get_bilibili_video(bvid: str = Query(..., description="视频 BV 号，如 B
 # ==========================================
 @app.get("/api/baidupan/quota", summary="获取百度网盘存储容量与配额信息", tags=["百度网盘服务"])
 def get_baidupan_quota():
+    require_service_enabled("baidupan")
     try:
         return baidu_service.get_quota()
+    except ServiceDisabledError:
+        raise
     except Exception as e:
         _service_error(500, f"查询网盘配额失败: {str(e)}", "baidu")
 
 
 @app.get("/api/baidupan/user", summary="获取百度网盘账号资料与 VIP 等级", tags=["百度网盘服务"])
 def get_baidupan_user():
+    require_service_enabled("baidupan")
     try:
         return baidu_service.get_user_info()
+    except ServiceDisabledError:
+        raise
     except Exception as e:
         _service_error(500, f"查询网盘用户失败: {str(e)}", "baidu")
 
 
 @app.get("/api/baidupan/files", summary="遍历百度网盘指定目录下的文件", tags=["百度网盘服务"])
 def list_baidupan_files(dir_path: str = Query("/", description="网盘目录路径，默认根目录 /")):
+    require_service_enabled("baidupan")
     try:
         return baidu_service.list_files(dir_path=dir_path)
+    except ServiceDisabledError:
+        raise
     except Exception as e:
         _service_error(500, f"遍历网盘文件失败: {str(e)}", "baidu")
 
 
 @app.post("/api/baidupan/refresh", summary="强制从浏览器刷新百度网盘凭证", tags=["百度网盘服务"])
 def refresh_baidupan_auth():
+    require_service_enabled("baidupan")
     try:
         return baidu_service.refresh_auth()
+    except ServiceDisabledError:
+        raise
     except Exception as e:
         _service_error(500, f"刷新网盘凭证失败: {str(e)}", "baidu")
 
@@ -1002,6 +1869,16 @@ def get_hub_status():
 
 @app.get("/api/hub/cookies", summary="按域名动态提取实时 Cookie", tags=["Cookie Hub 通信"])
 def get_hub_cookies(domain: str = Query("google.com", description="要提取 Cookie 的目标域名")):
+    allowed, disabled_ids = is_domain_cookie_allowed(domain)
+    if not allowed:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": f"域名 {domain} 对应的网页 API ({', '.join(disabled_ids)}) 已在管理控制台关闭，已禁止获取 Cookie。",
+                "type": "service_disabled",
+                "disabled_services": disabled_ids,
+            },
+        )
     try:
         header_cookie = bridge_hub.get_cookies_header(domain=domain)
         cookies_dict = bridge_hub.get_cookies_dict(domain=domain)
@@ -1020,8 +1897,11 @@ def get_hub_cookies(domain: str = Query("google.com", description="要提取 Coo
 # ==========================================
 @app.get("/api/suno/quota", summary="获取当前 Suno 账户积分与可用曲目数", tags=["Suno 音乐生成"])
 def get_suno_quota():
+    require_service_enabled("suno")
     try:
         return suno_client.get_credits()
+    except ServiceDisabledError:
+        raise
     except Exception as e:
         _service_error(500, f"查询 Suno 配额失败: {str(e)}", "suno")
 
@@ -1043,15 +1923,19 @@ def _enrich_suno_clips(clips_data: Any) -> Any:
 
 @app.get("/api/suno/feed", summary="获取 Suno 历史作品曲库列表", tags=["Suno 音乐生成"])
 def get_suno_feed(page: int = Query(1, ge=1, description="页码")):
+    require_service_enabled("suno")
     try:
         clips = suno_client.get_feed(page=page)
         return _enrich_suno_clips(clips)
+    except ServiceDisabledError:
+        raise
     except Exception as e:
         _service_error(500, f"获取 Suno 历史曲库失败: {str(e)}", "suno")
 
 
 @app.post("/api/suno/generate", summary="提交 Suno 音乐创作任务", tags=["Suno 音乐生成"])
 def generate_suno_music(req: SunoGenerateRequest):
+    require_service_enabled("suno")
     try:
         if req.wait:
             if req.download:
@@ -1095,26 +1979,35 @@ def generate_suno_music(req: SunoGenerateRequest):
 
 @app.get("/api/suno/status", summary="查询指定 clip ids 的生成状态与音频直链", tags=["Suno 音乐生成"])
 def get_suno_status(clip_ids: str = Query(..., description="待查询的 clip ID，多个用英文逗号隔开")):
+    require_service_enabled("suno")
     try:
         id_list = [i.strip() for i in clip_ids.split(",") if i.strip()]
         clips = suno_client.fetch_clips_status(id_list)
         return _enrich_suno_clips(clips)
+    except ServiceDisabledError:
+        raise
     except Exception as e:
         _service_error(500, f"查询任务状态失败: {str(e)}", "suno")
 
 
 @app.post("/api/suno/lyrics", summary="使用 Suno AI 单独创作歌词", tags=["Suno 音乐生成"])
 def generate_suno_lyrics(req: SunoLyricsRequest):
+    require_service_enabled("suno")
     try:
         return suno_client.generate_lyrics(prompt=req.prompt)
+    except ServiceDisabledError:
+        raise
     except Exception as e:
         _service_error(500, f"创作歌词失败: {str(e)}", "suno")
 
 
 @app.post("/api/suno/refresh", summary="强制刷新 Suno 凭证与 Clerk JWT 令牌", tags=["Suno 音乐生成"])
 def refresh_suno_auth():
+    require_service_enabled("suno")
     try:
         return suno_client.refresh_auth()
+    except ServiceDisabledError:
+        raise
     except Exception as e:
         _service_error(500, f"刷新 Suno 凭证失败: {str(e)}", "suno")
 
@@ -1161,12 +2054,14 @@ def get_minimax_voices():
 
 @app.get("/api/minimax/quota", summary="获取 MiniMax 账户剩余字符配额与积分", tags=["MiniMax 语音合成"])
 def get_minimax_quota():
+    require_service_enabled("minimax")
     return minimax_client.get_quota()
 
 
 @app.post("/api/minimax/speech", summary="MiniMax 高级语音合成", tags=["MiniMax 语音合成"])
 def post_minimax_speech(req: MinimaxSpeechRequest):
     import io
+    require_service_enabled("minimax")
     try:
         audio_bytes = minimax_client.synthesize(
             text=req.text,
@@ -1184,12 +2079,15 @@ def post_minimax_speech(req: MinimaxSpeechRequest):
                 "Content-Length": str(len(audio_bytes))
             }
         )
+    except ServiceDisabledError:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"MiniMax 语音合成失败: {str(e)}")
 
 
 @app.post("/api/minimax/auto_fetch", summary="通知浏览器扩展唤醒并自动拉取 MiniMax 登录态", tags=["MiniMax 语音合成"])
 def post_minimax_auto_fetch(force: bool = Query(True, description="是否强制后台打开页面以唤醒会话")):
+    require_service_enabled("minimax")
     res = minimax_client.auto_refresh_auth(force_visit=force, timeout=20)
     return res
 
@@ -1217,6 +2115,7 @@ def openai_chat_completions(req: OpenAIChatRequest):
     if not _is_gemini_web_pool_model(model_name) and (
         model_name.startswith("aistudio") or model_name.startswith("gemini-4") or "argon" in model_name
     ):
+        require_service_enabled("aistudio")
         actual_model = req.model.replace("aistudio/", "").replace("aistudio-", "") if req.model else "gemini-4-argon"
         messages_payload = [m.model_dump(exclude_none=True) for m in req.messages]
         req_timeout = getattr(req, "timeout", None) or 120
@@ -1280,8 +2179,7 @@ def openai_chat_completions(req: OpenAIChatRequest):
 
     # 1. Gemini 分流
     if model_name.startswith("gemini"):
-        if not gemini_pool.is_running():
-            gemini_pool.start()
+        require_service_enabled("gemini")
 
         target_model = req.model if req.model and "gemini" in req.model else "gemini-4-hydrogen"
         reasoning = req.reasoning_effort or req.reasoning_level or "off"
@@ -1306,14 +2204,23 @@ def openai_chat_completions(req: OpenAIChatRequest):
                 sent_role = False
 
                 for attempt in range(MAX_TOOL_LIMIT_RETRIES + 1):
-                    raw_gen = gemini_pool.stream_chat_messages(
-                        messages=attempt_messages,
-                        model=target_model,
-                        reasoning_level=reasoning,
-                        timeout=effective_timeout,
-                        tools=tools,
-                        tool_choice=tool_choice,
-                    )
+                    if target_model.endswith("-task") or not gemini_pool.is_running():
+                        raw_gen = gemini_conv_manager.stream_openai_task_chat(
+                            messages=attempt_messages,
+                            model=target_model,
+                            tools=tools,
+                            tool_choice=tool_choice,
+                            timeout=effective_timeout,
+                        )
+                    else:
+                        raw_gen = gemini_pool.stream_chat_messages(
+                            messages=attempt_messages,
+                            model=target_model,
+                            reasoning_level=reasoning,
+                            timeout=effective_timeout,
+                            tools=tools,
+                            tool_choice=tool_choice,
+                        )
                     stream_iter = intercept_openai_sse_tool_limit(
                         raw_gen, tools_active=gemini_tools_active
                     )
@@ -1403,6 +2310,36 @@ def openai_chat_completions(req: OpenAIChatRequest):
                 }
             )
 
+        if target_model.endswith("-task") or not gemini_pool.is_running():
+            attempt_messages = sanitize_tool_limit_history(messages_payload, tools_active=gemini_tools_active)
+            txt_parts, tc_map, fin_reason = [], {}, "stop"
+            for sse_line in gemini_conv_manager.stream_openai_task_chat(
+                messages=attempt_messages, model=target_model, tools=tools, tool_choice=tool_choice, timeout=effective_timeout
+            ):
+                st = sse_line.strip()
+                if not st.startswith("data:") or st == "data: [DONE]": continue
+                try: obj = json.loads(st[5:].strip())
+                except Exception: continue
+                ch0 = (obj.get("choices") or [{}])[0]
+                if ch0.get("finish_reason"): fin_reason = ch0["finish_reason"]
+                dl = ch0.get("delta") or {}
+                if dl.get("content"): txt_parts.append(dl["content"])
+                for tc in dl.get("tool_calls") or []:
+                    idx = tc.get("index", 0)
+                    tc_map.setdefault(idx, {"id": tc.get("id", ""), "type": "function", "function": {"name": "", "arguments": ""}})
+                    if tc.get("id"): tc_map[idx]["id"] = tc["id"]
+                    fn = tc.get("function") or {}
+                    tc_map[idx]["function"]["name"] += fn.get("name", "")
+                    tc_map[idx]["function"]["arguments"] += fn.get("arguments", "")
+            msg_out = {"role": "assistant", "content": "".join(txt_parts) or None}
+            if tc_map: msg_out["tool_calls"] = [tc_map[k] for k in sorted(tc_map)]
+            return {
+                "id": f"chatcmpl-gemini-task-{int(time.time()*1000)}",
+                "object": "chat.completion", "created": int(time.time()), "model": target_model,
+                "choices": [{"index": 0, "message": msg_out, "finish_reason": fin_reason}],
+                "usage": {"prompt_tokens": len(last_user_msg), "completion_tokens": len(msg_out.get("content") or ""), "total_tokens": len(last_user_msg) + len(msg_out.get("content") or "")},
+            }
+
         try:
             res = gemini_pool.ask_with_details(
                 prompt=last_user_msg,
@@ -1412,13 +2349,15 @@ def openai_chat_completions(req: OpenAIChatRequest):
             )
         except Exception as first_err:
             failure_kind = gemini_failure_kind(str(first_err))
-            if failure_kind == "login":
-                print("[Gemini OpenAI] 检测到登录态失效，正在从 Cookie Hub 刷新身份匹配的账号...", flush=True)
+            if failure_kind in {"login", "unbound"}:
+                print(f"[Gemini OpenAI] 检测到上游异常 ({failure_kind})，正在从 Cookie Hub 自动刷新凭证...", flush=True)
             elif not gemini_failure_should_retry(str(first_err)):
                 _gemini_stop(str(first_err))
             try:
-                if failure_kind == "login":
-                    gemini_pool.refresh_pool_cookies()
+                if failure_kind in {"login", "unbound"}:
+                    refreshed = gemini_pool.recover_from_failure(failure_kind)
+                    if failure_kind == "unbound" and not refreshed:
+                        _gemini_stop(str(first_err))
                 else:
                     gemini_pool.reset_proxies()
                 res = gemini_pool.ask_with_details(
@@ -1427,10 +2366,12 @@ def openai_chat_completions(req: OpenAIChatRequest):
                     reasoning_level=reasoning,
                     timeout=effective_timeout,
                 )
+            except HTTPException:
+                raise
             except Exception as retry_err:
                 _service_error(
                     502,
-                    f"Gemini 兼容接口调用失败: {first_err} (未自动刷新或覆盖 Cookie): {retry_err}",
+                    f"Gemini 兼容接口调用失败: {first_err} (自愈重试亦未成功: {retry_err})",
                     "gemini",
                 )
 
@@ -1476,6 +2417,7 @@ def openai_chat_completions(req: OpenAIChatRequest):
         }
 
     # 2. ChatGPT 分流 (逆向引擎 + 扩展模拟桥接)
+    require_service_enabled("chatgpt")
     req_model_lower = (req.model or "").lower().strip()
     if "moni" in req_model_lower or req_model_lower in ("chatgpt-web", "chatgpt-web-moni"):
         target_gpt_model = "chatgpt-web-moni"
@@ -1487,10 +2429,15 @@ def openai_chat_completions(req: OpenAIChatRequest):
         target_gpt_model = "auto"
 
     audit_messages = [m.model_dump(exclude_none=True) for m in req.messages]
-    effort = req.reasoning_effort or req.reasoning_level or ""
+    _, _, is_member_plan = _chatgpt_plan_context()
+    target_gpt_model, effort = _resolve_chatgpt_model_and_effort(
+        target_gpt_model,
+        req.reasoning_effort or req.reasoning_level or "",
+        is_member_plan,
+    )
     extra = req.model_extra or {}
-    tools = extra.get("tools")
-    tool_choice = extra.get("tool_choice")
+    tools = req.tools if req.tools is not None else extra.get("tools")
+    tool_choice = req.tool_choice if req.tool_choice is not None else extra.get("tool_choice")
 
     use_tool_bridge = (
         target_gpt_model != "chatgpt-web-moni"
@@ -1512,31 +2459,42 @@ def openai_chat_completions(req: OpenAIChatRequest):
         upstream_tools = None
         upstream_tool_choice = None
 
+    tool_audit_meta = {
+        "tools_declared": len(tools or []),
+        "tool_names": [item["name"] for item in normalize_tool_definitions(tools)],
+        "tool_bridge": use_tool_bridge,
+        "tool_mode": tool_mode,
+        "tool_choice": tool_choice,
+    }
+
     if req.stream:
         attempt_messages = upstream_messages
         stream_iter = None
         first_chunk = None
 
         for attempt in range(MAX_TOOL_LIMIT_RETRIES + 1):
-            upstream_iter = chatgpt_client.chat(
-                attempt_messages,
-                model=target_gpt_model,
-                stream=True,
-                thinking_effort=effort,
-                tools=upstream_tools,
-                tool_choice=upstream_tool_choice,
-            )
+            def _request_upstream(stream_messages):
+                return chatgpt_client.chat(
+                    stream_messages,
+                    model=target_gpt_model,
+                    stream=True,
+                    thinking_effort=effort,
+                    tools=upstream_tools,
+                    tool_choice=upstream_tool_choice,
+                )
             if use_tool_bridge:
                 stream_iter = iter(
-                    adapt_stream_chunks(
-                        upstream_iter,
+                    stream_tool_bridge(
+                        _request_upstream,
+                        attempt_messages,
                         model=req.model or target_gpt_model,
                         allowed_names=allowed_tool_names,
                         mode=tool_mode,
+                        audit_state=tool_audit_meta,
                     )
                 )
             else:
-                stream_iter = iter(upstream_iter)
+                stream_iter = iter(_request_upstream(attempt_messages))
             try:
                 first_chunk = next(stream_iter)
                 break
@@ -1633,6 +2591,7 @@ def openai_chat_completions(req: OpenAIChatRequest):
             messages=audit_messages,
             actual_model=target_gpt_model,
             start_time=start_t,
+            meta=tool_audit_meta,
         )
         return StreamingResponse(
             wrapped_gen,
@@ -1690,7 +2649,8 @@ def openai_chat_completions(req: OpenAIChatRequest):
             status=200,
             latency_ms=latency,
             is_stream=False,
-            actual_model=target_gpt_model
+            actual_model=target_gpt_model,
+            meta=tool_audit_meta,
         )
         return res
     except Exception as e:
@@ -1772,15 +2732,25 @@ def openai_image_generations(body: OpenAIImageGenerationRequest):
     提供标准 OpenAI POST /v1/images/generations 接口，
     底层自动路由到 chatgpt2api 官方逆向的 gpt-image-2 / DALL-E 3 生成能力。
     """
+    require_service_enabled('chatgpt')
+    start_t = time.time()
+    target_model = body.model or 'gpt-image-2'
+    fmt = body.response_format or 'b64_json'
+    n_val = body.n or 1
+    chat_id = chat_history_manager.start_chat(endpoint='/v1/images/generations', model=target_model, messages=body.prompt, is_stream=False, actual_model=target_model, meta={'type': 'image_generation', 'n': n_val, 'response_format': fmt})
     try:
-        return chatgpt_client.generate_image(
-            prompt=body.prompt,
-            model=body.model or "gpt-image-2",
-            n=body.n or 1,
-            response_format=body.response_format or "b64_json"
-        )
+        res = chatgpt_client.generate_image(prompt=body.prompt, model=target_model, n=n_val, response_format=fmt)
+        latency = int((time.time() - start_t) * 1000)
+        summary_text, meta = _format_image_history_summary(res, response_format=fmt)
+        meta['n'] = n_val
+        chat_history_manager.finish_chat(chat_id, response_text=summary_text, status=200, latency_ms=latency, actual_model=target_model, meta=meta)
+        return res
+    except ServiceDisabledError:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"ChatGPT 图片生成失败: {str(e)}")
+        latency = int((time.time() - start_t) * 1000)
+        chat_history_manager.finish_chat(chat_id, response_text='', status=502, latency_ms=latency, actual_model=target_model, error_message=str(e))
+        raise HTTPException(status_code=502, detail=f'ChatGPT 图片生成失败: {str(e)}')
 
 
 @app.post("/v1/audio/speech", summary="OpenAI 兼容语音合成接口", tags=["OpenAI 兼容接口"])
@@ -1791,6 +2761,7 @@ def openai_audio_speech(body: OpenAISpeechRequest):
     返回标准 audio/mpeg 二进制音频流。
     """
     import io
+    require_service_enabled("minimax")
     try:
         audio_bytes = minimax_client.synthesize(
             text=body.input,
@@ -1806,6 +2777,8 @@ def openai_audio_speech(body: OpenAISpeechRequest):
                 "Content-Length": str(len(audio_bytes))
             }
         )
+    except ServiceDisabledError:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"语音合成失败: {str(e)}")
 
@@ -1866,6 +2839,65 @@ def _chatgpt_reasoning(model_id: str) -> str:
     }.get(model_id, "")
 
 
+def _resolve_chatgpt_model_and_effort(
+    requested_model: str,
+    reasoning_level: Optional[str],
+    is_member: bool,
+) -> tuple[str, str]:
+    """将网页端主模型 (6 / 6 Plus / 5.6 / 6 Sol / 5.6 Sol / Auto) + 三档推理深度映射为上游真实模型与 thinking_effort。"""
+    mid = str(requested_model or "auto").strip()
+    raw_effort = str(reasoning_level or "").strip().lower()
+
+    if mid == "gpt-6":
+        if raw_effort in ("", "off", "none"):
+            return "gpt-6-instant", ""
+        if raw_effort in ("low", "medium", "standard"):
+            return ("gpt-6-thinking" if is_member else "gpt-6-t-mini"), "standard"
+        if raw_effort in ("high", "xhigh", "extended", "max"):
+            return ("gpt-6-thinking" if is_member else "gpt-6-t-mini"), "extended"
+        return "gpt-6", ""
+
+    if mid == "gpt-6-plus":
+        if raw_effort in ("", "off", "none"):
+            return "gpt-6-thinking", ""
+        if raw_effort in ("low", "medium", "standard"):
+            return "gpt-6-thinking", "standard"
+        if raw_effort == "max":
+            return "gpt-6-thinking", "max"
+        return "gpt-6-thinking", "extended"
+
+    if mid == "gpt-5-6":
+        if raw_effort in ("", "off", "none"):
+            return "gpt-5-6-instant", ""
+        if raw_effort in ("low", "medium", "standard"):
+            return "gpt-5-6-thinking", "standard"
+        if raw_effort in ("high", "xhigh", "extended", "max"):
+            return "gpt-5-6-thinking", "extended"
+        return "gpt-5-6", ""
+
+    return mid, _normalize_chatgpt_thinking_effort(raw_effort, mid)
+
+
+def _normalize_chatgpt_thinking_effort(effort: Optional[str], model: str = "") -> str:
+    """将 OpenAI/控制台推理级别 (off/low/medium/high) 映射为 ChatGPT 网页端协议支持的 thinking_effort (standard/extended/max)。"""
+    raw = str(effort or "").strip().lower()
+    if raw in ("", "off", "none", "auto"):
+        return ""
+    mid = str(model or "").strip().lower()
+    if mid in ("gpt-6-instant", "gpt-5-6-instant", "gpt-6-mini", "gpt-5-6-mini", "research", "chatgpt-web", "chatgpt-web-moni"):
+        return ""
+    mapping = {
+        "low": "standard",
+        "medium": "standard",
+        "standard": "standard",
+        "high": "extended",
+        "xhigh": "extended",
+        "extended": "extended",
+        "max": "max",
+    }
+    return mapping.get(raw, "")
+
+
 _GEMINI_MODEL_NOTES = {
     "gemini-3.5-flash-lite": "极速响应",
     "gemini-3.6-flash": "多模态高通量",
@@ -1895,7 +2927,7 @@ _GEMINI_MODEL_FALLBACK = [
 def _is_gemini_web_pool_model(name: str) -> bool:
     """网页选择器上的模型走 Gemini 号池，不进 AI Studio。"""
     base = (name or "").lower().strip()
-    for suffix in ("-thinking-medium", "-thinking", "-thinking-lite"):
+    for suffix in ("-thinking-medium", "-thinking", "-thinking-lite", "-task"):
         if base.endswith(suffix):
             base = base[: -len(suffix)]
             break
@@ -1915,25 +2947,125 @@ def _is_gemini_web_pool_model(name: str) -> bool:
     }
 
 
+def _chatgpt_plan_context():
+    """解析当前生效 ChatGPT 账号的订阅方案 (free / plus / pro / team / enterprise)。"""
+    plan = "free"
+    plan_label = "免费版"
+    try:
+        hint = chatgpt_client.public_account() or {}
+        if hint.get("plan"):
+            plan = str(hint.get("plan")).strip().lower() or "free"
+        if hint.get("plan_label"):
+            plan_label = str(hint.get("plan_label")).strip() or plan_label
+    except Exception:
+        pass
+    if plan == "free":
+        try:
+            accts = chatgpt_client.get_dashboard_accounts() or []
+            active = [a for a in accts if a.get("status") in ("enabled", "ready") and a.get("is_member")]
+            if active:
+                plan = str(active[0].get("membership") or active[0].get("plan_tier") or "plus").strip().lower()
+                plan_label = chatgpt_client.plan_label(plan)
+        except Exception:
+            pass
+    is_member = plan not in ("", "free", "none", "unknown")
+    return plan, plan_label, is_member
+
+
+def _build_chatgpt_model_catalog(raw_res: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """构建区分免费版与 Plus 会员的 ChatGPT 模型目录，过滤内部 gate 占位符。"""
+    plan, plan_label, is_member = _chatgpt_plan_context()
+    raw_items = (raw_res or {}).get("data") if isinstance(raw_res, dict) else []
+    clean_data = []
+    seen_ids = set()
+    for item in raw_items or []:
+        if not isinstance(item, dict):
+            continue
+        mid = str(item.get("id") or "").strip()
+        if not mid or mid in seen_ids or "reserved_gate" in mid:
+            continue
+        seen_ids.add(mid)
+        clean_data.append(item)
+
+    if not clean_data:
+        for mid in REVERSE_MODEL_DESCRIPTIONS:
+            clean_data.append({
+                "id": mid,
+                "object": "model",
+                "created": 0,
+                "owned_by": "chatgpt",
+            })
+            seen_ids.add(mid)
+
+    # 对齐 ChatGPT 网页选择器：仅保留主线模型，推理深度通过 Reasoning 下拉框三档映射
+    webpage_specs = [
+        ("auto", f"Auto（{plan_label} · 智能优选）" if is_member else "Auto（免费 · 智能优选）", False, "chat"),
+        ("gpt-6", "GPT-6（Instant / Thinking）", False, "chat"),
+        ("gpt-6-plus", f"GPT-6 Plus（{plan_label} 专享）" if is_member else "GPT-6 Plus（Plus 专享/未开通）", True, "chat"),
+        ("gpt-5-6", "GPT-5.6（Instant / Thinking）" if is_member else "GPT-5.6（Plus 专享/未开通）", True, "chat"),
+        ("gpt-6-sol-wm", "GPT-6 Sol（协同工作区）" if is_member else "GPT-6 Sol（Plus 专享/未开通）", True, "work"),
+        ("gpt-5.6-sol-wm", "GPT-5.6 Sol（协同工作区）" if is_member else "GPT-5.6 Sol（Plus 专享/未开通）", True, "work"),
+        ("research", "Deep Research（全网深度研究）" if is_member else "Deep Research（Plus 专享/未开通）", True, "chat"),
+        ("gpt-image-2", "GPT Image 2（绘图/动图）", False, "image"),
+        ("chatgpt-web", "ChatGPT Web（网页原生）", False, "chat"),
+    ]
+
+    ui_models = []
+    for mid, label, is_plus_only, scene in webpage_specs:
+        # 若上游列表非空，过滤掉上游完全不存在且非合成入口的模型（gpt-6 / gpt-6-plus / chatgpt-web 始终保留）
+        if mid not in ("auto", "gpt-6", "gpt-6-plus", "gpt-image-2", "chatgpt-web"):
+            has_upstream = (
+                mid in seen_ids
+                or (mid == "gpt-5-6" and any(k in seen_ids for k in ("gpt-5-6", "gpt-5-6-instant", "gpt-5-6-thinking")))
+            )
+            if not has_upstream:
+                continue
+        tier = "plus" if is_plus_only else "free"
+        locked = bool(is_plus_only and not is_member)
+        ui_models.append({
+            "id": mid,
+            "label": label,
+            "tier": tier,
+            "locked": locked,
+            "scene": scene,
+            "description": REVERSE_MODEL_DESCRIPTIONS.get(mid, MODEL_DISPLAY_NAMES.get(mid, label)),
+        })
+
+    return {
+        "object": "list",
+        "plan": plan,
+        "plan_label": plan_label,
+        "is_member": is_member,
+        "models": ui_models,
+        "data": clean_data,
+    }
+
+
 def _gemini_catalog_rows():
     """对外目录用网页上的型号名。3.8 已下线，日常模型是 4 Hydrogen。"""
     rows = []
     seen = set()
     for item in gemini_pool.list_web_models():
         mid = item.get("id") or ""
+        if not mid or mid in seen or item.get("locked"):
+            continue
+        seen.add(mid)
+        note = item.get("label") or mid
+        rows.append({
+            "id": mid, "object": "model", "owned_by": "google-cookie-suite",
+            "tag": "pool", "type": "gemini_pool", "mode": "chat",
+            "description": f"[Gemini 聊天] {note}",
+        })
+    for item in gemini_pool.list_task_models():
+        mid = item.get("id") or ""
         if not mid or mid in seen:
             continue
         seen.add(mid)
         note = item.get("label") or mid
-        if item.get("locked"):
-            note += "（当前账号未开通）"
         rows.append({
-            "id": mid,
-            "object": "model",
-            "owned_by": "google-cookie-suite",
-            "tag": "pool",
-            "type": "gemini_pool",
-            "description": f"[Gemini 网页] {note}",
+            "id": mid, "object": "model", "owned_by": "google-cookie-suite",
+            "tag": "pool_task", "type": "gemini_task", "mode": "task",
+            "description": f"[Gemini 任务/Agent] {note}",
         })
     for mid, note in (
         ("gemini-image", "网页生图"),
@@ -1969,7 +3101,7 @@ def export_opencode(set_default: bool = Query(False, description="是否把默�
     except Exception:
         pass
     try:
-        result = export_to_file(raw or [], set_default=set_default, plan=plan)
+        result = export_to_file(raw or [], set_default=set_default, plan=plan, api_key=token_store.get_token())
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"写入 OpenCode 配置失败: {exc}")
     return {
@@ -1987,11 +3119,32 @@ def openai_models():
     - pool (谷歌号池直连): Google Gemini 多账号自动轮询直连
     - 已彻底移除官方下线的过时 gpt-4o 模型
     """
+    plan, plan_label, is_member = _chatgpt_plan_context()
     reverse_models = []
     seen_ids = set()
 
+    def _make_reverse_row(mid: str, desc: str) -> Dict[str, Any]:
+        is_wm = "-wm" in mid.lower()
+        is_plus_only = (mid in PLUS_EXCLUSIVE_MODELS) or is_wm
+        row: Dict[str, Any] = {
+            "id": mid,
+            "object": "model",
+            "owned_by": "openai-reverse",
+            "tag": "reverse",
+            "type": "api_reverse",
+            "scene": "work" if is_wm else "chat",
+            "tier": "plus" if is_plus_only else "free",
+            "locked": bool(is_plus_only and not is_member),
+            "description": desc,
+        }
+        reasoning = _chatgpt_reasoning(mid)
+        if reasoning:
+            row["reasoning"] = reasoning
+        return row
+
     # 1. 优先从运行中的逆向引擎动态提取实时模型
-    if chatgpt_client.reverse.is_running():
+    chatgpt_enabled = is_service_enabled("chatgpt")
+    if chatgpt_enabled and chatgpt_client.reverse.is_running():
         try:
             raw_res = chatgpt_client.reverse.get_models()
             for item in raw_res.get("data", []):
@@ -2003,68 +3156,45 @@ def openai_models():
                     continue
                 seen_ids.add(mid)
                 desc = REVERSE_MODEL_DESCRIPTIONS.get(mid, f"[协议逆向直连] ChatGPT 官方模型 ({mid})")
-                is_wm = "-wm" in mid.lower()
-                row = {
-                    "id": mid,
-                    "object": "model",
-                    "owned_by": "openai-reverse",
-                    "tag": "reverse",
-                    "type": "api_reverse",
-                    "scene": "work" if is_wm else "chat",
-                    "description": desc,
-                }
-                reasoning = _chatgpt_reasoning(mid)
-                if reasoning:
-                    row["reasoning"] = reasoning
-                reverse_models.append(row)
+                reverse_models.append(_make_reverse_row(mid, desc))
         except Exception:
             pass
 
     # 兜底回退：若逆向引擎暂时未拉取到，使用内建全量逆向清单 (包含 thinking，无 4o)
-    if not reverse_models:
+    if chatgpt_enabled and not reverse_models:
         for mid, desc in REVERSE_MODEL_DESCRIPTIONS.items():
-            is_wm = "-wm" in mid.lower()
-            row = {
-                "id": mid,
-                "object": "model",
-                "owned_by": "openai-reverse",
-                "tag": "reverse",
-                "type": "api_reverse",
-                "scene": "work" if is_wm else "chat",
-                "description": desc,
-            }
-            reasoning = _chatgpt_reasoning(mid)
-            if reasoning:
-                row["reasoning"] = reasoning
-            reverse_models.append(row)
+            reverse_models.append(_make_reverse_row(mid, desc))
 
     # 2. 网页模拟输入模型 (专属 moni 标签)
     moni_models = [
         {"id": "chatgpt-web-moni", "object": "model", "owned_by": "moni", "tag": "moni", "type": "dom_simulated", "description": "[网页模拟输入/moni] 浏览器扩展 DOM 按键与点击输入模拟"},
         {"id": "chatgpt-web", "object": "model", "owned_by": "moni", "tag": "moni", "type": "dom_simulated", "description": "[网页模拟输入/moni] ChatGPT 浏览器同源页面输入桥接"},
-    ]
+    ] if chatgpt_enabled else []
 
     # 3. Google 多账号池直连模型（跟号池 /v1/models 走，不再写死一份旧名单）
-    gemini_models = _gemini_catalog_rows()
+    gemini_models = _gemini_catalog_rows() if is_service_enabled("gemini") else []
 
     # 4. Google AI Studio 逆向原生模型
     aistudio_models = []
-    try:
-        raw_ai_models = aistudio_client.list_models()
-        for mid in raw_ai_models[:15]:
-            aistudio_models.append({
-                "id": mid,
-                "object": "model",
-                "owned_by": "google-aistudio-reverse",
-                "tag": "aistudio_reverse",
-                "type": "playground_waa_rpc",
-                "description": f"[AI Studio 逆向直连] 官方 Playground 原生模型 ({mid})",
-            })
-    except Exception:
-        pass
+    if is_service_enabled("aistudio"):
+        try:
+            raw_ai_models = aistudio_client.list_models()
+            for mid in raw_ai_models[:15]:
+                aistudio_models.append({
+                    "id": mid,
+                    "object": "model",
+                    "owned_by": "google-aistudio-reverse",
+                    "tag": "aistudio_reverse",
+                    "type": "playground_waa_rpc",
+                    "description": f"[AI Studio 逆向直连] 官方 Playground 原生模型 ({mid})",
+                })
+        except Exception:
+            pass
 
     return {
         "object": "list",
+        "chatgpt_plan": plan,
+        "chatgpt_plan_label": plan_label,
         "data": reverse_models + moni_models + gemini_models + aistudio_models,
     }
 
@@ -2139,6 +3269,7 @@ def dashboard():
 
 
 def generate_responses_text(model, messages):
+    require_service_enabled("chatgpt")
     completion = chatgpt_client.chat(messages, model=model, stream=False)
     return completion["choices"][0]["message"]["content"]
 
@@ -2156,5 +3287,7 @@ else:
     app.include_router(make_responses_router(generate_responses_text))
 
 
+
+
 if __name__ == "__main__":
-    uvicorn.run("app_service:app", host="127.0.0.1", port=18800, reload=False)
+    uvicorn.run("app_service:app", host=COOKIE_SUITE_HOST, port=COOKIE_SUITE_PORT, reload=False)

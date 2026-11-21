@@ -12,6 +12,72 @@ const LOCAL_HOSTS = new Set(['127.0.0.1:18888', 'localhost:18888']);
 const isExtensionOrigin = origin => /^(chrome-extension|extension):\/\/[a-z0-9]{32}$/i.test(origin || '');
 const permittedHttpOrigin = origin => !origin || LOCAL_HTTP_ORIGINS.has(origin) || isExtensionOrigin(origin);
 
+const SWITCHES_FILE = path.join(__dirname, '..', 'runtime_state', 'web_api_switches.json');
+const WEB_API_DOMAINS = [
+  { id: 'gemini', domains: ['gemini.google.com', 'google.com'] },
+  { id: 'aistudio', domains: ['aistudio.google.com', 'google.com'] },
+  { id: 'chatgpt', domains: ['chatgpt.com', 'openai.com'] },
+  { id: 'suno', domains: ['suno.com', 'clerk.suno.com', 'auth.suno.com'] },
+  { id: 'minimax', domains: ['minimax.io', 'minimaxi.com', 'hailuo.ai', 'hailuoai.com'] },
+  { id: 'baidupan', domains: ['pan.baidu.com', 'baidu.com'] },
+  { id: 'bilibili', domains: ['bilibili.com'] },
+  { id: 'udio', domains: ['udio.com'] }
+];
+
+function readWebApiSwitches() {
+  try {
+    if (!fs.existsSync(SWITCHES_FILE)) return {};
+    const parsed = JSON.parse(fs.readFileSync(SWITCHES_FILE, 'utf-8'));
+    return (parsed && typeof parsed.services === 'object' && parsed.services) ? parsed.services : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+function isWebApiEnabled(serviceId) {
+  const services = readWebApiSwitches();
+  const entry = services[serviceId];
+  if (entry === undefined || entry === null) return true;
+  if (typeof entry === 'boolean') return entry;
+  return entry.enabled !== false;
+}
+
+function isDomainCookieAllowed(domainOrUrl) {
+  const raw = String(domainOrUrl || '').trim().toLowerCase();
+  if (!raw) return { allowed: true, disabled: [] };
+  let host = raw;
+  if (raw.includes('://')) {
+    try { host = new URL(raw).hostname.toLowerCase(); } catch (e) {}
+  } else {
+    host = raw.split('/')[0].split(':')[0];
+  }
+  host = host.replace(/^\.+/, '');
+  if (!host) return { allowed: true, disabled: [] };
+
+  const matching = [];
+  for (const spec of WEB_API_DOMAINS) {
+    let bestLen = 0;
+    for (const d of spec.domains) {
+      if ((host === d || host.endsWith('.' + d)) && d.length > bestLen) {
+        bestLen = d.length;
+      }
+    }
+    if (bestLen > 0) {
+      matching.push({ len: bestLen, id: spec.id, enabled: isWebApiEnabled(spec.id) });
+    }
+  }
+  if (matching.length === 0) return { allowed: true, disabled: [] };
+  const maxLen = Math.max(...matching.map(m => m.len));
+  const specific = matching.filter(m => m.len === maxLen);
+  if (specific.some(m => m.enabled)) return { allowed: true, disabled: [] };
+  return { allowed: false, disabled: specific.map(m => m.id) };
+}
+
+function sendServiceDisabled(res, message) {
+  res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+  res.end(JSON.stringify({ success: false, code: 'service_disabled', error: message }));
+}
+
 // Store active extension WebSocket connections
 const extensionSockets = new Set();
 // Store pending HTTP requests waiting for extension response: reqId -> { resolve, reject, timer }
@@ -138,6 +204,10 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (pathname === '/chatgpt/open') {
+    if (!isWebApiEnabled('chatgpt')) {
+      sendServiceDisabled(res, 'ChatGPT 网页 API 已在管理控制台关闭，已禁止访问浏览器会话。');
+      return;
+    }
     try {
       const data = await dispatchToExtension('open_chatgpt_tab', {});
       if (data && data.tabId) currentBridgeTabId = Number(data.tabId);
@@ -195,13 +265,23 @@ const server = http.createServer(async (req, res) => {
 
   // 2.8 ChatGPT In-Page Bridge: Get Session (/chatgpt/session)
   if (pathname === '/chatgpt/session') {
+    if (!isWebApiEnabled('chatgpt')) {
+      sendServiceDisabled(res, 'ChatGPT 网页 API 已在管理控制台关闭，已禁止获取会话与 Cookie。');
+      return;
+    }
     if (extensionSockets.size === 0) {
       res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify({ error: '浏览器扩展未连接' }));
       return;
     }
     try {
-      const data = await dispatchToExtension('chatgpt_get_session', { tabId: currentBridgeTabId });
+      const refresh = parsedUrl.searchParams.get('refresh') === 'true';
+      const autoOpen = parsedUrl.searchParams.get('auto_open') === 'true';
+      const data = await dispatchToExtension('chatgpt_get_session', {
+        tabId: currentBridgeTabId,
+        refresh,
+        autoOpen,
+      });
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify(data, null, 2));
     } catch (err) {
@@ -300,6 +380,21 @@ const server = http.createServer(async (req, res) => {
   if (pathname === '/gemini/inspect') {
     try {
       const data = await dispatchToExtension('gemini_inspect', {}, 15000);
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(data, null, 2));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  // 2.87b Gemini 页面网络抓包读取与清空 (/gemini/captures)
+  if (pathname === '/gemini/captures') {
+    try {
+      const tabId = parsedUrl.searchParams.get('tabId') ? Number(parsedUrl.searchParams.get('tabId')) : undefined;
+      const clear = parsedUrl.searchParams.get('clear') === '1' || req.method === 'DELETE';
+      const data = await dispatchToExtension('gemini_captures', { tabId, clear }, 15000);
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify(data, null, 2));
     } catch (err) {
@@ -570,7 +665,67 @@ const server = http.createServer(async (req, res) => {
   // 3. Fetch Cookies by Domain / URL
   // AI Studio session bootstrap: open the connected browser profile and collect cookies via the extension.
   // Cookie values are returned only to the local AI Studio service; they are never written to bridge logs.
+  if (pathname === '/gemini/auto_fetch') {
+    if (!isWebApiEnabled('gemini')) { sendServiceDisabled(res, 'Gemini disabled'); return; }
+    if (extensionSockets.size === 0) {
+      res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify({ success: false, error: 'Cookie Hub not connected' })); return;
+    }
+    try {
+      const targetUrl = 'https://gemini.google.com/u/0/app';
+      const getTabs = () => dispatchToExtension('list_tabs', {}, 8000);
+      let tabs = ((await getTabs()).tabs || []);
+      const cands = tabs.filter(t => { try { return new URL(t.url || '').hostname === 'gemini.google.com'; } catch (e) { return false; } });
+      let tab = cands.length ? cands[cands.length - 1] : null;
+      let tabId = null, createdByUs = false;
+      if (!tab) {
+        const op = await dispatchToExtension('open_tab', { url: targetUrl, active: false }, 12000);
+        if (!op.success || !op.tabId) throw new Error(op.error || 'open_tab failed');
+        tabId = Number(op.tabId); createdByUs = true;
+      } else {
+        tabId = Number(tab.id);
+        await dispatchToExtension('navigate_tab', { tabId, url: targetUrl, active: false }, 10000);
+      }
+      let ft = null, ls = '', sc = 0;
+      for (let i = 0; i < 22; i++) {
+        tabs = ((await getTabs()).tabs || []);
+        ft = tabs.find(t => Number(t.id) === tabId) || null;
+        if (ft && ft.url) {
+          let h = ''; try { h = new URL(ft.url).hostname; } catch (e) {}
+          if (h === 'accounts.google.com' || h.endsWith('.accounts.google.com')) {
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+            res.end(JSON.stringify({ success: false, loginRequired: true, tabId, pageHost: h })); return;
+          }
+          if (h === 'gemini.google.com' && ft.title) {
+            const st = ft.url + '|' + ft.title; sc = st === ls ? sc + 1 : 0; ls = st;
+            if (sc >= 1) break;
+          }
+        }
+        await new Promise(r => setTimeout(r, 750));
+      }
+      await new Promise(r => setTimeout(r, 1200));
+      const [gRes, gemRes] = await Promise.all([
+        dispatchToExtension('get_cookies', { domain: 'google.com' }, 15000),
+        dispatchToExtension('get_cookies', { url: 'https://gemini.google.com/' }, 15000)
+      ]);
+      const cmap = new Map();
+      [...(gRes.cookies || []), ...(gemRes.cookies || [])].forEach(c => { const k = c.name + '@' + c.domain + c.path; if (!cmap.has(k)) cmap.set(k, c); });
+      const cookies = Array.from(cmap.values());
+      if (createdByUs && tabId) dispatchToExtension('close_tab', { tabId }, 5000).catch(() => {});
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify({ success: cookies.length > 0, loginRequired: false, closedTempTab: createdByUs, count: cookies.length, cookies }));
+    } catch (err) {
+      res.writeHead(502, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify({ success: false, error: err.message }));
+    }
+    return;
+  }
+
   if (pathname === '/aistudio/auto_fetch') {
+    if (!isWebApiEnabled('aistudio') && !isWebApiEnabled('gemini')) {
+      sendServiceDisabled(res, 'AI Studio 与 Gemini 网页 API 均已在管理控制台关闭，已禁止刷新 Google Cookie。');
+      return;
+    }
     if (extensionSockets.size === 0) {
       res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
       res.end(JSON.stringify({ success: false, error: 'Cookie Hub 浏览器扩展未连接' }));
@@ -589,10 +744,12 @@ const server = http.createServer(async (req, res) => {
         });
         tab = candidates.length ? candidates[candidates.length - 1] : null;
       }
+      let createdByUs = false;
       if (!tab) {
-        const opened = await dispatchToExtension('open_tab', { url: targetUrl, active: true }, 12000);
+        const opened = await dispatchToExtension('open_tab', { url: targetUrl, active: false }, 12000);
         if (!opened.success || !opened.tabId) throw new Error(opened.error || '浏览器未能打开 AI Studio');
         aiStudioAuthTabId = Number(opened.tabId);
+        createdByUs = true;
       } else {
         aiStudioAuthTabId = Number(tab.id);
         let host = '';
@@ -600,7 +757,7 @@ const server = http.createServer(async (req, res) => {
         if (host === 'accounts.google.com' || host.endsWith('.accounts.google.com')) {
           await dispatchToExtension('navigate_tab', { tabId: tab.id, url: tab.url, active: true }, 10000);
         } else {
-          await dispatchToExtension('navigate_tab', { tabId: tab.id, url: targetUrl, active: true }, 10000);
+          await dispatchToExtension('navigate_tab', { tabId: tab.id, url: targetUrl, active: false }, 10000);
         }
       }
 
@@ -653,6 +810,11 @@ const server = http.createServer(async (req, res) => {
         if (!cookieMap.has(key)) cookieMap.set(key, cookie);
       });
       const cookies = Array.from(cookieMap.values());
+      if (createdByUs && aiStudioAuthTabId) {
+        const tempTabId = aiStudioAuthTabId;
+        aiStudioAuthTabId = null;
+        dispatchToExtension('close_tab', { tabId: tempTabId }, 5000).catch(() => {});
+      }
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
       res.end(JSON.stringify({
         success: cookies.length > 0, loginRequired: false, tabId: aiStudioAuthTabId,
@@ -686,6 +848,12 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({
         error: '缺少必填参数 domain 或 url，例如: /cookies?domain=bilibili.com'
       }));
+      return;
+    }
+
+    const domainCheck = isDomainCookieAllowed(domain);
+    if (!domainCheck.allowed) {
+      sendServiceDisabled(res, `域名 ${domain} 对应的网页 API (${domainCheck.disabled.join(', ')}) 已在管理控制台关闭，已禁止获取 Cookie。`);
       return;
     }
 
@@ -759,6 +927,10 @@ const server = http.createServer(async (req, res) => {
 
   // 5. Suno Auto-Fetch & Session Wakeup (/suno/auto_fetch or /suno/cookies)
   if (pathname === '/suno/auto_fetch' || pathname === '/suno/cookies') {
+    if (!isWebApiEnabled('suno')) {
+      sendServiceDisabled(res, 'Suno 网页 API 已在管理控制台关闭，已禁止获取或刷新 Cookie。');
+      return;
+    }
     if (extensionSockets.size === 0) {
       res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify({
@@ -960,6 +1132,10 @@ const server = http.createServer(async (req, res) => {
 
   // 6. MiniMax Auto-Fetch & Session Token Extraction (/minimax/auto_fetch or /minimax/cookies)
   if (pathname === '/minimax/auto_fetch' || pathname === '/minimax/cookies') {
+    if (!isWebApiEnabled('minimax')) {
+      sendServiceDisabled(res, 'MiniMax 网页 API 已在管理控制台关闭，已禁止获取或刷新 Cookie。');
+      return;
+    }
     if (extensionSockets.size === 0) {
       res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify({
