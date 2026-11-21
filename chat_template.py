@@ -175,6 +175,19 @@ async function loadModels() {
   renderModels(list);
 }
 
+function addBubble(role, text) {
+  const box = document.getElementById('msgs');
+  const w = document.createElement('div'); w.className = 'msg ' + role;
+  const b = document.createElement('div'); b.className = 'bubble'; b.textContent = text || '';
+  w.appendChild(b); box.appendChild(w); box.scrollTop = box.scrollHeight; return b;
+}
+function newChat() {
+  activeCid = null; convSyncPromise = null; localStorage.removeItem('css_active_cid');
+  document.getElementById('msgs').innerHTML = '';
+  document.getElementById('chat-title').textContent = 'Gemini';
+  document.querySelectorAll('.conv-item').forEach(el => el.classList.remove('active'));
+  toggleSidebar(false); document.getElementById('prompt-in').focus();
+}
 function getCache(k, defVal) {
   try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : defVal; } catch (e) { return defVal; }
 }
